@@ -36,6 +36,7 @@ Stdlib only. Usable as a library (run_guarded) or as a CLI:
 """
 
 import argparse
+import ctypes
 import glob
 import json
 import os
@@ -79,6 +80,47 @@ def vram_total_mib():
 
 def gtt_used_mib():
     return _mib(_read_int(GTT_USED))
+
+
+class _NvmlMem(ctypes.Structure):
+    _fields_ = [("total", ctypes.c_ulonglong),
+                ("free", ctypes.c_ulonglong),
+                ("used", ctypes.c_ulonglong)]
+
+
+_NVML = None
+_NVML_TRIED = False
+
+
+def nvidia_vram_mib():
+    """Return (used_mib, total_mib) for NVIDIA GPU 0, or None if unavailable.
+
+    The display GPU's VRAM is visible via sysfs (`card0`), but a second, discrete
+    GPU — e.g. a Thunderbolt eGPU — is not. `nvidia-smi` costs ~150 ms per
+    invocation, far too much to poll at 20 Hz, whereas NVML is a shared library
+    so the query is a few microseconds.
+    """
+    global _NVML, _NVML_TRIED
+    if not _NVML_TRIED:
+        _NVML_TRIED = True
+        try:
+            lib = ctypes.CDLL("libnvidia-ml.so.1")
+            if lib.nvmlInit_v2() == 0:
+                _NVML = lib
+        except (OSError, AttributeError):
+            _NVML = None
+    if _NVML is None:
+        return None
+    try:
+        h = ctypes.c_void_p()
+        if _NVML.nvmlDeviceGetHandleByIndex_v2(0, ctypes.byref(h)) != 0:
+            return None
+        m = _NvmlMem()
+        if _NVML.nvmlDeviceGetMemoryInfo(h, ctypes.byref(m)) != 0:
+            return None
+        return m.used / 1048576.0, m.total / 1048576.0
+    except Exception:
+        return None
 
 
 def drm_clients(pids=None):
@@ -243,6 +285,10 @@ class Monitor(threading.Thread):
         self._cpu_total = 0.0
         self._child_cpu0 = None
         self._child_cpu1 = None
+        # Discrete GPU (e.g. Thunderbolt eGPU). Not covered by the sysfs counter
+        # above, which tracks only the display GPU.
+        self.nvidia_peak = 0.0
+        self.nvidia_total = None
 
     # Ticks between the expensive /proc walks. The system-VRAM read that
     # enforces the cap is a single sysfs file and stays on every tick; walking
@@ -264,6 +310,10 @@ class Monitor(threading.Thread):
                         self._cpu_total += dt
                 self._cpu_prev = cur
             v = vram_used_mib()
+            nv = nvidia_vram_mib()
+            if nv is not None:
+                self.nvidia_peak = max(self.nvidia_peak, nv[0])
+                self.nvidia_total = nv[1]
             if v is not None:
                 self.vram_peak = max(self.vram_peak, v)
                 self.samples += 1
@@ -421,6 +471,8 @@ def run_guarded(cmd, cap_mib=DEFAULT_CAP_MIB, timeout=None, log_path=None,
         "rss_peak_mib": round(mon.rss_peak_kib / 1024.0, 1),
         "cpu_busy_pct": None if mon.cpu_busy_pct is None else round(mon.cpu_busy_pct, 1),
         "bg_cpu_pct": None if mon.bg_cpu_pct is None else round(mon.bg_cpu_pct, 1),
+        "nvidia_vram_peak_mib": None if not mon.nvidia_total else round(mon.nvidia_peak, 1),
+        "nvidia_vram_total_mib": None if not mon.nvidia_total else round(mon.nvidia_total, 1),
         "timed_out": timed_out,
         "log": log_path,
         "stdout": text if out_f is None else None,

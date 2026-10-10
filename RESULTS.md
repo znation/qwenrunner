@@ -429,6 +429,83 @@ Conclusions:
 * **History worth keeping:** across three earlier designs the figure came out as
   +56 %, −12 % and +120 %. Only the idle interleaved A/B is trustworthy.
 
+## Thunderbolt eGPU: one model across two GPUs **[clean]**
+
+An NVIDIA GTX 1070 (GP104, 8 GB) in a Thunderbolt 3 enclosure was added, giving a
+second, independent VRAM pool. Setup (driver, the 288 MB BAR1 window fix, the
+CUDA build) is in the README. Both backends live in one binary:
+
+```
+CUDA0:   NVIDIA GeForce GTX 1070   (8106 MiB, 8022 MiB free)
+Vulkan0: AMD Radeon Graphics (RADV VEGA10) (8176 MiB, 6933 MiB free)
+```
+
+One model instance spreads across both, with the remainder on CPU, via
+`-dev CUDA0,Vulkan0 -sm layer -ts 4,1 -ngl N`.
+
+### Measured at a realistic shape
+
+5188-token prompt, `-c 8192`, `-n 32`, `-lm dio`, `-ctk q4_0 -ctv q4_0 -fa on`:
+
+| config | layers offloaded | sys peak MiB | NVIDIA peak MiB | prompt t/s | gen t/s |
+|---|---|---|---|---|---|
+| Vega 10 only, `-ngl 8` | 8 | 4349 | 87 | **66.66** | 1.640 |
+| Vega 10 only, `-ngl 10` | 10 | 4846 | 87 | **66.96** | 1.740 |
+| 1070 only, `-ngl 24` | 24 | 1237 | 6967 | 36.74 | 2.160 |
+| 1070 only, `-ngl 28` | 28 | 1228 | 7873 | 39.63 | 2.540 |
+| 1070 only, `-ngl 30` | 30 | 1220 | 7445 | **✗ fail** | **✗ fail** |
+| **split `-ts 4,1 -ngl 40`** | **40** | 4304 | 7633 | 50.60 | **3.240** |
+
+Conclusions:
+
+* **The split dominates on generation and is second on prompt.** 40 layers
+  offloaded against 28 for the 1070 alone and 10 for the Vega 10; +28 %
+  generation over the best 1070-only config.
+* **The 1070-only configuration fails at this shape.** `-ngl 30` cannot allocate
+  the compute buffer for a 5188-token batch alongside 30 layers of weights in
+  8 GB. Splitting moves weights to a second device and frees the room — so the
+  split is not just faster, it is the configuration that works.
+* **The Vega 10 is the better prefill engine, the 1070 the better offloader.**
+  Vega-only prompts at 66.7 t/s against the 1070's 39.6, because the Vega 48 has
+  ~2× the FP32 throughput (3840 vs 1920 shaders) and prefill is compute-bound;
+  the 1070 wins generation purely by holding more layers.
+* The Thunderbolt link trains at **2.5 GT/s ×4** (PCIe 1.0, ~1 GB/s) where
+  8.0 GT/s is available — and it does **not** matter: only ~20 KB crosses the
+  CPU↔GPU boundary per token.
+
+### Context length trades against layer count
+
+At 128k the KV cache competes with the weights for the same VRAM. Only 16 of the
+64 layers are full-attention, and with `q4_0` KV they cost ~18 KiB/token across
+all 16, i.e. ~37 MiB per offloaded layer at 131 072 tokens:
+
+| `-ts` | `-ngl` | `-c` | exit | sys peak MiB | NVIDIA peak MiB |
+|---|---|---|---|---|---|
+| 4,1 | 40 | 131072 | 1 | — | ✗ needs 1152 MiB KV with 7067 MiB of weights |
+| 4,1 | 32 | 131072 | **0** | 3893 | 7839 |
+| 4,1 | 36 | 131072 | 1 | 3765 | 6453 |
+| 3,1 | 32 | 131072 | **0** | 4518 | 7213 |
+
+So **128k costs ~8 layers of offload** (40 → 32). f16 KV is not an option here:
+~8.6 GB across the 16 full-attention layers, more than either GPU has free.
+`-ctk q4_0 -ctv q4_0 -fa on` is mandatory at this context.
+
+### Traps
+
+* **`llama-bench` cannot measure a combined split.** Its `-dev` lists devices to
+  benchmark *separately*: it loaded the model twice, once CUDA-only and once
+  Vulkan-only (two independent 5172 MiB buffers). A `-ngl 44` attempt "OOM'd"
+  because it was 44 layers on one card. Use `llama-cli`/`llama-completion`/
+  `llama-server`, where `-dev` is a real device list.
+* **`-ts` is not honoured as written.** `-ts 2,1` breached the display cap while
+  `-ts 4,1` fit, and measured layer counts land nearer 2:1 than 4:1 — non-layer
+  tensors appear to land on the primary device. Tune against the two VRAM
+  counters, do not trust the ratio.
+* **`guard.py` needed extending.** It read only `card0` sysfs, so it was blind to
+  the 1070. It now reads NVIDIA VRAM through NVML via `ctypes` (microseconds;
+  `nvidia-smi` costs ~150 ms per spawn) and records `nvidia_vram_peak_mib`. The
+  5000 MiB cap still governs the display GPU only.
+
 ## Serving (`llama-server`)
 
 `scripts/serve.sh` runs `llama-server` under `guard.py`, which polls system-wide
@@ -473,6 +550,12 @@ python3 scripts/wait_idle.py --system --idle-cores 3 --hold 30
 ./scripts/mtp_ab.py --ngl 8 --ctx 8192 --n-predict 64 --arms base,mtp-sidecar \
     --ngld 0 --reps 2 --server-extra "-lm dio -b 2048 -ub 512" --out results/final_mtp.jsonl
 ./scripts/quant_compare.sh                              # quant ceiling, speed, perplexity
+
+# one model across both GPUs, remainder on CPU (see "Thunderbolt eGPU")
+build/bin/llama-completion -m models/Qwen3.8-27B-UD-Q4_K_M.gguf \
+    -dev CUDA0,Vulkan0 -sm layer -ts 4,1 -ngl 40 -lm dio \
+    -ctk q4_0 -ctv q4_0 -fa on -no-cnv -t 8 -c 8192 \
+    --seed 42 -f data/long_prompt.txt -n 32
 ```
 
 `bench.py` does not export `PATH`/`LD_LIBRARY_PATH` itself — set them on the same

@@ -15,3 +15,8 @@ tools/
 __pycache__/
 *.pyc
 *.pyo
+
+# Raw kernel-log dump. Contains a MAC address and the interface name derived
+# from it, so it is not published; the relevant NVRM/BAR excerpts are quoted in
+# README.md and RESULTS.md instead.
+dmesg.log

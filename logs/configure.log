@@ -6,6 +6,20 @@ CMAKE_BUILD_TYPE=Release
 -- Including CPU backend
 -- x86 detected
 -- Adding CPU backend variant ggml-cpu: -march=native 
+-- Found CUDAToolkit: /usr/include (found version "12.4.131")
+-- CUDA Toolkit found
+-- The CUDA compiler identification is NVIDIA 12.4.131 with host compiler GNU 13.3.0
+-- Detecting CUDA compiler ABI info
+-- Detecting CUDA compiler ABI info - done
+-- Check for working CUDA compiler: /usr/bin/nvcc - skipped
+-- Detecting CUDA compile features
+-- Detecting CUDA compile features - done
+-- Using CMAKE_CUDA_ARCHITECTURES=61 CMAKE_CUDA_ARCHITECTURES_NATIVE=61-real
+-- FlashAttention K-V type combinations: f16-f16;q4_0-q4_0;q8_0-q8_0;bf16-bf16
+-- Could NOT find NCCL (missing: NCCL_LIBRARY NCCL_INCLUDE_DIR) 
+-- Warning: NCCL not found, performance for multiple CUDA GPUs will be suboptimal
+-- CUDA host compiler is GNU 13.3.0
+-- Including CUDA backend
 -- Vulkan found
 -- GL_KHR_cooperative_matrix supported by glslc
 -- GL_NV_cooperative_matrix2 supported by glslc
@@ -19,6 +33,6 @@ CMAKE_BUILD_TYPE=Release
 -- ggml commit:  aa5e009
 -- OpenSSL found: 3.5.7
 -- Generating embedded license file for target: llama-app
--- Configuring done (1.3s)
+-- Configuring done (2.8s)
 -- Generating done (0.3s)
 -- Build files have been written to: /home/zach/qwenrunner/build

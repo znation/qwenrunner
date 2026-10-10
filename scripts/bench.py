@@ -101,6 +101,7 @@ GUARD_FIELDS = [
     "client_vram_peak_mib", "client_gtt_peak_mib",
     "rss_peak_mib",
     "cpu_busy_pct", "bg_cpu_pct",
+    "nvidia_vram_peak_mib", "nvidia_vram_total_mib",
 ]
 
 
