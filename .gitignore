@@ -20,3 +20,6 @@ __pycache__/
 # from it, so it is not published; the relevant NVRM/BAR excerpts are quoted in
 # README.md and RESULTS.md instead.
 dmesg.log
+
+# this one will change on every ./serve.sh run I think?
+logs/serve.log
