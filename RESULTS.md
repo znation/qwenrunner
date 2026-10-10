@@ -490,6 +490,28 @@ So **128k costs ~8 layers of offload** (40 → 32). f16 KV is not an option here
 ~8.6 GB across the 16 full-attention layers, more than either GPU has free.
 `-ctk q4_0 -ctv q4_0 -fa on` is mandatory at this context.
 
+### 128k measured end to end
+
+A genuine 130 729-token prompt, `-dev CUDA0,Vulkan0 -sm layer -ts 4,1 -ngl 32
+-ctk q4_0 -ctv q4_0 -fa on -c 131072`, on an idle host (`bg_cpu_pct` 2.9 %):
+
+| | |
+|---|---|
+| exit | 0 |
+| wall | 4413 s |
+| prompt eval | 130 729 tokens in 4388 s = **29.79 t/s** |
+| generation | 838.13 ms/token = **1.19 t/s** |
+| system peak | 4314 MiB (cap 5000) |
+| NVIDIA peak | 7945 of 8192 MiB |
+| RSS peak | 9629 MiB |
+
+So 128k is **usable**: 1.19 t/s generation, 29.8 t/s prompt, at the cost of a
+73-minute prefill. Generation at this depth beats what the single-GPU depth ladder
+would predict — extrapolating `-ngl 10` at 32k (0.85 t/s) suggested 0.3-0.4 t/s,
+but offloading 32 layers across two GPUs more than compensates for the context.
+The 1070 finishes at 7945 of 8192 MiB, so `-ngl 32` is at the edge; `-ngl 36`
+does not fit.
+
 ### Traps
 
 * **`llama-bench` cannot measure a combined split.** Its `-dev` lists devices to

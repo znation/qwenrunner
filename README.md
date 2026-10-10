@@ -38,8 +38,9 @@ Best measured figures: **74.41 t/s prompt and 2.01 t/s generation** (`-ngl 10`,
 
 **With the Thunderbolt eGPU attached, `serve.sh` splits one model across both
 GPUs** — 40 layers at 8k context, 32 at 128k — which is +28 % generation over the
-1070 alone and roughly triples the offloadable layer count (40 vs 12). See
-[`RESULTS.md`](RESULTS.md).
+1070 alone and roughly triples the offloadable layer count (40 vs 12). A genuine
+128k context runs at **1.19 t/s generation and 29.8 t/s prompt** (73-minute
+prefill), inside the display-GPU cap. See [`RESULTS.md`](RESULTS.md).
 
 ## Prerequisites
 
