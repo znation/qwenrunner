@@ -1,0 +1,2 @@
+baseline VRAM: 1339.8 MiB (cap 5000.0)
+[depth/p128/n128/d0] OK vram_peak=4379.2 client=3039.4 (+3039.4) exit=0 (356s) n_prompt=512 n_gen=0 46.53 t/s n_prompt=128 n_gen=0 22.08 t/s n_prompt=0 n_gen=128 1.01 t/s n_prompt=0 n_gen=128 0.78 t/s

@@ -1,0 +1,25 @@
+ggml_vulkan: Found 1 Vulkan devices:
+ggml_vulkan: 0 = AMD Radeon Graphics (RADV VEGA10) (radv) | uma: 0 | fp16: 1 | bf16: 0 | fp4: 0 | warp size: 64 | shared memory: 65536 | int dot: 0 | matrix cores: none
+[
+/home/zach/qwenrunner/third_party/llama.cpp/src/llama-mmap.cpp:804: GGML_ASSERT(addr) failed
+[New LWP 40767]
+[New LWP 40766]
+[Thread debugging using libthread_db enabled]
+Using host libthread_db library "/lib/x86_64-linux-gnu/libthread_db.so.1".
+0x00007f70480a672e in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#0  0x00007f70480a672e in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007f704809b388 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#2  0x00007f704809b3cd in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#3  0x00007f7048106507 in wait4 () from /lib/x86_64-linux-gnu/libc.so.6
+#4  0x00007f70484d9c7b in ggml_print_backtrace () from /home/zach/qwenrunner/build/bin/libggml-base.so.0
+#5  0x00007f70484d9dce in ggml_abort () from /home/zach/qwenrunner/build/bin/libggml-base.so.0
+#6  0x00007f70478b5d76 in llama_mlock::grow_to(unsigned long) () from /home/zach/qwenrunner/build/bin/libllama.so.0
+#7  0x00007f70478e5266 in llama_model_base::load_tensors(llama_model_loader&) () from /home/zach/qwenrunner/build/bin/libllama.so.0
+#8  0x00007f70477de80d in llama_model_load(gguf_context*, void (*)(ggml_tensor*, void*), void*, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&, std::vector<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::allocator<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > >&, _IO_FILE*, llama_model_params&) () from /home/zach/qwenrunner/build/bin/libllama.so.0
+#9  0x00007f70477dfbc5 in llama_model_load_from_file_impl(gguf_context*, void (*)(ggml_tensor*, void*), void*, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&, std::vector<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, std::allocator<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > > >&, _IO_FILE*, llama_model_params) () from /home/zach/qwenrunner/build/bin/libllama.so.0
+#10 0x00007f70477dfef6 in llama_model_load_from_file () from /home/zach/qwenrunner/build/bin/libllama.so.0
+#11 0x00007f70486181e0 in llama_bench(int, char**) () from /home/zach/qwenrunner/build/bin/libllama-bench-impl.so
+#12 0x00007f7048035ca8 in ?? () from /lib/x86_64-linux-gnu/libc.so.6
+#13 0x00007f7048035d65 in __libc_start_main () from /lib/x86_64-linux-gnu/libc.so.6
+#14 0x000055a35375c1b1 in _start ()
+[Inferior 1 (process 40764) detached]

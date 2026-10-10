@@ -1,0 +1,17 @@
+timestamp,stage,label,ok,model_filename,build_commit,n_gpu_layers,flash_attn,type_k,type_v,n_threads,n_batch,n_ubatch,load_mode,no_kv_offload,no_op_offload,n_prompt,n_gen,n_depth,avg_ts,stddev_ts,vram_peak_mib,vram_delta_mib,client_vram_peak_mib,client_gtt_peak_mib,vram_violation,rss_peak_mib,wall_s
+2026-10-09T04:25:05,ngl,ngl4,True,models/Qwen3.8-27B-UD-Q4_K_M.gguf,aa5e009,4,-1,f16,f16,8,2048,512,auto,False,0,512,0,0,62.800422,0.0,2893.4,2049.7,2049.7,43.6,False,15656.2,100.539
+2026-10-09T04:25:05,ngl,ngl4,True,models/Qwen3.8-27B-UD-Q4_K_M.gguf,aa5e009,4,-1,f16,f16,8,2048,512,auto,False,0,0,128,0,1.694837,0.0,2893.4,2049.7,2049.7,43.6,False,15656.2,100.539
+2026-10-09T04:26:48,ngl,ngl6,True,models/Qwen3.8-27B-UD-Q4_K_M.gguf,aa5e009,6,-1,f16,f16,8,2048,512,auto,False,0,512,0,0,64.872017,0.0,3476.2,2632.5,2551.2,43.6,False,15229.7,102.211
+2026-10-09T04:26:48,ngl,ngl6,True,models/Qwen3.8-27B-UD-Q4_K_M.gguf,aa5e009,6,-1,f16,f16,8,2048,512,auto,False,0,0,128,0,1.662871,0.0,3476.2,2632.5,2551.2,43.6,False,15229.7,102.211
+2026-10-09T04:28:27,ngl,ngl8,True,models/Qwen3.8-27B-UD-Q4_K_M.gguf,aa5e009,8,-1,f16,f16,8,2048,512,auto,False,0,512,0,0,65.735304,0.0,3883.0,3039.4,3039.4,43.6,False,15586.6,99.631
+2026-10-09T04:28:27,ngl,ngl8,True,models/Qwen3.8-27B-UD-Q4_K_M.gguf,aa5e009,8,-1,f16,f16,8,2048,512,auto,False,0,0,128,0,1.762237,0.0,3883.0,3039.4,3039.4,43.6,False,15586.6,99.631
+2026-10-09T04:29:56,ngl,ngl10,True,models/Qwen3.8-27B-UD-Q4_K_M.gguf,aa5e009,10,-1,f16,f16,8,2048,512,auto,False,0,512,0,0,66.652503,0.0,4414.1,3540.9,3540.9,43.6,False,15817.6,88.952
+2026-10-09T04:29:56,ngl,ngl10,True,models/Qwen3.8-27B-UD-Q4_K_M.gguf,aa5e009,10,-1,f16,f16,8,2048,512,auto,False,0,0,128,0,1.903736,0.0,4414.1,3540.9,3540.9,43.6,False,15817.6,88.952
+2026-10-09T04:31:52,ngl,ngl4,True,models/Qwen3.8-27B-UD-Q4_K_M.gguf,aa5e009,4,-1,f16,f16,8,2048,512,auto,False,0,512,0,0,64.638463,0.0,2922.9,2049.7,2049.7,43.6,False,15866.8,99.183
+2026-10-09T04:31:52,ngl,ngl4,True,models/Qwen3.8-27B-UD-Q4_K_M.gguf,aa5e009,4,-1,f16,f16,8,2048,512,auto,False,0,0,128,0,1.61805,0.0,2922.9,2049.7,2049.7,43.6,False,15866.8,99.183
+2026-10-09T04:33:31,ngl,ngl6,True,models/Qwen3.8-27B-UD-Q4_K_M.gguf,aa5e009,6,-1,f16,f16,8,2048,512,auto,False,0,512,0,0,62.044993,0.0,3506.5,2551.2,2551.2,43.6,False,15443.2,99.239
+2026-10-09T04:33:31,ngl,ngl6,True,models/Qwen3.8-27B-UD-Q4_K_M.gguf,aa5e009,6,-1,f16,f16,8,2048,512,auto,False,0,0,128,0,1.739709,0.0,3506.5,2551.2,2551.2,43.6,False,15443.2,99.239
+2026-10-09T04:35:09,ngl,ngl8,True,models/Qwen3.8-27B-UD-Q4_K_M.gguf,aa5e009,8,-1,f16,f16,8,2048,512,auto,False,0,512,0,0,62.998992,0.0,3912.7,3039.4,3039.4,43.6,False,15133.6,98.002
+2026-10-09T04:35:09,ngl,ngl8,True,models/Qwen3.8-27B-UD-Q4_K_M.gguf,aa5e009,8,-1,f16,f16,8,2048,512,auto,False,0,0,128,0,1.759269,0.0,3912.7,3039.4,3039.4,43.6,False,15133.6,98.002
+2026-10-09T04:36:41,ngl,ngl10,True,models/Qwen3.8-27B-UD-Q4_K_M.gguf,aa5e009,10,-1,f16,f16,8,2048,512,auto,False,0,512,0,0,70.17296,0.0,4497.4,3540.9,3540.9,43.6,False,15824.5,92.422
+2026-10-09T04:36:41,ngl,ngl10,True,models/Qwen3.8-27B-UD-Q4_K_M.gguf,aa5e009,10,-1,f16,f16,8,2048,512,auto,False,0,0,128,0,1.8629,0.0,4497.4,3540.9,3540.9,43.6,False,15824.5,92.422

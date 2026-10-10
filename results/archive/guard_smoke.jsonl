@@ -1,0 +1,1 @@
+{"cmd": ["sleep", "2"], "exit_code": 0, "label": "guard-smoke", "log": null, "rss_peak_mib": 2.0, "stdout": "", "timed_out": false, "timestamp": "2026-10-07T17:35:15", "vram_baseline_mib": 1487.1, "vram_cap_mib": 5000.0, "vram_killed_at_mib": null, "vram_peak_mib": 1487.1, "vram_violation": false, "wall_s": 2.007}

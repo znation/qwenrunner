@@ -1,0 +1,180 @@
+{
+  "cmd": [
+    "build/bin/llama-perplexity",
+    "-m",
+    "models/Qwen3.8-27B-UD-IQ3_S.gguf",
+    "-f",
+    "data/ppl_corpus.txt",
+    "-c",
+    "512",
+    "--chunks",
+    "40",
+    "-ngl",
+    "10",
+    "-lm",
+    "dio",
+    "-t",
+    "8"
+  ],
+  "exit_code": 0,
+  "wall_s": 293.699,
+  "vram_baseline_mib": 853.5,
+  "vram_peak_mib": 3863.6,
+  "vram_delta_mib": 3010.1,
+  "vram_cap_mib": 5000.0,
+  "vram_violation": false,
+  "vram_killed_at_mib": null,
+  "client_vram_peak_mib": 2993.1,
+  "client_gtt_peak_mib": 9788.2,
+  "client_top": {
+    "173": {
+      "vram_kib": 2993.12890625,
+      "shared_vram_kib": 0.0,
+      "gtt_kib": 9788.2265625,
+      "shared_gtt_kib": 0.0
+    }
+  },
+  "rss_peak_mib": 853.7,
+  "cpu_busy_pct": 11.5,
+  "bg_cpu_pct": 0.7,
+  "timed_out": false,
+  "log": "logs/pplbig-IQ3_S.log",
+  "stdout": null,
+  "label": "pplbig-IQ3_S",
+  "timestamp": "2026-10-09T19:07:20"
+}
+{
+  "cmd": [
+    "build/bin/llama-perplexity",
+    "-m",
+    "models/Qwen3.8-27B-UD-Q2_K_XL.gguf",
+    "-f",
+    "data/ppl_corpus.txt",
+    "-c",
+    "512",
+    "--chunks",
+    "40",
+    "-ngl",
+    "10",
+    "-lm",
+    "dio",
+    "-t",
+    "8"
+  ],
+  "exit_code": 0,
+  "wall_s": 283.535,
+  "vram_baseline_mib": 3143.0,
+  "vram_peak_mib": 3393.9,
+  "vram_delta_mib": 250.9,
+  "vram_cap_mib": 5000.0,
+  "vram_violation": false,
+  "vram_killed_at_mib": null,
+  "client_vram_peak_mib": 2616.4,
+  "client_gtt_peak_mib": 8054.2,
+  "client_top": {
+    "174": {
+      "vram_kib": 2616.36328125,
+      "shared_vram_kib": 0.0,
+      "gtt_kib": 8054.21484375,
+      "shared_gtt_kib": 0.0
+    }
+  },
+  "rss_peak_mib": 865.0,
+  "cpu_busy_pct": 11.2,
+  "bg_cpu_pct": 0.6,
+  "timed_out": false,
+  "log": "logs/pplbig-Q2_K_XL.log",
+  "stdout": null,
+  "label": "pplbig-Q2_K_XL",
+  "timestamp": "2026-10-09T19:12:03"
+}
+{
+  "cmd": [
+    "build/bin/llama-perplexity",
+    "-m",
+    "models/Qwen3.8-27B-UD-Q3_K_XL.gguf",
+    "-f",
+    "data/ppl_corpus.txt",
+    "-c",
+    "512",
+    "--chunks",
+    "40",
+    "-ngl",
+    "10",
+    "-lm",
+    "dio",
+    "-t",
+    "8"
+  ],
+  "exit_code": 0,
+  "wall_s": 299.357,
+  "vram_baseline_mib": 2767.6,
+  "vram_peak_mib": 3819.9,
+  "vram_delta_mib": 1052.3,
+  "vram_cap_mib": 5000.0,
+  "vram_violation": false,
+  "vram_killed_at_mib": null,
+  "client_vram_peak_mib": 3042.3,
+  "client_gtt_peak_mib": 10794.1,
+  "client_top": {
+    "175": {
+      "vram_kib": 3042.34375,
+      "shared_vram_kib": 0.0,
+      "gtt_kib": 10794.08984375,
+      "shared_gtt_kib": 0.0
+    }
+  },
+  "rss_peak_mib": 854.1,
+  "cpu_busy_pct": 11.3,
+  "bg_cpu_pct": 0.5,
+  "timed_out": false,
+  "log": "logs/pplbig-Q3_K_XL.log",
+  "stdout": null,
+  "label": "pplbig-Q3_K_XL",
+  "timestamp": "2026-10-09T19:17:03"
+}
+{
+  "cmd": [
+    "build/bin/llama-perplexity",
+    "-m",
+    "models/Qwen3.8-27B-UD-Q4_K_M.gguf",
+    "-f",
+    "data/ppl_corpus.txt",
+    "-c",
+    "512",
+    "--chunks",
+    "40",
+    "-ngl",
+    "10",
+    "-lm",
+    "dio",
+    "-t",
+    "8"
+  ],
+  "exit_code": 0,
+  "wall_s": 317.573,
+  "vram_baseline_mib": 3191.4,
+  "vram_peak_mib": 4450.3,
+  "vram_delta_mib": 1258.9,
+  "vram_cap_mib": 5000.0,
+  "vram_violation": false,
+  "vram_killed_at_mib": null,
+  "client_vram_peak_mib": 3616.2,
+  "client_gtt_peak_mib": 13387.1,
+  "client_top": {
+    "176": {
+      "vram_kib": 3616.21484375,
+      "shared_vram_kib": 0.0,
+      "gtt_kib": 13387.12890625,
+      "shared_gtt_kib": 0.0
+    }
+  },
+  "rss_peak_mib": 854.4,
+  "cpu_busy_pct": 13.7,
+  "bg_cpu_pct": 2.9,
+  "timed_out": false,
+  "log": "logs/pplbig-Q4_K_M.log",
+  "stdout": null,
+  "label": "pplbig-Q4_K_M",
+  "timestamp": "2026-10-09T19:22:20"
+}

@@ -1,0 +1,17 @@
+# Model weights: ~50 GB total, and every .gguf is far over GitHub's 100 MB
+# per-file limit. Fetch them per README "Prerequisites".
+models/
+
+# Build output and the vendored llama.cpp checkout (215 MB, has its own .git).
+# Recreate with scripts/build.sh after cloning the pinned revision.
+build/
+third_party/
+
+# Unpacked Debian shader tooling (glslc / libshaderc / spirv-headers).
+# Recreate per README "Prerequisites".
+tools/
+
+# Scratch
+__pycache__/
+*.pyc
+*.pyo

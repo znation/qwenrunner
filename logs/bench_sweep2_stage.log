@@ -1,0 +1,23 @@
+baseline VRAM: 1754.7 MiB (cap 5000.0)
+[ngl/ngl10] FAIL vram_peak=5129.1 client=0.0 (+3374.4) exit=-9 (10s) NO RESULTS
+[ngl] stopping ladder: ngl10 breached the cap
+wrote results/bench_ab.csv, results/bench_ab.md
+baseline VRAM: 3083.8 MiB (cap 5000.0)
+[ngl/ngl10] FAIL vram_peak=5097.2 client=0.0 (+2013.4) exit=-9 (8s) NO RESULTS
+[ngl] stopping ladder: ngl10 breached the cap
+wrote results/bench_ab.csv, results/bench_ab.md
+baseline VRAM: 5097.2 MiB (cap 5000.0)
+[threads/t4] FAIL vram_peak=5097.2 client=0.0 (+0.0) exit=-9 (0s) NO RESULTS
+[threads/t6] FAIL vram_peak=5097.2 client=0.0 (+0.0) exit=-9 (0s) NO RESULTS
+[threads/t8] FAIL vram_peak=5097.2 client=0.0 (+0.0) exit=-9 (0s) NO RESULTS
+[threads/t12] FAIL vram_peak=5097.2 client=0.0 (+0.0) exit=-9 (0s) NO RESULTS
+[threads/t16] FAIL vram_peak=5097.2 client=0.0 (+0.0) exit=-9 (0s) NO RESULTS
+wrote results/bench_threads.csv, results/bench_threads.md
+baseline VRAM: 4075.9 MiB (cap 5000.0)
+[ngl/ngl10] FAIL vram_peak=5346.5 client=2983.1 (+1270.6) exit=-9 (12s) NO RESULTS
+[ngl] stopping ladder: ngl10 breached the cap
+wrote results/bench_ab4096.csv, results/bench_ab4096.md
+baseline VRAM: 5346.3 MiB (cap 5000.0)
+[ngl/ngl10] FAIL vram_peak=5346.3 client=0.0 (+0.0) exit=-9 (0s) NO RESULTS
+[ngl] stopping ladder: ngl10 breached the cap
+wrote results/bench_ab4096.csv, results/bench_ab4096.md

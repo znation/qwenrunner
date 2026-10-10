@@ -1,0 +1,2 @@
+serve: model=/home/zach/qwenrunner/models/Qwen3.8-27B-UD-Q4_K_M.gguf ngl=8 ctx=4096 threads=8 cap=5000MiB
+serve: http://127.0.0.1:8082  (log: /home/zach/qwenrunner/logs/serve.log)

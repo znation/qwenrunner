@@ -1,0 +1,10 @@
+=== NMAX START 17:56:17
+baseline VRAM: 796.8 MiB (cap 5000.0); prompt 15907 chars
+mtp-sidecar  vram_peak=4119.5  client=3320.7  exit=-9  load=7.02   pp=60.17    tg=3.051    draft=52/53 
+mtp-sidecar  vram_peak=4262.9  client=3320.3  exit=-9  load=7.01   pp=60.28    tg=3.514    draft=52/53 
+wrote 2 records to results/mtp_nmax.jsonl
+baseline VRAM: 4106.9 MiB (cap 5000.0); prompt 15907 chars
+mtp-sidecar  vram_peak=4277.9  client=3353.8  exit=-9  load=7.02   pp=56.78    tg=3.24     draft=55/59 
+mtp-sidecar  vram_peak=4277.4  client=3353.3  exit=-9  load=7.01   pp=57.13    tg=3.244    draft=55/59 
+wrote 2 records to results/mtp_nmax.jsonl
+=== NMAX DONE 18:04:01

@@ -1,0 +1,18 @@
+0.00.021.319 W srv  llama_server: security: no API key is set and CORS allows all origins (see https://github.com/ggml-org/llama.cpp/pull/25655)
+0.00.864.233 W model has unused tensor blk.64.attn_norm.weight (size = 20480 bytes) -- ignoring
+0.00.864.243 W model has unused tensor blk.64.post_attention_norm.weight (size = 20480 bytes) -- ignoring
+0.00.864.257 W model has unused tensor blk.64.attn_q.weight (size = 51609600 bytes) -- ignoring
+0.00.864.263 W model has unused tensor blk.64.attn_k.weight (size = 5570560 bytes) -- ignoring
+0.00.864.269 W model has unused tensor blk.64.attn_v.weight (size = 5570560 bytes) -- ignoring
+0.00.864.286 W model has unused tensor blk.64.attn_output.weight (size = 25804800 bytes) -- ignoring
+0.00.864.293 W model has unused tensor blk.64.attn_q_norm.weight (size = 1024 bytes) -- ignoring
+0.00.864.299 W model has unused tensor blk.64.attn_k_norm.weight (size = 1024 bytes) -- ignoring
+0.00.864.306 W model has unused tensor blk.64.ffn_gate.weight (size = 73113600 bytes) -- ignoring
+0.00.864.314 W model has unused tensor blk.64.ffn_down.weight (size = 73113600 bytes) -- ignoring
+0.00.864.320 W model has unused tensor blk.64.ffn_up.weight (size = 73113600 bytes) -- ignoring
+0.00.864.327 W model has unused tensor blk.64.nextn.eh_proj.weight (size = 43008000 bytes) -- ignoring
+0.00.864.334 W model has unused tensor blk.64.nextn.enorm.weight (size = 20480 bytes) -- ignoring
+0.00.864.340 W model has unused tensor blk.64.nextn.hnorm.weight (size = 20480 bytes) -- ignoring
+0.00.864.355 W model has unused tensor blk.64.nextn.shared_head_norm.weight (size = 20480 bytes) -- ignoring
+0.01.159.290 W read_raw_unsafe: Falling back to buffered IO due to Bad address
+0.05.202.342 W srv          init: chat template supports preserving reasoning, it is enabled by default (may use more tokens, disable via --no-reasoning-preserve)

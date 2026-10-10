@@ -1,0 +1,11 @@
+timestamp,stage,label,ok,model_filename,build_commit,n_gpu_layers,flash_attn,type_k,type_v,n_threads,n_batch,n_ubatch,load_mode,no_kv_offload,no_op_offload,n_prompt,n_gen,n_depth,avg_ts,stddev_ts,vram_peak_mib,vram_delta_mib,client_vram_peak_mib,client_gtt_peak_mib,vram_violation,rss_peak_mib,wall_s
+2026-10-09T04:15:01,threads,t4,True,models/Qwen3.8-27B-UD-Q4_K_M.gguf,aa5e009,10,-1,f16,f16,4,2048,512,auto,False,0,512,0,0,62.122513,0.0,4384.6,3540.9,3540.9,43.6,False,15393.6,129.323
+2026-10-09T04:15:01,threads,t4,True,models/Qwen3.8-27B-UD-Q4_K_M.gguf,aa5e009,10,-1,f16,f16,4,2048,512,auto,False,0,0,128,0,1.304792,0.0,4384.6,3540.9,3540.9,43.6,False,15393.6,129.323
+2026-10-09T04:16:42,threads,t6,True,models/Qwen3.8-27B-UD-Q4_K_M.gguf,aa5e009,10,-1,f16,f16,6,2048,512,auto,False,0,512,0,0,60.395306,0.0,4463.4,3540.9,3540.9,43.6,False,14490.6,101.029
+2026-10-09T04:16:42,threads,t6,True,models/Qwen3.8-27B-UD-Q4_K_M.gguf,aa5e009,10,-1,f16,f16,6,2048,512,auto,False,0,0,128,0,1.931954,0.0,4463.4,3540.9,3540.9,43.6,False,14490.6,101.029
+2026-10-09T04:18:24,threads,t8,True,models/Qwen3.8-27B-UD-Q4_K_M.gguf,aa5e009,10,-1,f16,f16,8,2048,512,auto,False,0,512,0,0,65.133033,0.0,4455.8,3533.3,3540.9,43.6,False,15774.2,102.015
+2026-10-09T04:18:24,threads,t8,True,models/Qwen3.8-27B-UD-Q4_K_M.gguf,aa5e009,10,-1,f16,f16,8,2048,512,auto,False,0,0,128,0,1.609238,0.0,4455.8,3533.3,3540.9,43.6,False,15774.2,102.015
+2026-10-09T04:20:10,threads,t12,True,models/Qwen3.8-27B-UD-Q4_K_M.gguf,aa5e009,10,-1,f16,f16,12,2048,512,auto,False,0,512,0,0,61.394915,0.0,4384.6,3540.9,3540.9,43.6,False,15563.8,106.094
+2026-10-09T04:20:10,threads,t12,True,models/Qwen3.8-27B-UD-Q4_K_M.gguf,aa5e009,10,-1,f16,f16,12,2048,512,auto,False,0,0,128,0,1.596672,0.0,4384.6,3540.9,3540.9,43.6,False,15563.8,106.094
+2026-10-09T04:23:09,threads,t16,True,models/Qwen3.8-27B-UD-Q4_K_M.gguf,aa5e009,10,-1,f16,f16,16,2048,512,auto,False,0,512,0,0,40.172757,0.0,4384.6,3540.9,3540.9,43.6,False,15728.3,178.352
+2026-10-09T04:23:09,threads,t16,True,models/Qwen3.8-27B-UD-Q4_K_M.gguf,aa5e009,10,-1,f16,f16,16,2048,512,auto,False,0,0,128,0,0.928821,0.0,4384.6,3540.9,3540.9,43.6,False,15728.3,178.352

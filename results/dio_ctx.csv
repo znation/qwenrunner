@@ -1,0 +1,6 @@
+timestamp,stage,label,ok,model_filename,build_commit,n_gpu_layers,flash_attn,type_k,type_v,n_threads,n_batch,n_ubatch,load_mode,no_kv_offload,no_op_offload,n_prompt,n_gen,n_depth,avg_ts,stddev_ts,vram_peak_mib,vram_delta_mib,client_vram_peak_mib,client_gtt_peak_mib,vram_violation,rss_peak_mib,wall_s
+2026-10-09T05:32:15,ctx,pp512/tg128,False,,,,,,,,,,,,,,,,,,5127.2,3547.2,3003.2,12632.2,True,173.2,11.094
+2026-10-09T05:32:15,ctx,pp2048/tg128,False,,,,,,,,,,,,,,,,,,5111.8,0.0,0.0,0.0,True,0.0,0.01
+2026-10-09T05:32:31,ctx,pp128/tg512,False,,,,,,,,,,,,,,,,,,5128.1,1037.5,3157.7,12632.2,True,334.5,15.944
+2026-10-09T05:32:31,ctx,tg128,False,,,,,,,,,,,,,,,,,,5116.5,0.0,0.0,0.0,True,0.0,0.013
+2026-10-09T05:32:31,ctx,pp512,False,,,,,,,,,,,,,,,,,,5116.5,0.0,0.0,0.0,True,0.0,0.008

@@ -1,0 +1,9 @@
+=== KV0 START 17:45:43
+baseline VRAM: 794.8 MiB (cap 5000.0)
+[kv/kv=f16/f16] OK vram_peak=4348.1 client=3540.9 (+3553.3) exit=0 (90s) n_prompt=512 n_gen=0 72.21 t/s n_prompt=0 n_gen=128 1.80 t/s
+[kv/kv=q8_0/f16] OK vram_peak=4346.7 client=3540.2 (+3551.9) exit=0 (90s) n_prompt=512 n_gen=0 71.20 t/s n_prompt=0 n_gen=128 1.80 t/s
+[kv/kv=q8_0/q8_0] OK vram_peak=4336.0 client=3541.2 (+3541.2) exit=0 (90s) n_prompt=512 n_gen=0 72.40 t/s n_prompt=0 n_gen=128 1.80 t/s
+[kv/kv=q4_0/q4_0] OK vram_peak=4333.0 client=3538.2 (+3538.2) exit=0 (90s) n_prompt=512 n_gen=0 72.50 t/s n_prompt=0 n_gen=128 1.80 t/s
+[kv/kv=bf16/bf16] OK vram_peak=4337.7 client=3540.9 (+3540.9) exit=0 (88s) n_prompt=512 n_gen=0 73.36 t/s n_prompt=0 n_gen=128 1.85 t/s
+wrote results/cl_kv0.csv, results/cl_kv0.md
+=== KV0 DONE 17:54:11

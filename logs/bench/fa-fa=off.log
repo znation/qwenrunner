@@ -1,0 +1,5 @@
+ggml_vulkan: Found 1 Vulkan devices:
+ggml_vulkan: 0 = AMD Radeon Graphics (RADV VEGA10) (radv) | uma: 0 | fp16: 1 | bf16: 0 | fp4: 0 | warp size: 64 | shared memory: 65536 | int dot: 0 | matrix cores: none
+llama_init_from_model: quantized V cache requires flash_attn to be enabled
+llama_bench: error: failed to create context with model 'models/Qwen3.8-27B-UD-Q4_K_M.gguf'
+[

@@ -1,0 +1,6 @@
+baseline VRAM: 785.1 MiB (cap 5000.0); prompt 15907 chars
+base         vram_peak=3926.5  client=2793.9  exit=-9  load=31.09  pp=23.61    tg=0.155    draft=-/- 
+mtp-sidecar  vram_peak=4558.0  client=3290.1  exit=-9  load=61.28  pp=18.65    tg=0.255    draft=47/48 
+base         vram_peak=4074.8  client=2793.9  exit=-9  load=35.07  pp=21.87    tg=0.076    draft=-/- 
+mtp-sidecar  vram_peak=4654.2  client=3290.1  exit=-9  load=38.09  pp=17.05    tg=0.248    draft=47/48 
+wrote 4 records to results/mtp_il.jsonl

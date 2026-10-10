@@ -1,0 +1,5 @@
+timestamp,stage,label,ok,model_filename,build_commit,n_gpu_layers,flash_attn,type_k,type_v,n_threads,n_batch,n_ubatch,load_mode,no_kv_offload,no_op_offload,n_prompt,n_gen,n_depth,avg_ts,stddev_ts,vram_peak_mib,vram_delta_mib,client_vram_peak_mib,client_gtt_peak_mib,vram_violation,rss_peak_mib,wall_s
+2026-10-09T15:41:36,nkvo,nkvo=0,True,models/Qwen3.8-27B-UD-Q4_K_M.gguf,aa5e009,8,-1,f16,f16,8,2048,512,dio,False,0,512,0,0,74.115441,0.0,3969.8,3178.9,3039.4,13125.4,False,355.7,90.356
+2026-10-09T15:41:36,nkvo,nkvo=0,True,models/Qwen3.8-27B-UD-Q4_K_M.gguf,aa5e009,8,-1,f16,f16,8,2048,512,dio,False,0,0,128,0,1.773121,0.0,3969.8,3178.9,3039.4,13125.4,False,355.7,90.356
+2026-10-09T15:43:18,nkvo,nkvo=1,True,models/Qwen3.8-27B-UD-Q4_K_M.gguf,aa5e009,8,-1,f16,f16,8,2048,512,dio,True,0,512,0,0,74.0213,0.0,3809.5,3018.6,3018.6,13125.4,False,374.0,91.492
+2026-10-09T15:43:18,nkvo,nkvo=1,True,models/Qwen3.8-27B-UD-Q4_K_M.gguf,aa5e009,8,-1,f16,f16,8,2048,512,dio,True,0,0,128,0,1.747608,0.0,3809.5,3018.6,3018.6,13125.4,False,374.0,91.492

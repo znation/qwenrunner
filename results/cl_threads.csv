@@ -1,0 +1,11 @@
+timestamp,stage,label,ok,model_filename,build_commit,n_gpu_layers,flash_attn,type_k,type_v,n_threads,n_batch,n_ubatch,load_mode,no_kv_offload,no_op_offload,n_prompt,n_gen,n_depth,avg_ts,stddev_ts,vram_peak_mib,vram_delta_mib,client_vram_peak_mib,client_gtt_peak_mib,vram_violation,rss_peak_mib,wall_s
+2026-10-09T16:45:14,threads,t4,True,models/Qwen3.8-27B-UD-Q4_K_M.gguf,aa5e009,10,-1,f16,f16,4,2048,512,dio,False,0,512,0,0,74.436325,0.0,4329.7,3540.9,3540.9,12632.2,False,351.4,81.195
+2026-10-09T16:45:14,threads,t4,True,models/Qwen3.8-27B-UD-Q4_K_M.gguf,aa5e009,10,-1,f16,f16,4,2048,512,dio,False,0,0,128,0,2.025332,0.0,4329.7,3540.9,3540.9,12632.2,False,351.4,81.195
+2026-10-09T16:46:43,threads,t6,True,models/Qwen3.8-27B-UD-Q4_K_M.gguf,aa5e009,10,-1,f16,f16,6,2048,512,dio,False,0,512,0,0,74.254036,0.0,4326.5,3540.9,3540.9,12632.2,False,351.3,79.04
+2026-10-09T16:46:43,threads,t6,True,models/Qwen3.8-27B-UD-Q4_K_M.gguf,aa5e009,10,-1,f16,f16,6,2048,512,dio,False,0,0,128,0,2.095556,0.0,4326.5,3540.9,3540.9,12632.2,False,351.3,79.04
+2026-10-09T16:48:16,threads,t8,True,models/Qwen3.8-27B-UD-Q4_K_M.gguf,aa5e009,10,-1,f16,f16,8,2048,512,dio,False,0,512,0,0,74.182124,0.0,4338.8,3553.3,3540.9,12632.2,False,351.4,82.843
+2026-10-09T16:48:16,threads,t8,True,models/Qwen3.8-27B-UD-Q4_K_M.gguf,aa5e009,10,-1,f16,f16,8,2048,512,dio,False,0,0,128,0,1.975168,0.0,4338.8,3553.3,3540.9,12632.2,False,351.4,82.843
+2026-10-09T16:49:48,threads,t12,True,models/Qwen3.8-27B-UD-Q4_K_M.gguf,aa5e009,10,-1,f16,f16,12,2048,512,dio,False,0,512,0,0,74.436603,0.0,4338.8,3553.3,3540.9,12632.2,False,353.6,82.209
+2026-10-09T16:49:48,threads,t12,True,models/Qwen3.8-27B-UD-Q4_K_M.gguf,aa5e009,10,-1,f16,f16,12,2048,512,dio,False,0,0,128,0,1.994085,0.0,4338.8,3553.3,3540.9,12632.2,False,353.6,82.209
+2026-10-09T16:51:26,threads,t16,True,models/Qwen3.8-27B-UD-Q4_K_M.gguf,aa5e009,10,-1,f16,f16,16,2048,512,dio,False,0,512,0,0,68.317618,0.0,4470.1,3684.5,3540.9,12632.2,False,351.4,87.755
+2026-10-09T16:51:26,threads,t16,True,models/Qwen3.8-27B-UD-Q4_K_M.gguf,aa5e009,10,-1,f16,f16,16,2048,512,dio,False,0,0,128,0,1.8618,0.0,4470.1,3684.5,3540.9,12632.2,False,351.4,87.755

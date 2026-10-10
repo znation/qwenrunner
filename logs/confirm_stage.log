@@ -1,0 +1,24 @@
+=== round 1 22:58:47
+baseline VRAM: 763.1 MiB (cap 5000.0)
+[ngl/ngl8] OK vram_peak=3802.4 client=3039.4 (+3039.4) exit=0 (792s) n_prompt=512 n_gen=0 21.68 t/s n_prompt=0 n_gen=128 0.18 t/s
+[ngl/ngl10] OK vram_peak=4304.0 client=3540.9 (+3540.9) exit=0 (300s) n_prompt=512 n_gen=0 38.04 t/s n_prompt=0 n_gen=128 0.51 t/s
+wrote results/il_f16.csv, results/il_f16.md
+baseline VRAM: 763.1 MiB (cap 5000.0)
+[ngl/ngl8] OK vram_peak=3894.4 client=3036.7 (+3131.4) exit=0 (266s) n_prompt=512 n_gen=0 34.56 t/s n_prompt=0 n_gen=128 0.58 t/s
+[ngl/ngl10] OK vram_peak=4388.2 client=3538.2 (+3625.2) exit=0 (147s) n_prompt=512 n_gen=0 44.15 t/s n_prompt=0 n_gen=128 1.25 t/s
+wrote results/il_q4.csv, results/il_q4.md
+=== round 2 23:23:51
+baseline VRAM: 763.1 MiB (cap 5000.0)
+[ngl/ngl8] OK vram_peak=3802.4 client=3039.4 (+3039.4) exit=0 (196s) n_prompt=512 n_gen=0 40.84 t/s n_prompt=0 n_gen=128 0.84 t/s
+[ngl/ngl10] OK vram_peak=4304.0 client=3540.9 (+3540.9) exit=0 (244s) n_prompt=512 n_gen=0 27.28 t/s n_prompt=0 n_gen=128 0.71 t/s
+wrote results/il_f16.csv, results/il_f16.md
+baseline VRAM: 763.1 MiB (cap 5000.0)
+[ngl/ngl8] OK vram_peak=3799.7 client=3036.7 (+3036.7) exit=0 (230s) n_prompt=512 n_gen=0 25.16 t/s n_prompt=0 n_gen=128 0.73 t/s
+[ngl/ngl10] OK vram_peak=4396.0 client=3538.2 (+3632.9) exit=0 (183s) n_prompt=512 n_gen=0 41.62 t/s n_prompt=0 n_gen=128 0.91 t/s
+wrote results/il_q4.csv, results/il_q4.md
+=== threads 23:38:05
+baseline VRAM: 763.0 MiB (cap 5000.0)
+[threads/t4] OK vram_peak=4382.6 client=3540.9 (+3619.6) exit=0 (218s) n_prompt=512 n_gen=0 42.64 t/s n_prompt=0 n_gen=128 0.75 t/s
+[threads/t6] OK vram_peak=4376.6 client=3540.9 (+3540.9) exit=0 (134s) n_prompt=512 n_gen=0 40.59 t/s n_prompt=0 n_gen=128 1.32 t/s
+[threads/t8] OK vram_peak=4304.0 client=3540.9 (+3540.9) exit=0 (168s) n_prompt=512 n_gen=0 33.00 t/s n_prompt=0 n_gen=128 1.09 t/s
+[threads/t12] OK vram_peak=4376.6 client=3540.9 (+3540.9) exit=0 (241s) n_prompt=512 n_gen=0 36.91 t/s n_prompt=0 n_gen=128 0.67 t/s

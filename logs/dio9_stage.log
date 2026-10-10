@@ -1,0 +1,23 @@
+=== DIO9 START 15:49:42
+baseline VRAM: 788.7 MiB (cap 5000.0)
+[ngl/ngl8] OK vram_peak=3964.4 client=3039.4 (+3175.7) exit=0 (85s) n_prompt=512 n_gen=0 73.35 t/s n_prompt=0 n_gen=128 1.93 t/s
+[ngl/ngl10] OK vram_peak=4329.7 client=3540.9 (+3540.9) exit=0 (83s) n_prompt=512 n_gen=0 73.67 t/s n_prompt=0 n_gen=128 2.00 t/s
+wrote results/dio9_ngl.csv, results/dio9_ngl.md
+baseline VRAM: 785.5 MiB (cap 5000.0)
+[ngl/ngl8] OK vram_peak=3836.4 client=3039.4 (+3050.8) exit=0 (84s) n_prompt=512 n_gen=0 74.00 t/s n_prompt=0 n_gen=128 1.94 t/s
+[ngl/ngl10] OK vram_peak=4338.8 client=3540.9 (+3550.1) exit=0 (82s) n_prompt=512 n_gen=0 74.41 t/s n_prompt=0 n_gen=128 2.01 t/s
+wrote results/dio9_ngl.csv, results/dio9_ngl.md
+baseline VRAM: 785.5 MiB (cap 5000.0)
+[kv/kv=f16/f16] OK vram_peak=4398.1 client=3605.3 (+3609.4) exit=0 (217s) n_prompt=512 n_gen=0 66.35 t/s n_prompt=0 n_gen=128 1.58 t/s
+[kv/kv=q8_0/f16] OK vram_peak=4382.2 client=3589.4 (+3589.4) exit=0 (213s) n_prompt=512 n_gen=0 64.24 t/s n_prompt=0 n_gen=128 1.70 t/s
+[kv/kv=q8_0/q8_0] OK vram_peak=4417.0 client=3607.4 (+3631.4) exit=0 (211s) n_prompt=512 n_gen=0 66.72 t/s n_prompt=0 n_gen=128 1.68 t/s
+[kv/kv=q4_0/q4_0] OK vram_peak=4349.2 client=3556.4 (+3560.5) exit=0 (215s) n_prompt=512 n_gen=0 61.56 t/s n_prompt=0 n_gen=128 1.73 t/s
+[kv/kv=bf16/bf16] OK vram_peak=4398.1 client=3605.3 (+3609.4) exit=0 (215s) n_prompt=512 n_gen=0 65.75 t/s n_prompt=0 n_gen=128 1.63 t/s
+wrote results/dio9_kv.csv, results/dio9_kv.md
+baseline VRAM: 785.5 MiB (cap 5000.0)
+[batch/b2048/ub512] OK vram_peak=4387.3 client=3573.3 (+3598.6) exit=0 (146s) n_prompt=512 n_gen=0 70.26 t/s n_prompt=0 n_gen=128 1.82 t/s
+[batch/b1024/ub256] OK vram_peak=4103.5 client=3310.7 (+3317.9) exit=0 (159s) n_prompt=512 n_gen=0 59.09 t/s n_prompt=0 n_gen=128 1.82 t/s
+[batch/b512/ub128] OK vram_peak=3973.4 client=3180.6 (+3187.8) exit=0 (185s) n_prompt=512 n_gen=0 45.06 t/s n_prompt=0 n_gen=128 1.81 t/s
+[batch/b256/ub64] OK vram_peak=3961.2 client=3168.4 (+3175.7) exit=0 (244s) n_prompt=512 n_gen=0 29.48 t/s n_prompt=0 n_gen=128 1.84 t/s
+wrote results/dio9_batch.csv, results/dio9_batch.md
+=== DIO9 DONE 16:28:30

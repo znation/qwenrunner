@@ -1,0 +1,11 @@
+timestamp,stage,label,ok,model_filename,build_commit,n_gpu_layers,flash_attn,type_k,type_v,n_threads,n_batch,n_ubatch,load_mode,no_kv_offload,no_op_offload,n_prompt,n_gen,n_depth,avg_ts,stddev_ts,vram_peak_mib,vram_delta_mib,client_vram_peak_mib,client_gtt_peak_mib,vram_violation,rss_peak_mib,wall_s
+2026-10-09T17:47:38,kv,kv=f16/f16,True,models/Qwen3.8-27B-UD-Q4_K_M.gguf,aa5e009,10,-1,f16,f16,8,2048,512,dio,False,0,512,0,0,72.211837,0.0,4348.1,3553.3,3540.9,12632.2,False,355.2,90.376
+2026-10-09T17:47:38,kv,kv=f16/f16,True,models/Qwen3.8-27B-UD-Q4_K_M.gguf,aa5e009,10,-1,f16,f16,8,2048,512,dio,False,0,0,128,0,1.802491,0.0,4348.1,3553.3,3540.9,12632.2,False,355.2,90.376
+2026-10-09T17:49:18,kv,kv=q8_0/f16,True,models/Qwen3.8-27B-UD-Q4_K_M.gguf,aa5e009,10,-1,q8_0,f16,8,2048,512,dio,False,0,512,0,0,71.203611,0.0,4346.7,3551.9,3540.2,12632.2,False,345.4,89.983
+2026-10-09T17:49:18,kv,kv=q8_0/f16,True,models/Qwen3.8-27B-UD-Q4_K_M.gguf,aa5e009,10,-1,q8_0,f16,8,2048,512,dio,False,0,0,128,0,1.802454,0.0,4346.7,3551.9,3540.2,12632.2,False,345.4,89.983
+2026-10-09T17:50:55,kv,kv=q8_0/q8_0,True,models/Qwen3.8-27B-UD-Q4_K_M.gguf,aa5e009,10,-1,q8_0,q8_0,8,2048,512,dio,False,0,512,0,0,72.397103,0.0,4336.0,3541.2,3541.2,12632.2,False,339.0,89.767
+2026-10-09T17:50:55,kv,kv=q8_0/q8_0,True,models/Qwen3.8-27B-UD-Q4_K_M.gguf,aa5e009,10,-1,q8_0,q8_0,8,2048,512,dio,False,0,0,128,0,1.795596,0.0,4336.0,3541.2,3541.2,12632.2,False,339.0,89.767
+2026-10-09T17:52:35,kv,kv=q4_0/q4_0,True,models/Qwen3.8-27B-UD-Q4_K_M.gguf,aa5e009,10,-1,q4_0,q4_0,8,2048,512,dio,False,0,512,0,0,72.496607,0.0,4333.0,3538.2,3538.2,12632.2,False,331.8,89.874
+2026-10-09T17:52:35,kv,kv=q4_0/q4_0,True,models/Qwen3.8-27B-UD-Q4_K_M.gguf,aa5e009,10,-1,q4_0,q4_0,8,2048,512,dio,False,0,0,128,0,1.799751,0.0,4333.0,3538.2,3538.2,12632.2,False,331.8,89.874
+2026-10-09T17:54:11,kv,kv=bf16/bf16,True,models/Qwen3.8-27B-UD-Q4_K_M.gguf,aa5e009,10,-1,bf16,bf16,8,2048,512,dio,False,0,512,0,0,73.358995,0.0,4337.7,3540.9,3540.9,12632.2,False,351.4,87.588
+2026-10-09T17:54:11,kv,kv=bf16/bf16,True,models/Qwen3.8-27B-UD-Q4_K_M.gguf,aa5e009,10,-1,bf16,bf16,8,2048,512,dio,False,0,0,128,0,1.847555,0.0,4337.7,3540.9,3540.9,12632.2,False,351.4,87.588

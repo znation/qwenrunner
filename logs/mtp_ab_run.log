@@ -1,0 +1,5 @@
+baseline VRAM: 1347.9 MiB (cap 5000.0); prompt 15907 chars
+base         vram_peak=4281.0  client=2793.9  exit=-9  load=18.07  pp=39.69    tg=1.222    draft=-/- 
+mtp-sidecar  vram_peak=5244.2  client=3121.6  exit=-9  load=None   pp=0        tg=0        draft=-/- ERR health timeout
+stopping: mtp-sidecar breached the cap
+wrote 2 records to results/mtp_ab.jsonl

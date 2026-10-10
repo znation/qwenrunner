@@ -1,0 +1,29 @@
+baseline VRAM: 746.9 MiB (cap 5000.0)
+[ngl/ngl8] OK vram_peak=3786.3 client=3039.4 (+3039.4) exit=0 (129s) n_prompt=512 n_gen=0 48.78 t/s n_prompt=0 n_gen=128 1.37 t/s
+[ngl/ngl10] OK vram_peak=4376.5 client=3540.9 (+3629.6) exit=0 (200s) n_prompt=512 n_gen=0 42.73 t/s n_prompt=0 n_gen=128 0.76 t/s
+[ngl/ngl12] OK vram_peak=4824.6 client=4014.6 (+4005.1) exit=0 (132s) n_prompt=512 n_gen=0 41.68 t/s n_prompt=0 n_gen=128 1.33 t/s
+wrote results/final_ngl_f16.csv, results/final_ngl_f16.md
+baseline VRAM: 819.5 MiB (cap 5000.0)
+[ngl/ngl8] OK vram_peak=3850.6 client=3036.7 (+3031.1) exit=0 (134s) n_prompt=512 n_gen=0 47.21 t/s n_prompt=0 n_gen=128 1.24 t/s
+[ngl/ngl10] OK vram_peak=4551.7 client=3538.2 (+3546.5) exit=0 (180s) n_prompt=512 n_gen=0 33.37 t/s n_prompt=0 n_gen=128 0.95 t/s
+wrote results/final_ngl_q4.csv, results/final_ngl_q4.md
+baseline VRAM: 1008.5 MiB (cap 5000.0)
+[threads/t4] OK vram_peak=4573.3 client=3540.9 (+3564.8) exit=0 (161s) n_prompt=512 n_gen=0 48.54 t/s n_prompt=0 n_gen=128 1.16 t/s
+[threads/t6] OK vram_peak=4571.3 client=3540.9 (+3540.9) exit=0 (147s) n_prompt=512 n_gen=0 48.20 t/s n_prompt=0 n_gen=128 1.22 t/s
+[threads/t8] OK vram_peak=4571.3 client=3540.9 (+3557.0) exit=0 (130s) n_prompt=512 n_gen=0 60.04 t/s n_prompt=0 n_gen=128 1.29 t/s
+[threads/t12] OK vram_peak=4571.3 client=3540.9 (+3557.0) exit=0 (219s) n_prompt=512 n_gen=0 52.18 t/s n_prompt=0 n_gen=128 0.67 t/s
+[threads/t16] OK vram_peak=4555.2 client=3540.9 (+3540.9) exit=0 (973s) n_prompt=512 n_gen=0 39.75 t/s n_prompt=0 n_gen=128 0.14 t/s
+wrote results/final_threads.csv, results/final_threads.md
+baseline VRAM: 1058.8 MiB (cap 5000.0)
+[ngl/ngl10] OK vram_peak=4631.9 client=3573.3 (+3573.1) exit=0 (297s) n_prompt=512 n_gen=0 31.56 t/s n_prompt=0 n_gen=128 0.81 t/s
+wrote results/final_d4096_f16.csv, results/final_d4096_f16.md
+baseline VRAM: 1035.5 MiB (cap 5000.0)
+[ngl/ngl10] OK vram_peak=4699.8 client=3547.4 (+3664.4) exit=0 (273s) n_prompt=512 n_gen=0 45.27 t/s n_prompt=0 n_gen=128 0.97 t/s
+wrote results/final_d4096_q4.csv, results/final_d4096_q4.md
+baseline VRAM: 1026.6 MiB (cap 5000.0)
+[batch/b2048/ub512] OK vram_peak=4712.5 client=3547.4 (+3685.9) exit=0 (404s) n_prompt=512 n_gen=0 21.26 t/s n_prompt=0 n_gen=128 0.53 t/s
+[batch/b1024/ub256] OK vram_peak=4409.3 client=3284.7 (+3382.7) exit=0 (391s) n_prompt=512 n_gen=0 31.61 t/s n_prompt=0 n_gen=128 0.73 t/s
+[batch/b512/ub128] OK vram_peak=4311.3 client=3154.6 (+3192.8) exit=0 (461s) n_prompt=512 n_gen=0 12.54 t/s n_prompt=0 n_gen=128 1.12 t/s
+[batch/b256/ub64] FAIL vram_peak=6389.3 client=3142.5 (+5624.3) exit=-9 (660s) NO RESULTS
+wrote results/final_batch.csv, results/final_batch.md
+FINAL PASS DONE 22:52:51
