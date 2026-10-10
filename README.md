@@ -37,10 +37,12 @@ Best measured figures: **74.41 t/s prompt and 2.01 t/s generation** (`-ngl 10`,
 `-ngl 8`.
 
 **With the Thunderbolt eGPU attached, `serve.sh` splits one model across both
-GPUs** — 40 layers at 8k context, 32 at 128k — which is +28 % generation over the
-1070 alone and roughly triples the offloadable layer count (40 vs 12). A genuine
-128k context runs at **1.19 t/s generation and 29.8 t/s prompt** (73-minute
-prefill), inside the display-GPU cap. See [`RESULTS.md`](RESULTS.md).
+GPUs** — 40 layers at 8k context, 32 at the 128k default — which is +28 %
+generation over the 1070 alone and roughly triples the offloadable layer count
+(40 vs 12). The eGPU is now required: `serve.sh` exits rather than fall back to
+the Vega 10 alone, which cannot hold 128k context under the cap. A genuine 128k
+context runs at **1.19 t/s generation and 29.8 t/s prompt** (73-minute prefill),
+inside the display-GPU cap. See [`RESULTS.md`](RESULTS.md).
 
 ## Prerequisites
 
@@ -84,21 +86,20 @@ present. Both backends end up in one binary and `-dev` selects between them.
 ## Run
 
 ```
-./serve.sh                       # best config for the hardware present (32k context)
-CTX=131072 ./serve.sh            # 128k context (fewer layers fit — see below)
-NGL=40 TS=4,1 ./serve.sh         # override the split
-DEV=Vulkan0 NGL=10 ./serve.sh    # force the Vega 10 alone
-./serve.sh --spec-type draft-mtp -md models/mtp-Qwen3.8-27B-Q4_0.gguf -ngld 0
+./serve.sh                       # 128k context across both GPUs (the default)
+CTX=32768 ./serve.sh             # shorter context, more layers (faster)
+NGL=36 TS=4,1 ./serve.sh         # override the split
 ```
 
-`serve.sh` chooses between two configurations at startup and prints which:
+`serve.sh` requires the eGPU and prints the configuration it picked. It errors
+out if `/dev/nvidia0` is absent or the binary was built without CUDA, because
+the Vega 10 alone cannot hold 128k context under the display cap:
 
 * **eGPU present** — one model instance split across the GTX 1070 (CUDA) and the
   Vega 10 (Vulkan), with the remainder on CPU: `-dev CUDA0,Vulkan0 -sm layer
   -ts 4,1`. The layer count is derived from the context, because the KV cache
   competes with the weights for the same VRAM — **40 layers at 8k, 32 at 128k**,
-  both measured.
-* **no eGPU** — the Vega 10 alone, `-ngl` from the client-VRAM-per-layer rule.
+  both measured, so the 128k default offloads 8 layers to CPU.
 
 `serve.sh` runs `llama-server` under `scripts/guard.py`, which polls system-wide
 VRAM every 50 ms and `SIGKILL`s the process group if it exceeds `CAP`
@@ -112,8 +113,10 @@ hour). `-ngl 12` fits at 765 MiB and breaches at 1114; 10 fits at 785 and
 breaches at 1592; 8 survives a loaded desktop. Pick from the measured client
 peak, not from a constant.
 
-**MTP needs `-ngl 8` or lower.** The draft head adds ~498 MiB of client VRAM and
-will breach the cap at `-ngl 10` (measured twice). Its win is also
+**MTP needs `-ngl 8` or lower** — measured on the Vega 10 alone, which is no
+longer a `serve.sh` mode now that the eGPU is required (run `llama-server` with
+that `-ngl` directly to reproduce it). The draft head adds ~498 MiB of client
+VRAM and will breach the cap at `-ngl 10` (measured twice). Its win is also
 configuration-dependent: **+97.8 %** generation on Q4_K_M at `-ngl 8`, but only
 **+3.6 %** on Q2_K_XL at `-ngl 16`, where the target is fast enough that the
 CPU-resident draft head becomes the bottleneck.

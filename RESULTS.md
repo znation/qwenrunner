@@ -533,24 +533,28 @@ does not fit.
 `serve.sh` runs `llama-server` under `guard.py`, which polls system-wide
 VRAM every 50 ms and `SIGKILL`s the process group above `CAP` (default
 5000 MiB), so the display GPU is protected by measurement rather than by
-arithmetic. Defaults are the measured winners: `-ngl 8 -c 8192 -t 8 -lm dio
--b 2048 -ub 512 -ctk q4_0 -ctv q4_0 -fa on`. It forwards `SIGINT`/`SIGTERM` to
-the child, so Ctrl-C actually stops the server.
+arithmetic. It serves one model split across both GPUs — `-dev CUDA0,Vulkan0
+-sm layer -ts 4,1` — and **requires the eGPU**: without `/dev/nvidia0` or a CUDA
+build it exits 1 instead of degrading to a configuration the watchdog would
+kill. Defaults: `-c 131072` with `-ngl` derived from the context (32 at 128k,
+40 at 8k), `-t 8 -lm dio -b 2048 -ub 512 -ctk q4_0 -ctv q4_0 -fa on`. It
+forwards `SIGINT`/`SIGTERM` to the child, so Ctrl-C actually stops the server.
 
 ```
-./serve.sh                       # → http://127.0.0.1:8080
-curl -sf localhost:8080/health           # ok after a 9 s load
+./serve.sh                       # → http://127.0.0.1:8080, 128k context
+curl -sf localhost:8080/health           # ok after a ~13 s load
 curl -s localhost:8080/v1/chat/completions -H 'Content-Type: application/json' \
-     -d '{"messages":[{"role":"user","content":"hi"}],"max_tokens":16}'
+     -d '{"messages":[{"role":"user","content":"Reply with exactly: pong"}],"max_tokens":64}'
 ```
 
-Smoke-tested end to end with that exact command line: `exit_code 0`,
-`vram_violation: false`, peak **3553.3 MiB** of the 5000 MiB cap (client
-2754.5 MiB, RSS 1189.4 MiB), and a clean teardown (`kill -TERM <guard>` leaves
-`pgrep -c llama-server` at 0). The completion returns `predicted_n 16` with an
-**empty `content`**: every token went to `reasoning_content`. Qwen-3.8-27B is a
-thinking model — budget `max_tokens` for the reasoning trace or the visible
-answer is truncated away.
+Smoke-tested end to end at those defaults, `n_ctx_slot = 131072` confirmed in the
+log: `exit_code 0`, `vram_violation: false`, peak **3972.8 MiB** of the 5000 MiB
+cap (client 2456.8 MiB, RSS 10 152.3 MiB, NVIDIA 8019.3 of 8192 MiB), and a
+clean teardown (`SIGTERM` to the guard leaves `pgrep -c llama-server` at 0). The
+completion returns `content: "pong"` in 38 tokens. Qwen-3.8-27B is a thinking
+model, so a `max_tokens` smaller than the reasoning trace returns an **empty
+`content`** with everything in `reasoning_content` — budget for the trace or the
+visible answer is truncated away.
 
 `guard.py` forwarding signals is load-bearing: the child is started with
 `start_new_session=True`, so before the fix a Ctrl-C on `serve.sh` killed only
