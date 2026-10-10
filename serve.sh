@@ -29,7 +29,11 @@ export PATH="$ROOT/tools/local/usr/bin:$PATH"
 export LD_LIBRARY_PATH="$ROOT/build/bin:$ROOT/tools/local/usr/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH:-}"
 
 MODEL="${MODEL:-$ROOT/models/Qwen3.8-27B-UD-Q4_K_M.gguf}"
-CTX="${CTX:-8192}"
+# 8k was too small for an agent client: pi's system prompt + tool schemas run
+# ~4.4k tokens, and pi reserves 4096 tokens of headroom, leaving ~1 token of
+# output at 8k. 32k keeps a usable working set (measured: 39 layers, 4.2 GiB
+# on the display GPU, under the 5000 MiB cap).
+CTX="${CTX:-32768}"
 THREADS="${THREADS:-8}"
 
 # eGPU present? /dev/nvidia0 exists only once the proprietary driver has bound

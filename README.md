@@ -84,7 +84,7 @@ present. Both backends end up in one binary and `-dev` selects between them.
 ## Run
 
 ```
-./serve.sh                       # picks the best config for the hardware present
+./serve.sh                       # best config for the hardware present (32k context)
 CTX=131072 ./serve.sh            # 128k context (fewer layers fit — see below)
 NGL=40 TS=4,1 ./serve.sh         # override the split
 DEV=Vulkan0 NGL=10 ./serve.sh    # force the Vega 10 alone
