@@ -83,11 +83,11 @@ present. Both backends end up in one binary and `-dev` selects between them.
 ## Run
 
 ```
-./scripts/serve.sh                       # picks the best config for the hardware present
-CTX=131072 ./scripts/serve.sh            # 128k context (fewer layers fit — see below)
-NGL=40 TS=4,1 ./scripts/serve.sh         # override the split
-DEV=Vulkan0 NGL=10 ./scripts/serve.sh    # force the Vega 10 alone
-./scripts/serve.sh --spec-type draft-mtp -md models/mtp-Qwen3.8-27B-Q4_0.gguf -ngld 0
+./serve.sh                       # picks the best config for the hardware present
+CTX=131072 ./serve.sh            # 128k context (fewer layers fit — see below)
+NGL=40 TS=4,1 ./serve.sh         # override the split
+DEV=Vulkan0 NGL=10 ./serve.sh    # force the Vega 10 alone
+./serve.sh --spec-type draft-mtp -md models/mtp-Qwen3.8-27B-Q4_0.gguf -ngld 0
 ```
 
 `serve.sh` chooses between two configurations at startup and prints which:
@@ -179,7 +179,7 @@ window above 4 GB. Verify: `nvidia-smi` lists the card with 8192 MiB, and
 | script | purpose |
 |---|---|
 | `scripts/build.sh` | configure + build llama.cpp with Vulkan, pinned revision |
-| `scripts/serve.sh` | launch `llama-server` under the VRAM watchdog |
+| `serve.sh` | launch `llama-server` under the VRAM watchdog |
 | `scripts/guard.py` | VRAM watchdog + measurement: display-GPU VRAM, per-DRM-client VRAM, NVIDIA VRAM via NVML, RSS, `cpu_busy_pct`, `bg_cpu_pct` |
 | `scripts/bench.py` | `llama-bench` sweeps: `ngl`, `kv`, `fa`, `depth`, `ctx`, `threads`, `batch`, `load`, `nkvo`, `nopo`, `quant` |
 | `scripts/mtp_ab.py` | MTP A/B over HTTP, with `--server-extra` for arbitrary flags |

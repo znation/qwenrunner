@@ -17,14 +17,14 @@
 # Overridable via env (anything unset is derived):
 #   MODEL CTX THREADS DEV TS NGL LM BATCH UBATCH CTK CTV FA HOST PORT CAP
 #
-#   ./scripts/serve.sh                      # picks the best available config
-#   CTX=131072 ./scripts/serve.sh           # 128k context, fewer layers
-#   NGL=40 TS=4,1 ./scripts/serve.sh        # override the split
-#   DEV=Vulkan0 NGL=10 ./scripts/serve.sh   # force the Vega 10 alone
+#   ./serve.sh                      # picks the best available config
+#   CTX=131072 ./serve.sh           # 128k context, fewer layers
+#   NGL=40 TS=4,1 ./serve.sh        # override the split
+#   DEV=Vulkan0 NGL=10 ./serve.sh   # force the Vega 10 alone
 # Extra args are appended verbatim to the llama-server command line.
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export PATH="$ROOT/tools/local/usr/bin:$PATH"
 export LD_LIBRARY_PATH="$ROOT/build/bin:$ROOT/tools/local/usr/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH:-}"
 

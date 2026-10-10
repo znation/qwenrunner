@@ -508,7 +508,7 @@ So **128k costs ~8 layers of offload** (40 → 32). f16 KV is not an option here
 
 ## Serving (`llama-server`)
 
-`scripts/serve.sh` runs `llama-server` under `guard.py`, which polls system-wide
+`serve.sh` runs `llama-server` under `guard.py`, which polls system-wide
 VRAM every 50 ms and `SIGKILL`s the process group above `CAP` (default
 5000 MiB), so the display GPU is protected by measurement rather than by
 arithmetic. Defaults are the measured winners: `-ngl 8 -c 8192 -t 8 -lm dio
@@ -516,7 +516,7 @@ arithmetic. Defaults are the measured winners: `-ngl 8 -c 8192 -t 8 -lm dio
 the child, so Ctrl-C actually stops the server.
 
 ```
-./scripts/serve.sh                       # → http://127.0.0.1:8080
+./serve.sh                       # → http://127.0.0.1:8080
 curl -sf localhost:8080/health           # ok after a 9 s load
 curl -s localhost:8080/v1/chat/completions -H 'Content-Type: application/json' \
      -d '{"messages":[{"role":"user","content":"hi"}],"max_tokens":16}'
