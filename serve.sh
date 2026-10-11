@@ -16,9 +16,10 @@
 # separately as nvidia_vram_peak_mib.
 #
 # Overridable via env (anything unset is derived):
-#   MODEL CTX THREADS TS NGL LM BATCH UBATCH CTK CTV FA HOST PORT CAP
+#   MODEL CTX THREADS TS NGL LM BATCH UBATCH CTK CTV FA HOST PORT CAP MTP MD NGLD
 #
-#   ./serve.sh                      # 128k context across both GPUs
+#   ./serve.sh                      # 128k context across both GPUs, MTP on
+#   MTP=0 ./serve.sh                # the same split without speculative decoding
 #   CTX=32768 ./serve.sh            # shorter context, more layers (faster)
 #   NGL=36 TS=4,1 ./serve.sh        # override the split
 # Extra args are appended verbatim to the llama-server command line.
@@ -41,6 +42,16 @@ HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-8080}"
 CAP="${CAP:-5000}"
 
+# MTP speculation is ON by default: measured +29 % generation over this split's
+# base config at 128k (2.73 -> 3.52 t/s at depth 5246) for -18 % prompt and 6
+# layers moved to the CPU. It was the largest single lever measured on this
+# host (+97.8 % on the Vega-only path). The draft head runs on the CPU
+# (-ngld 0): the 1070 has no room for it, and the default -1 would offload the
+# 1.37 GB draft file to VRAM and breach the display cap.
+MTP="${MTP:-1}"
+MD="${MD:-$ROOT/models/mtp-Qwen3.8-27B-Q4_0.gguf}"
+NGLD="${NGLD:-0}"
+
 # The eGPU is required, not optional: /dev/nvidia0 exists only once the
 # proprietary driver has bound the card, so this is an instant check (no
 # nvidia-smi spawn).
@@ -60,7 +71,16 @@ DEV="CUDA0,Vulkan0"
 TS="${TS:-4,1}"
 # Measured: 40 layers fit at 8k context, 32 at 128k. Interpolate linearly in
 # context length between those two points; override NGL to depart from it.
+# MTP needs ~900 MiB of CUDA compute buffer that the 1070 does not have at that
+# count: at 128k `-ngl 32` aborts in `cudaMalloc` for a 901 MiB pp buffer, and
+# at 8k `-ngl 40` fails the same way. Six layers (~1.5 GB) of headroom clears it
+# at both ends — measured startable at 26 (128k) and 34 (8k), not at 32/40.
+# The reserve applies to the derived count only; an explicit NGL is honoured.
+NGL_OVERRIDE="${NGL:-}"
 NGL="${NGL:-$(( 40 - (CTX - 8192) / 15360 ))}"
+if [ "$MTP" = 1 ] && [ -z "$NGL_OVERRIDE" ]; then
+    NGL=$(( NGL - 6 ))
+fi
 [ "$NGL" -lt 8 ] && NGL=8
 
 # `-lm dio` reads the weights with O_DIRECT; measured ~12 % faster on prompt
@@ -80,7 +100,17 @@ mkdir -p "$ROOT/logs"
 
 echo "serve: model=$(basename "$MODEL") ctx=$CTX threads=$THREADS"
 echo "serve: dev=$DEV -ts $TS -ngl=$NGL -lm=$LM -b $BATCH -ub $UBATCH -ctk $CTK -ctv $CTV -fa $FA"
+if [ "$MTP" = 1 ]; then
+    echo "serve: mtp=on draft=$(basename "$MD") ngld=$NGLD (-ngl reduced by 6 for the draft's CUDA compute buffer)"
+else
+    echo "serve: mtp=off"
+fi
 echo "serve: cap=${CAP}MiB (display GPU)  http://$HOST:$PORT  log: $ROOT/logs/serve.log"
+
+MTP_ARGS=()
+if [ "$MTP" = 1 ]; then
+    MTP_ARGS=(--spec-type draft-mtp -md "$MD" -ngld "$NGLD")
+fi
 
 exec python3 "$ROOT/scripts/guard.py" --cap-mib "$CAP" --label serve \
     --log "$ROOT/logs/serve.log" -- \
@@ -89,4 +119,5 @@ exec python3 "$ROOT/scripts/guard.py" --cap-mib "$CAP" --label serve \
     -dev "$DEV" -sm layer -ts "$TS" \
     -lm "$LM" -b "$BATCH" -ub "$UBATCH" \
     -ctk "$CTK" -ctv "$CTV" -fa "$FA" \
+    "${MTP_ARGS[@]}" \
     --host "$HOST" --port "$PORT" "$@"

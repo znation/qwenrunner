@@ -512,6 +512,33 @@ but offloading 32 layers across two GPUs more than compensates for the context.
 The 1070 finishes at 7945 of 8192 MiB, so `-ngl 32` is at the edge; `-ngl 36`
 does not fit.
 
+### MTP at the split **[clean]**
+
+MTP is the `serve.sh` default on this split. `--spec-type draft-mtp -md
+models/mtp-Qwen3.8-27B-Q4_0.gguf -ngld 0`, 128k context, `data/long_prompt.txt`
+(5246-token prompt), one request each, idle host:
+
+| config | prompt t/s | generation t/s |
+|---|---|---|
+| base, `-ngl 32` | 40.24 | 2.73 |
+| base, `-ngl 26` | 35.77 | 2.49 |
+| **MTP, `-ngl 26`** | 32.99 | **3.52** |
+
+* **+29 % generation over the `-ngl 32` base config** (2.73 → 3.52 t/s), and
+  +41 % over base at the same `-ngl`, for −18 % prompt and 6 layers moved to the
+  CPU. The same run's slot log reports 21 of 33 drafts accepted.
+* **MTP cannot run at the base layer count.** At 128k, `-ngl 32` with MTP aborts
+  before load: `ggml_backend_cuda_buffer_type_alloc_buffer: allocating 901.25
+  MiB on device 0: cudaMalloc failed: out of memory` → `failed to allocate
+  compute pp buffers`. At 8k, `-ngl 40` fails the same way while `-ngl 36` and
+  `-ngl 34` start clean (load 14 s). Hence the 6-layer reserve: **26 at 128k,
+  34 at 8k**.
+* **Unmeasured at 130k depth.** These figures are at depth 5246; the 1.19 t/s
+  figure above is the base config at 130 729 tokens. MTP's benefit at that depth
+  is unknown, and the reserve costs 6 layers, so the two effects trade.
+* `-ngld 0` is what keeps the 1.37 GB draft file off the GPUs; the 1070 has no
+  room for it at any tested `-ngl`.
+
 ### Traps
 
 * **`llama-bench` cannot measure a combined split.** Its `-dev` lists devices to
@@ -537,24 +564,28 @@ arithmetic. It serves one model split across both GPUs — `-dev CUDA0,Vulkan0
 -sm layer -ts 4,1` — and **requires the eGPU**: without `/dev/nvidia0` or a CUDA
 build it exits 1 instead of degrading to a configuration the watchdog would
 kill. Defaults: `-c 131072` with `-ngl` derived from the context (32 at 128k,
-40 at 8k), `-t 8 -lm dio -b 2048 -ub 512 -ctk q4_0 -ctv q4_0 -fa on`. It
-forwards `SIGINT`/`SIGTERM` to the child, so Ctrl-C actually stops the server.
+40 at 8k) **minus 6 when MTP is on**, `-t 8 -lm dio -b 2048 -ub 512 -ctk q4_0
+-ctv q4_0 -fa on`, and MTP (`MTP=0` disables it, `NGL=` overrides the reserve).
+It forwards `SIGINT`/`SIGTERM` to the child, so Ctrl-C actually stops the server.
 
 ```
-./serve.sh                       # → http://127.0.0.1:8080, 128k context
+./serve.sh                       # → http://127.0.0.1:8080, 128k context + MTP
 curl -sf localhost:8080/health           # ok after a ~13 s load
 curl -s localhost:8080/v1/chat/completions -H 'Content-Type: application/json' \
      -d '{"messages":[{"role":"user","content":"Reply with exactly: pong"}],"max_tokens":64}'
 ```
 
-Smoke-tested end to end at those defaults, `n_ctx_slot = 131072` confirmed in the
-log: `exit_code 0`, `vram_violation: false`, peak **3972.8 MiB** of the 5000 MiB
-cap (client 2456.8 MiB, RSS 10 152.3 MiB, NVIDIA 8019.3 of 8192 MiB), and a
-clean teardown (`SIGTERM` to the guard leaves `pgrep -c llama-server` at 0). The
-completion returns `content: "pong"` in 38 tokens. Qwen-3.8-27B is a thinking
-model, so a `max_tokens` smaller than the reasoning trace returns an **empty
-`content`** with everything in `reasoning_content` — budget for the trace or the
-visible answer is truncated away.
+Smoke-tested end to end at the pre-MTP defaults (MTP off, `-ngl 32`),
+`n_ctx_slot = 131072` confirmed in the log: `exit_code 0`, `vram_violation:
+false`, peak **3972.8 MiB** of the 5000 MiB cap (client 2456.8 MiB, RSS 10 152.3
+MiB, NVIDIA 8019.3 of 8192 MiB), and a clean teardown (`SIGTERM` to the guard
+leaves `pgrep -c llama-server` at 0). The completion returns `content: "pong"`
+in 38 tokens. The MTP default re-smoke-tested the same way: `n_ctx_slot =
+131072`, `content: "pong"`, slot log `draft acceptance = 0.63636 (21 accepted /
+33 generated)`, `pgrep -c llama-server` 0 after `SIGTERM`. Qwen-3.8-27B is a
+thinking model, so a `max_tokens` smaller than the reasoning trace returns an
+**empty `content`** with everything in `reasoning_content` — budget for the trace
+or the visible answer is truncated away.
 
 `guard.py` forwarding signals is load-bearing: the child is started with
 `start_new_session=True`, so before the fix a Ctrl-C on `serve.sh` killed only
