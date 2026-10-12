@@ -639,6 +639,15 @@ mid-document prompt, 64 tokens out), `results/opt_threads_split.json`:
   fewer threads help: the draft and the target's CPU layers are serial, so the
   CPU work that remains is on the critical path.
 
+The two other thread knobs are batch threads and CPU affinity, and neither helps
+(`results/cpu_pin_fit.jsonl`, and the `-tb` table under "Prefill-side levers"
+below). Pinning the 8 threads to the 8 physical cores (`--cpu-strict 1 -Cr 0-7`)
+is neutral on prompt (36.92 vs 36.95) and −3 % on generation (6.054 vs 6.234);
+pinning across the whole 8c/16t package (`-Cr 0-15`) costs **38 %** of
+generation (3.867 t/s). llama.cpp does not document how the mask maps threads to
+CPUs, so the mechanism is unestablished — but the default, un-pinned placement
+is the fastest of the three, so both knobs are best left at their defaults.
+
 #### MTP's benefit is content-dependent **[clean]**
 
 The same configuration on a *different* continuation of the same corpus —
@@ -663,8 +672,162 @@ reps, `results/opt_midprompt.json`:
 * MTP never measured as a *loss* at the shipped configuration, but +9 % is the
   honest floor for a generation-bound workload.
 
+#### Speculation variants that change nothing **[clean]**
+
+The same mid-document continuation as the content-dependence row above
+(`data/long_prompt.txt` truncated to 4500 chars, `-ngl 28 -ts 6,1 -np 1`,
+`--n-predict 64`, `-lm dio -b 2048 -ub 512 -ctk q4_0 -ctv q4_0 -fa on`),
+`results/spec_ab.jsonl`:
+
+| arm | prompt t/s | generation t/s | draft / accepted |
+|---|---|---|---|
+| shipped MTP (`--spec-type draft-mtp -md … -devd Vulkan0 -ngld 99`) | 34.11 | 2.855 | 27 / 104 |
+| + `--spec-draft-sampling probabilistic` | 34.00 | 2.946 | 27 / 104 |
+| + `ngram-simple` (`--spec-type draft-mtp,ngram-simple`) | 33.94 | 2.957 | **27 / 104** |
+
+* **Both variants draft exactly the same 104 tokens and land 27 of them**, so
+  the ≤3.6 % spread is single-sample noise, not an effect. Probabilistic draft
+  sampling does not move acceptance here, and chaining `ngram-simple` onto
+  `draft-mtp` adds nothing — the ngram path found no usable match on this
+  prompt. Neither is worth carrying.
+* The run also reproduced the content-dependence figure exactly (27/104, 26 %),
+  which is a good check on that section.
+
+### Prefill-side levers that are dead ends **[clean]**
+
+Prompt throughput at depth is the expensive number here (29.79 t/s on a real
+130 729-token prefill, ~73 min), so three ways to raise it were tried at the
+shipped split (`-ngl 28 -ts 6,1` + MTP on the Vega, 15 907-char / 5246-token
+prompt, `--n-predict 32`).
+
+**Batch threads do nothing** — `results/tb8_fit.jsonl`, `tb12_fit.jsonl`,
+`tb16_fit.jsonl`:
+
+| `-tb` | prompt t/s | generation t/s |
+|---|---|---|
+| 8 (= `-t`, default) | 36.95 | 6.234 |
+| 12 | 36.96 | 6.264 |
+| 16 | 36.24 | 6.139 |
+
+All three within 2 %, i.e. noise. This is the same finding as the thread sweep
+seen from the prefill side: the CPU work that remains is on the serial path, so
+handing prompt processing more threads than `-t` buys nothing.
+
+**Larger batches are forbidden by the cap** — `results/batch_hi_fit.jsonl`:
+
+| `-b` / `-ub` | result |
+|---|---|
+| 4096 / 512 | 37.04 prompt / 6.241 gen — identical to the default 2048/512 |
+| 2048 / 1024 | **✗ cap breach** — system peak 5319 MiB, `SIGKILL` before health |
+| 4096 / 1024 | **✗ cap breach** — same 5319 MiB, client 2509 / NVIDIA 7745 |
+
+The `-b 4096` half is free (the logical batch does not drive allocation), but
+`-ub 1024` grows the compute buffer enough to breach the 5000 MiB cap even
+though the trunk is unchanged — so 512 is the largest usable micro-batch at this
+configuration. Combined with the depth-4096 sweep (where the default 2048/512
+beat every smaller micro-batch), **`-b 2048 -ub 512` is pinned from both sides**.
+
+**A smaller ubatch does not buy layers** — `results/ub256_fit.jsonl`. The 1070
+refuses `-ngl 32` at 128k with `allocating 901.25 MiB on device 0` (compute pp
+buffers), so `-ub 256` was tried as a way to shrink that buffer and offload more:
+
+| `-ngl` | `-ub` | outcome |
+|---|---|---|
+| 30 | 256 | ok — client 3158, NVIDIA 7861, 4.591 t/s |
+| 32 | 256 | ✗ `allocating 799.25 MiB on device 0: cudaMalloc failed` |
+| 34 | 256 | ✗ same |
+
+Halving the micro-batch shrank the pp compute buffer by only 11 % (901 → 799
+MiB) because it is dominated by the flash-attention workspace, which scales with
+`n_ctx`, not with the ubatch. The `-ngl` ceiling is therefore unchanged, and
+trading prefill rate for it is pointless.
+
+### Split modes other than `-sm layer` are unavailable **[source]**
+
+A parallelized split (`-sm row`, `-sm tensor`) would have put *both* GPUs on
+every layer — the one structural change that could have attacked the 73-minute
+prefill, which is pipelined and therefore single-GPU at a time. It cannot be
+used on this build:
+
+```
+$ llama-completion … -dev CUDA0,Vulkan0 -sm row -ts 6,1 -ngl 20 -c 8192 …
+E llama_model_load: error loading model: device CUDA0 does not support split buffers
+```
+
+(`logs/split-mode-row.log`, exit 1 after 1.2 s, no health.)
+
+Row/tensor split requires each backend to export
+`ggml_backend_split_buffer_type`; `llama-model.cpp:1175` throws exactly this
+message when `ggml_backend_reg_get_proc_address(reg, "ggml_backend_split_buffer_type")`
+returns nothing. Of the in-tree backends **only SYCL implements it**
+(`ggml-sycl.cpp:28` → `ggml_backend_sycl_split_buffer_type`; zero occurrences in
+`ggml-cuda.cu` and `ggml-vulkan.cpp`). `--fit` refuses the mode too
+(`llama_params_fit is not implemented for SPLIT_MODE_TENSOR, abort`). Not a
+tuning problem — there is no code path.
+
+### `--fit`: the runtime derives the layer budget itself **[clean]**
+
+llama.cpp carries its own fitter (`common/fit.cpp`), on by default, which
+projects per-device weight + KV + compute + *draft* memory and picks
+`n_gpu_layers` and the tensor split — provided neither is set by the user, in
+which case it aborts (`n_gpu_layers already set by user to 32, abort`, the
+warning every `split_fit` rung prints). The display cap can be encoded as a
+per-device margin: `-fitt` is "leave at least this much free", so
+`vram_total - CAP` on the Vega expresses the cap *baseline-independently*,
+because the fit already sees the desktop's usage in `free`.
+
+`scripts/split_fit.py --autofit` drives it (omits `-ngl`/`-ts`, passes
+`--fit on -fitt`). At 128k + MTP, `-fitt 256,3176`:
+
+| | fit chose | client MiB | NVIDIA MiB | short-prompt gen t/s |
+|---|---|---|---|---|
+| formula (shipped) | 28 (25/4) | 3384 | 7541 | 4.39 |
+| `--fit` | **28** (25/4) | **3383** | **7525** | 4.42 |
+| `--fit`, rerun | **30** (25/5) | 3648 | 7479 | 4.63 |
+
+* **It derives the shipped configuration.** Same layer count, same split, peaks
+  within 2 MiB of client VRAM, and its projection tracked measurement closely
+  where it can be checked: it predicted CUDA0 25 layers / 7504 MiB against a
+  measured NVIDIA peak of 7479, and Vulkan0 5 layers / 3640 against a measured
+  client 3648. (The fit is *pessimistic* on the 1070 and accurate on the Vega.)
+  The full fit trace — targets, the per-device search, and the final assignment —
+  is in `logs/split_fit-auto.log` under `-lv 4`.
+* **It is adaptive.** Sweeping the margin — i.e. simulating a heavier desktop —
+  the fit gives up layers instead of breaching the cap, which is the one thing
+  the formula cannot do (`results/autofit_sweep.jsonl`, all `violation false`):
+
+  | `-fitt` (1070, Vega) | Vega allowance | fit chose | client MiB | NVIDIA MiB |
+  |---|---|---|---|---|
+  | 256,3176 | 5000 | 28 | 3383 | 7525 |
+  | 256,3176 (rerun) | 5000 | 30 | 3648 | 7479 |
+  | 256,3688 | 4488 | 26 | 3068 | 7553 |
+  | 256,3900 | 4276 | 25 | 2467 | 7615 |
+  | 256,4176 | 4000 | 26 | 2467 | 7615 |
+  | 256,5176 | 3000 | 20 | 1123 | 7501 |
+
+* **But it is discrete and jittery, and at 30 layers it spends the reserve.**
+  Two runs with identical margins and a 10 MiB difference in free Vega memory
+  (7059 vs 7069) chose 28 and 30 layers; the margin sweep is non-monotonic
+  (3900 → 25 layers, 4176 → 26). And the extra two layers cost the drift
+  headroom the formula keeps: client 3648 leaves ~350 MiB of desktop tolerance
+  against the cap where the formula's 3384 leaves ~620. That is why `serve.sh`
+  keeps the deterministic formula as its default and exposes this as `FIT=1`.
+* **Failure mode, if the fit cannot satisfy the margins:** it logs a warning and
+  leaves `n_gpu_layers` at its default, which is `-1` = *all* layers
+  (`llama_model::n_gpu_layers()` → `hparams.n_layer_all + 1`). The load then
+  fails loudly in `cudaMalloc` rather than silently over-committing the display
+  GPU — but it is a load failure, not a graceful degrade.
+
 ### Traps
 
+* **A `models.yml` custom provider without `apiKey` disables *all* custom
+  providers.** Adding the `llama.cpp` override produced `Warning: models.yml
+  validation failed — custom providers disabled` and `Validate(models) error:
+  Provider llama.cpp: "apiKey" is required when defining custom models`, which
+  silently dropped the `huggingface` provider's 140 models as well — including
+  the then-active default role. `apiKey: llama.cpp` (any literal; llama-server
+  ignores `Authorization`) fixes it. Check with `omp models --json`, which prints
+  the effective window per model.
 * **`llama-bench` cannot measure a combined split.** Its `-dev` lists devices to
   benchmark *separately*: it loaded the model twice, once CUDA-only and once
   Vulkan-only (two independent 5172 MiB buffers). A `-ngl 44` attempt "OOM'd"
@@ -680,13 +843,22 @@ reps, `results/opt_midprompt.json`:
   at `-np 1`, 7701 at 2, **8117 at 4** — and at 4 a real `/v1/chat/completions`
   request aborted the server in `ggml_cuda_pool_vmm::alloc` inside
   `launch_fattn` (SIGABRT, exit −6, NVIDIA peak 8189 of 8192). `-np 4` at
-  `-ngl 26` is 7793 and at 24 is 7259. Every measurement in this file is
-  `-np 1`; `serve.sh` now passes it explicitly. One slot costs no concurrency
-  for a single agent client.
+  `-ngl 26` is 7793 and at 24 is 7259. **Every measurement in this file is
+  `-np 1`** — the 128k-context figures are *one* 128k slot, not the two 64k slots
+  `serve.sh` now defaults to, and they are the reason `-np` is passed explicitly
+  rather than left to llama-server's own default of 4.
 * **`guard.py` needed extending.** It read only `card0` sysfs, so it was blind to
   the 1070. It now reads NVIDIA VRAM through NVML via `ctypes` (microseconds;
   `nvidia-smi` costs ~150 ms per spawn) and records `nvidia_vram_peak_mib`. The
   5000 MiB cap still governs the display GPU only.
+* **`llama-fit-params` cannot project an MTP draft.** It is the cheap way to ask
+  the fitter what it would pick (it loads with `no_alloc`, ~5 s, no VRAM), but
+  its argument set excludes the speculative flags: `error: invalid argument:
+  --spec-type`. Use `scripts/split_fit.py --autofit` instead, which goes through
+  `llama-server` and therefore fits the trunk and the draft together.
+* **`-sm row`/`-sm tensor` fail on the first device, not the second.** The error
+  names `CUDA0`, which reads like a CUDA problem; it is a backend-capability
+  check, and Vulkan has the same gap (see "Split modes other than `-sm layer`").
 
 ## Serving (`llama-server`)
 
@@ -697,15 +869,24 @@ arithmetic. It serves one model split across both GPUs — `-dev CUDA0,Vulkan0
 -sm layer` — and **requires the eGPU**: without `/dev/nvidia0` or a CUDA build
 it exits 1 instead of degrading to a configuration the watchdog would kill.
 
-Defaults at 128k: `-ts 6,1 -ngl 28 -np 1 -t 8 -lm dio -b 2048 -ub 512 -ctk q4_0
+Defaults: `-a Qwen3.8-27B -ts 6,1 -ngl 28 -np 2 -t 8 -lm dio -b 2048 -ub 512 -ctk q4_0
 -ctv q4_0 -fa on`, plus MTP with the draft head **on the Vega 10**
 (`--spec-type draft-mtp -md models/mtp-Qwen3.8-27B-Q4_0.gguf -devd Vulkan0
--ngld 99 -ctkd q4_0 -ctvd q4_0`). `-ngl` is derived from the context
-(`34 - (CTX-32768)/16384` with MTP, `40 - (CTX-8192)/15360` without) and `-ts`
+-ngld 99 -ctkd q4_0 -ctvd q4_0`). `-c` is the shared pool — `CTX=131072` with
+`-np 2` is **65536 per slot**, so a client's `contextWindow` must say 65536
+(pi's `~/.pi/agent/models.json` does) — and `-ngl` is derived from the pool
+(`34 - (CTX-32768)/16384` with MTP, `40 - (CTX-8192)/15360` without) with `-ts`
 from whether the draft is resident; `MTP=0` disables speculation, `NGL=`,
-`TS=`, `NP=`, `DEVD=`, `NGLD=` override. It prints the live display baseline and
-warns when it is above the ~1216 MiB this config was measured to survive, and
-forwards `SIGINT`/`SIGTERM` to the child, so Ctrl-C actually stops the server.
+`TS=`, `NP=`, `DEVD=`, `NGLD=` override. `FIT=1` replaces the formula with
+llama.cpp's own `--fit` (`-fitt "$FITT_CUDA,$(vram_total - CAP)"`, default
+`256,3176`), which re-derives `-ngl` and the split from live free VRAM — 28-30
+layers at a 128k pool with `-np 1`, **26 with `-np 2`** (it accounts for the
+second sequence's compute buffers: CUDA0 6876 MiB used, 472 free, client 3284) —
+at the cost of the formula's reserve (see "`--fit`: the runtime derives the layer
+budget itself"). Setting `NGL=` or `TS=` forces the fit off, because it aborts
+rather than honour either. `serve.sh` prints the live display baseline and warns
+when it is above the ~1216 MiB this config was measured to survive, and forwards
+`SIGINT`/`SIGTERM` to the child, so Ctrl-C actually stops the server.
 
 ```
 ./serve.sh                       # → http://127.0.0.1:8080, 128k context + MTP
@@ -719,19 +900,123 @@ Smoke-tested end to end at the shipped defaults (Vega draft, `-ts 6,1 -ngl 28
 `content: "pong"` (`predicted_per_second` 4.97, `draft_n_accepted` 20 of 33),
 `exit_code 0`, `vram_violation: false`, peak **4523.1 MiB** of the 5000 MiB cap
 (client 3383.1 MiB, RSS 11 354.2 MiB, NVIDIA 7519.3 of 8192 MiB), and a clean
-teardown (`SIGTERM` to the guard leaves `pgrep -c llama-server` at 0). Qwen-3.8-27B
-is a thinking model, so a `max_tokens` smaller than the reasoning trace returns an
-**empty `content`** with everything in `reasoning_content` — budget for the trace
-or the visible answer is truncated away.
+teardown (`SIGTERM` to the guard leaves `pgrep -c llama-server` at 0). Re-run
+after the `FIT` refactor it reproduced to the MiB: health 12.2 s, `pong`,
+4.996 t/s, 20/33, peak 4480.6, client 3383.1, NVIDIA 7519.3, no violation.
+Qwen-3.8-27B is a thinking model, so a `max_tokens` smaller than the reasoning
+trace returns an **empty `content`** with everything in `reasoning_content` —
+budget for the trace or the visible answer is truncated away.
 
-The same defaults without `-np 1` — i.e. llama-server's own `-np 4` — aborted the
-server on that same request: `exit_code -6` (SIGABRT), NVIDIA peak 8189 of
-8192 MiB, `ggml_cuda_pool_vmm::alloc` inside `launch_fattn`. That is why
-`serve.sh` passes `-np` explicitly; see the `-np` trap above.
+`FIT=1` on the same host instead picked **30 layers** (25/5): health 16.1 s,
+`pong`, 4.634 t/s, 20/33 accepted, peak **4738.3 MiB**, client 3648.2, NVIDIA
+7479.3, no violation. Faster, and 262 MiB closer to the cap — the trade the
+section above measures.
+
+Smoke-tested again at the shipped `-np 2` default, this time through the real
+client rather than curl: `/health` ok after 12.4 s, `/props` reports
+`n_ctx = 65536, total_slots = 2`, and `pi -p 'Reply with exactly: pong'` — pi
+being the agent configured against `127.0.0.1:8080`, with its full system prompt
+and tool schemas — exits 0 after 122.7 s with `pong`. Server `exit 0`,
+`vram_violation: false`, peak **4551.5 MiB** (client 3285.5, NVIDIA 7701.3 of
+8192). The same client run is what fixed the number in pi's `models.json`:
+`contextWindow` 65536, since the server rejects anything above the slot with
+`input (N tokens) is larger than the max context size`.
+
+Without an explicit `-np` — i.e. llama-server's own default of 4 — the server
+aborted on that same request at a 128k pool and `-ngl 28`: `exit_code -6`
+(SIGABRT), NVIDIA peak 8189 of 8192 MiB, `ggml_cuda_pool_vmm::alloc` inside
+`launch_fattn`. That is why `serve.sh` passes `-np` explicitly; see the `-np`
+trap above.
 
 `guard.py` forwarding signals is load-bearing: the child is started with
 `start_new_session=True`, so before the fix a Ctrl-C on `serve.sh` killed only
 the guard and **orphaned `llama-server` holding ~3 GB of the 5 GB budget**.
+
+## Agentic-coding profile: growth, compaction, slots **[clean]**
+
+At the shipped defaults (128k, `-ngl 28 -ts 6,1 -np 1`, MTP on the Vega), driving
+`/completion` with `cache_prompt: true` on `data/long_prompt.txt` (4000 chars ≈
+1546 tokens), `n_predict` 4:
+
+| request | `prompt_n` | `prompt_ms` |
+|---|---|---|
+| A (1546 tokens) | 1546 | 41 432 |
+| **A + 172 tokens appended** | **172** | **11 519** |
+| A again (slot holds A+ext) | 4 | 983 |
+| A with 2000 chars rewritten in the middle | 1556 | 42 644 |
+| the same rewrite, `--cache-reuse 256` | **1556** | 42 644 |
+
+* **Growth is nearly free.** Prefix caching is on by default (`--cache-prompt`
+  default enabled), so an append-only transcript pays for the new tokens, not the
+  history — 11.5 s instead of a 41.4 s re-prefill, and re-sending the same prompt
+  costs 1 s. The marginal cost of a turn is set by the depth-dependent prefill
+  rate (36.95 t/s at 5.2k depth, 29.79 t/s at 130k), i.e. ~30-70 s per 1-2k-token
+  tool result at the deep end.
+* **Compaction pays full price, and `--cache-reuse` did not help on this build.**
+  A rewrite in the middle of the transcript re-prefilled everything, and
+  `--cache-reuse 256` measured *identical* to reuse off — the KV-shifting path
+  did not engage. Checkpoints are on by default (`-ctxcp 32`, `-cms` 8192 tokens
+  apart) and could in principle let a rewrite at depth resume from the last
+  multiple of 8192; **unmeasured**, because the probe above is at 1.5k depth,
+  below the checkpoint spacing. Nothing persists to disk (`--slot-save-path`
+  unset), so a server restart is a cold prefill.
+* **The context ceiling is enforced, not silent.** A prompt longer than the
+  slot's context is rejected — `input (N tokens) is larger than the max context
+  size (M tokens)`, `ERROR_TYPE_EXCEED_CONTEXT_SIZE` — and with
+  `--context-shift` disabled (the default) running out mid-generation sets
+  `truncated: true` and stops. A client that only grows must compact on its own
+  schedule; it will not be quietly truncated.
+* **Parallel agents are the trade the default now makes: 2 slots, 64k each.**
+  `-c` is a shared pool divided by `-np`, and the extra sequences need compute
+  buffers the 1070 does not have:
+
+  | `-np` | `n_ctx_slot` at `-c 131072` | two concurrent 1135-token requests | per-request gen t/s |
+  |---|---|---|---|
+  | 1 | 131072 | 91.4 s wall — the second waited 44 s behind the first | 2.90 / 4.05 |
+  | **2 (shipped)** | **65536** | 100.0 s wall, both progressing | 1.39 / 1.56 |
+  | 4 | **32768** | — (NVIDIA 8093 of 8192 MiB at load; a real request has aborted in `ggml_cuda_pool_vmm::alloc`) | — |
+
+  Slots buy *fairness*, not throughput: the two requests took the same wall time
+  together either way (91.4 s serialized vs 100.0 s concurrent), because the box
+  is CPU/GPU-bound on one model. The pool cannot be grown to compensate —
+  `-c 262144 -np 2`, i.e. two slots at the full 128k, **does not load**
+  (`results/np2_fit.jsonl`: health timeout, exit 1 at `-ngl 28`) — so the choice
+  is 2 x 64k, 1 x 128k or 4 x 32k, and the *client* has to be told which: pi's
+  `~/.pi/agent/models.json` carries `contextWindow: 65536` for exactly this
+  reason, since a request above the slot is rejected outright. Under `FIT=1` the
+  fitter also gives up two layers for the second sequence (26 rather than 28).
+* **Subagents are the worst case for the cache.** Each child's transcript
+  diverges early from the parent's, so the shared prefix is small and every child
+  pays a near-full prefill; alternating parent and child across two slots thrashes
+  both slots' KV. `--cache-ram` (8192 MiB of host RAM, default) plus
+  `--cache-idle-slots` exist to restore *idle* slots, but `/slots` reported
+  `n_prompt_tokens_cache: 0` in every probe above, including at `-np 2` — nothing
+  was held in RAM.
+* **The local model is configured for 58k of the 64k slot in both clients**,
+  which is what keeps a turn from overrunning the slot. In both, its *entry* is
+  pinned at 58k; whether it is the default differs — pi defaults to the cloud
+  model and selects the local one with `--model qwenrunner/Qwen3.8-27B`, while
+  omp's `llama.cpp` provider is the local model outright:
+  * **pi** — `~/.pi/agent/models.json`: `contextWindow: 59392`, i.e. 58k with 6k
+    left under the slot for tool-call output.
+  * **omp** — auto-discovers the server at `http://127.0.0.1:8080`
+    (`LLAMA_CPP_BASE_URL` overrides) as provider `llama.cpp`, and reports the
+    server's raw per-slot context as **both** `contextWindow` and `maxTokens`
+    (65536/65536, i.e. no output budget at all). `~/.omp/agent/models.yml`
+    overrides that one model to 59392/16384. Measured end to end:
+    `omp -p 'Reply with exactly: pong' --model llama.cpp/Qwen3.8-27B` → exit 0,
+    `pong`, a 7766-token prompt prefilled at 35.66 t/s (216 s) then 23 tokens
+    generated at 3.28 t/s with 0.89 draft acceptance, `truncated = 0`.
+  * **tumwater** — the two fleets on this box name the local model as their free
+    `fallback` (`"fallback": "qwenrunner/Qwen3.8-27B"`) with no primary pinned, so
+    role ticks run pi's default and fall back to the local server when it fails
+    with provider-class errors. Only a pair pi's catalog prices at zero is
+    accepted as a fallback, and this one is priced 0/0/0/0.
+* **`serve.sh` passes `-a/--alias Qwen3.8-27B`.** Without it the API advertises
+  the .gguf *path* as the model id, which is what omp's discovery then shows as
+  the selector (`llama.cpp//home/zach/qwenrunner/models/Qwen3.8-27B-UD-Q4_K_M.gguf`).
+  The alias is advisory — llama-server ignores the request's `model` field, so a
+  client still sending an older id gets 200 (measured both ways), not an error.
 
 ## Reproducing
 
@@ -763,6 +1048,46 @@ python3 scripts/wait_idle.py --system --idle-cores 3 --hold 30
 # ...and the same at the shipped config with a realistic prompt (slow rungs)
 ./scripts/split_fit.py --ctx 131072 --ngl-ladder 28,30 --ts 6,1 \
     --prompt-chars 0 --n-predict 32 --out results/split_fit_long.jsonl
+# --fit as the layer-budget source (--autofit omits -ngl/-ts; single rung), and
+# the margin sweep behind the adaptivity table
+./scripts/split_fit.py --autofit --ctx 131072 --prompt-chars 600 --out results/autofit.jsonl
+for m in 3176 3688 3900 4176 5176; do
+    ./scripts/split_fit.py --autofit --fitt 256,$m --ctx 131072 --prompt-chars 600 \
+        --out results/autofit_sweep.jsonl
+done
+# prefill-side dead ends: batch threads, larger batches, smaller ubatch
+./scripts/split_fit.py --ngl-ladder 28 --ts 6,1 --prompt-chars 0 --n-predict 32 \
+    --out results/tb16_fit.jsonl \
+    --server-extra "-lm dio -b 2048 -ub 512 -ctk q4_0 -ctv q4_0 -fa on -tb 16"
+./scripts/split_fit.py --ngl-ladder 28 --ts 6,1 --prompt-chars 0 --n-predict 32 \
+    --out results/batch_hi_fit.jsonl \
+    --server-extra "-lm dio -b 2048 -ub 1024 -ctk q4_0 -ctv q4_0 -fa on"
+./scripts/split_fit.py --ngl-ladder 30,32,34 --ts 6,1 --out results/ub256_fit.jsonl \
+    --server-extra "-lm dio -b 2048 -ub 256 -ctk q4_0 -ctv q4_0 -fa on"
+# CPU affinity at the shipped config (un-pinned is the fastest of the three)
+./scripts/split_fit.py --ngl-ladder 28 --ts 6,1 --prompt-chars 0 --n-predict 32 \
+    --out results/cpu_pin_fit.jsonl \
+    --server-extra "-lm dio -b 2048 -ub 512 -ctk q4_0 -ctv q4_0 -fa on --cpu-strict 1 -Cr 0-15"
+# speculation variants: --no-mtp + the spec flags in --server-extra
+./scripts/split_fit.py --no-mtp --ngl-ladder 28 --ts 6,1 --prompt-chars 4500 --n-predict 64 \
+    --out results/spec_ab.jsonl --server-extra "-lm dio -b 2048 -ub 512 -ctk q4_0 -ctv q4_0 -fa on \
+    --spec-type draft-mtp,ngram-simple -md models/mtp-Qwen3.8-27B-Q4_0.gguf -devd Vulkan0 -ngld 99 -ctkd q4_0 -ctvd q4_0"
+# agentic-coding profile: prefix reuse on growth, full re-prefill on a rewrite,
+# and the per-slot context cost of extra slots (see "Agentic-coding profile")
+./serve.sh &                       # then, against a running server:
+P="$(head -c 4000 data/long_prompt.txt)"
+curl -s localhost:8080/completion -H 'Content-Type: application/json' \
+  -d "{\"prompt\":\"$P\",\"n_predict\":4,\"cache_prompt\":true}"      # read .timings.prompt_n
+#   ...repeat with ~200 chars appended (prompt_n ≈ 200), with the same prompt
+#   again (≈ 4), and with 2000 chars rewritten mid-prompt (prompt_n ≈ full).
+./serve.sh &                       # /props -> n_ctx = 65536, total_slots = 2 (the default)
+NP=1 ./serve.sh &                  # /props -> n_ctx = 131072, total_slots = 1
+# ...and the pool cannot be grown instead: --ctx 262144 with --np 2 does not load
+./scripts/split_fit.py --np 2 --ctx 262144 --ngl-ladder 28 --ts 6,1 --out results/np2_fit.jsonl
+./scripts/split_fit.py --autofit --np 2 --ctx 131072 --prompt-chars 600 --out results/autofit_np2.jsonl
+pi -p 'Reply with exactly: pong'   # the real client, against a running server
+omp models --json                  # effective window per model (llama.cpp -> 59392)
+omp -p 'Reply with exactly: pong' --model llama.cpp/Qwen3.8-27B --no-session
 ./scripts/quant_compare.sh                              # quant ceiling, speed, perplexity
 
 # one model across both GPUs, remainder on CPU (see "Thunderbolt eGPU")
@@ -791,6 +1116,17 @@ can be discarded.
   change) and argued to be redundant against `-lm dio`.
 * **The `-ngl` 0–6 rungs** were last measured under load; their VRAM figures are
   sound but their rates are not.
+* **The `-ngl` 30 rung at 128k is verified only to depth 5246**, which is why
+  `serve.sh` ships 28: the ceiling was set from probes that peak at 5246 tokens
+  and the flash-attention workspace was assumed to grow with context. Depth
+  added only +16 MiB to the 1070's peak at fixed `-ngl` (600-char vs 5246-token
+  prompt), and the fit models the pp compute buffer at the full `n_ctx`, so the
+  expectation is that 30 survives a real 130k prefill — unmeasured, and a
+  73-minute run to settle. `FIT=1` picks 30 on a light desktop and takes that
+  bet.
+* **Row/tensor split would be the next structural lever** (both GPUs on every
+  layer, including prefill), and is blocked on the backends, not on tuning: it
+  needs a SYCL build. See "Split modes other than `-sm layer` are unavailable".
 * **MTP at 130k depth.** The 6.22 t/s figure is at depth 5246; the 1.19 t/s
   end-to-end number is the base config at 130 729 tokens. The draft's benefit at
   full depth is unmeasured, and its acceptance rate is the thing that decides it

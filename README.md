@@ -21,12 +21,15 @@ including six conclusions that earlier, load-contaminated measurements got wrong
 | model | **`models/Qwen3.8-27B-UD-Q4_K_M.gguf`** | 16.46 GB. Smaller quants are *faster* — Q2_K_XL offloads 20 layers vs 12 and gains +52 % generation — but cost +61 % perplexity. See `RESULTS.md` |
 | `-lm` | **`dio`** | 74.55 vs 66.32 t/s prompt against the mmap default, and ~40× lighter RSS |
 | `-ngl` | **largest the live baseline allows** (10 here) | ~252 MiB client VRAM per layer; 10 beats 8 on both axes, 2/2 |
-| `-b`/`-ub` | **2048/512 (default)** | 70.26 vs 59.09/45.06/29.48 t/s prompt; smaller batches buy VRAM, not speed |
+| `--fit` (serve.sh `FIT=1`) | **off** — opt-in | llama.cpp's own fitter re-derives `-ngl`/`-ts` from live free VRAM with the cap as a `-fitt` margin: 28-30 layers at 128k, i.e. the shipped config to 2 MiB, or two layers (+4 %) faster — but it spends the ~620 MiB drift reserve and its choice moves with desktop noise |
+| `-b`/`-ub` | **2048/512 (default)** | 70.26 vs 59.09/45.06/29.48 t/s prompt; smaller batches buy VRAM, not speed. At 128k the cap pins it from above too: `-ub 1024` breaches (killed before health), `-b 4096` alone changes nothing (37.04 vs 36.95 t/s) |
+| `-tb` | `= -t` (default) | batch threads 8/12/16 measure 36.95/36.96/36.24 t/s prompt at 128k — equivalent, like `-t` itself |
+| CPU affinity | off (default) | `--cpu-strict 1 -Cr 0-7` is −3 % generation, `-Cr 0-15` −38 %; un-pinned placement is fastest |
 | KV cache | **`q4_0/q4_0` + `-fa on`** | free at depth 0 (all five dtypes within 3 %), **+9.6 % generation** at depth 8192; `q8_0/q8_0` is the balanced alternative |
 | flash attn | `-fa on` with a quantized V cache | `-fa off` aborts: `quantized V cache requires flash_attn to be enabled` |
 | threads | `-t 8` | Vega-only: 4–12 equivalent, 16 is ~8 % worse. Split: **8** beats 12 by 3 % and 6 by 13 % — the CPU work left is on the serial path, so fewer threads do not help |
 | MTP | `--spec-type draft-mtp -md models/mtp-Qwen3.8-27B-Q4_0.gguf -devd Vulkan0 -ngld 99 -ctkd q4_0 -ctvd q4_0` | **+97.8 % generation** on the Vega-only path (1.719 → 3.400 t/s), and **+38 %** on the two-GPU 128k split once the draft head runs on the **Vega 10** rather than the CPU (4.509 → 6.224 t/s). The largest lever on this host. Its win is content-dependent — +9 % to +132 % — because it is set by draft acceptance (26 % to 98 % on two prompts from the same document). Now the `serve.sh` default |
-| slots | `-np 1` | llama-server's own default is `-np 4`, which reserves compute for four sequences: ~570 MiB more on the 1070 at 128k, and a real request aborts in `ggml_cuda_pool_vmm::alloc` (exit −6). One slot costs no concurrency for a single agent client |
+| slots | **`-np 2`** | a second agent (or subagent) makes progress instead of queueing: two concurrent 1135-token requests take 100.0 s wall together against 91.4 s serialized — fairness, not throughput. Costs +160 MiB of the 1070's compute buffers (NVIDIA 7701 vs 7541) and **halves the per-slot context** (`-c` is a shared pool: 131072 / 2 = 65536, which is what pi's `contextWindow` must say). `-np 4` fits at load (NVIDIA 8093) but leaves 32768/slot and has aborted a real request in `ggml_cuda_pool_vmm::alloc` |
 
 **MTP speculation is the one large win — it more than doubles generation
 throughput, and where its draft head runs decides how much.** Everything else is
@@ -40,10 +43,11 @@ Best measured figures: **74.41 t/s prompt and 2.01 t/s generation** (`-ngl 10`,
 
 **With the Thunderbolt eGPU attached, `serve.sh` splits one model across both
 GPUs and runs MTP speculation on top, with the draft head on the Vega 10** — 28
-layers at 128k and 38 at 8k with MTP on (`MTP=0` restores the 32/40 split) —
-which is +28 % generation over the 1070 alone and roughly triples the offloadable
-layer count (40 vs 12). The eGPU is now required: `serve.sh` exits rather than
-fall back to the Vega 10 alone, which cannot hold 128k context under the cap.
+layers at a 128k pool and 38 at 8k with MTP on (`MTP=0` restores the 32/40
+split); the default `-np 2` divides that pool into two 64k slots — which is +28 %
+generation over the 1070 alone and roughly triples the offloadable layer count
+(40 vs 12). The eGPU is now required: `serve.sh` exits rather than fall back to
+the Vega 10 alone, which cannot hold the 128k pool under the cap.
 
 The draft head is the newest lever: it is a *serial* forward pass, so with 26+
 trunk layers offloaded the CPU is the bottleneck and the 1070 has no room to
@@ -105,12 +109,33 @@ present. Both backends end up in one binary and `-dev` selects between them.
 ## Run
 
 ```
-./serve.sh                       # 128k context, both GPUs, MTP on (the default)
+./serve.sh                       # 2 slots x 64k, both GPUs, MTP on (the default)
+NP=1 ./serve.sh                  # one slot: the whole 128k pool for one agent
 MTP=0 ./serve.sh                 # the same split without speculative decoding
-CTX=32768 ./serve.sh             # shorter context, more layers (faster)
+CTX=65536 ./serve.sh             # shorter pool (32k/slot), more layers (faster)
 NGL=26 TS=6,1 ./serve.sh         # override the layer count / tensor split
-NP=4 ./serve.sh                  # concurrent slots (costs ~570 MiB on the 1070)
+FIT=1 ./serve.sh                 # let llama.cpp's --fit derive -ngl from free VRAM
 ```
+
+`-c` is the **shared pool**, and llama-server divides it by `-np`: the default
+`CTX=131072` with `-np 2` is **65536 per slot**, which is what a client sees and
+what its `contextWindow` must say. Raising `CTX` buys depth at the cost of
+layers — `-c 262144` (two slots at 128k each) does not even load — so the choice
+is 2 x 64k, 1 x 128k, or 4 x 32k.
+
+The local model's entry in both clients is set to **58k of that 64k slot**,
+leaving room for tool-call output: pi in `~/.pi/agent/models.json`
+(`contextWindow: 59392`), and omp in `~/.omp/agent/models.yml`, which needs an
+explicit override because its auto-discovery of `http://127.0.0.1:8080`
+otherwise takes the server's raw per-slot context as both the window *and* the
+output budget (65536/65536). pi's own default is the cloud model
+(`huggingface/deepseek-ai/DeepSeek-V4.1-Flash:deepinfra`), so the local one is
+chosen with `--model qwenrunner/Qwen3.8-27B`; the two tumwater fleets on this box
+name it as their free `fallback`, which is the pair the docs' backend guide
+recommends (a budgeted API primary, the cost-n/a local model behind it).
+`serve.sh` passes `-a Qwen3.8-27B` so both see a stable model id instead of the
+.gguf path; the alias is advisory — llama-server ignores the request's `model`
+field, so a client still sending an older id works.
 
 `serve.sh` requires the eGPU and prints the configuration it picked. It errors
 out if `/dev/nvidia0` is absent or the binary was built without CUDA, because
@@ -124,7 +149,9 @@ the Vega 10 alone cannot hold 128k context under the display cap:
   measured anchors are **40 layers at 8k, 32 at 128k**; with the draft on the
   Vega the last startable rungs are **38 at 8k, 36 at 32k, 30 at 128k**, and
   `serve.sh` derives two under those (34/28) because its fit probes peak at 5.2k
-  depth and the flash-attention workspace grows with context. `-ts 6,1` rather
+  depth and the flash-attention workspace was assumed to grow with context —
+  measured since, depth added only 16 MiB to the 1070's peak at fixed `-ngl`, so
+  the reserve is cheap insurance rather than a known cost. `-ts 6,1` rather
   than `4,1`, because the draft's ~1.5 GB otherwise sits on top of six trunk
   layers. Every ceiling here is set by the **1070**, not the display cap.
 
@@ -134,6 +161,16 @@ VRAM every 50 ms and `SIGKILL`s the process group if it exceeds `CAP`
 by arithmetic. It prints the live display baseline and warns when it is above the
 ~1216 MiB the default config was measured to survive. It forwards
 `SIGINT`/`SIGTERM` to the child, so Ctrl-C actually stops the server.
+
+The layer count comes from the measured formula (`34 - (CTX-32768)/16384` with
+MTP), two layers under the last startable rung, which leaves ~620 MiB of the
+cap as a reserve for desktop drift. `FIT=1` instead hands `-ngl` and the tensor
+split to llama.cpp's own `--fit`, with the cap encoded as a `-fitt` margin
+(`vram_total - CAP` on the Vega, so it is baseline-independent); measured at
+128k it picks 28-30 layers — the same config to 2 MiB, or two layers faster —
+but it spends that reserve and its choice moves with a few MiB of desktop
+noise, so it is opt-in. Setting `NGL=` or `TS=` forces the fit off. See
+[`RESULTS.md`](RESULTS.md) for both tables.
 
 **Read the printed baseline before trusting `-ngl`.** The desktop is the other
 tenant of this GPU and its footprint drifts (measured 746–2188 MiB within one
@@ -207,6 +244,12 @@ window above 4 GB. Verify: `nvidia-smi` lists the card with 8192 MiB, and
 * **`-ts` does not behave as documented.** Requested `4,1`, measured layer counts
   land nearer 2:1, because non-layer tensors go to the primary device. Tune it
   against the two VRAM counters rather than trusting the ratio.
+* **`-sm row`/`-sm tensor` are unavailable on this build.** A parallelized split
+  would put both GPUs on every layer, prefill included — the one structural
+  answer to the pipelined split's single-GPU-at-a-time prefill. It needs each
+  backend to export `ggml_backend_split_buffer_type`, which only the SYCL backend
+  does: `llama-completion -sm row` dies with `device CUDA0 does not support split
+  buffers` before loading. Not a tuning problem.
 * **The Thunderbolt link trains at 2.5 GT/s ×4** (PCIe 1.0, ~1 GB/s) where 8.0
   GT/s is available. This is *not* the bottleneck — per token only ~20 KB crosses
   the CPU↔GPU boundary. The 1070's weaker prefill is simply that the Vega 48 has
@@ -221,7 +264,7 @@ window above 4 GB. Verify: `nvidia-smi` lists the card with 8192 MiB, and
 | `scripts/guard.py` | VRAM watchdog + measurement: display-GPU VRAM, per-DRM-client VRAM, NVIDIA VRAM via NVML, RSS, `cpu_busy_pct`, `bg_cpu_pct` |
 | `scripts/bench.py` | `llama-bench` sweeps: `ngl`, `kv`, `fa`, `depth`, `ctx`, `threads`, `batch`, `load`, `nkvo`, `nopo`, `quant` |
 | `scripts/mtp_ab.py` | MTP A/B over HTTP, with `--server-extra` for arbitrary flags. Arms: `base`, `mtp-sidecar` (CPU draft), `mtp-sidecar-qkv`, `mtp-draftgpu` (`--draft-dev`/`--ngld-gpu`, the Vega-draft arm), `mtp-nomd` |
-| `scripts/split_fit.py` | fit probe for the two-GPU split — `llama-bench` cannot do it. Sweeps `-ngl`/`-ts`, loads, issues one real completion, reports both GPUs' peaks |
+| `scripts/split_fit.py` | fit probe for the two-GPU split — `llama-bench` cannot do it. Sweeps `-ngl`/`-ts`, loads, issues one real completion, reports both GPUs' peaks. `--autofit` omits `-ngl`/`-ts` and drives llama.cpp's own `--fit` (`-fitt` margins) instead |
 | `scripts/quant_compare.sh` | quant offload ceiling + throughput + perplexity |
 | `scripts/wait_idle.py` | block until a workload's CPU — or the whole host's — goes quiet |
 | `scripts/gguf_head.py` | read GGUF metadata from a local file or a remote URL without downloading it |

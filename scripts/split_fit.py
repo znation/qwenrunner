@@ -64,20 +64,31 @@ def http_json(url, payload, timeout):
 
 
 def run_rung(args, prompt, ngl):
-    log = os.path.join(ROOT, "logs", "split_fit-%d.log" % ngl)
+    log = os.path.join(ROOT, "logs", "split_fit-%s.log" % ngl)
     cmd = [os.path.join(ROOT, "build", "bin", "llama-server"),
-           "-m", args.model, "-ngl", str(ngl), "-c", str(args.ctx),
-           "-dev", args.dev, "-sm", "layer", "-ts", args.ts,
+           "-m", args.model, "-c", str(args.ctx),
+           "-dev", args.dev, "-sm", "layer",
            "-t", str(args.threads), "-np", str(args.np),
            "--host", "127.0.0.1", "--port", str(args.port),
            "--seed", "42", "-lv", "2", "--log-file", log]
+    if args.autofit:
+        # Let llama.cpp's own --fit pick n_gpu_layers/tensor_split: it projects
+        # per-device weight + KV + compute + draft memory. -ngl/-ts must stay
+        # unset or the fit aborts ("already set by user"). -fitt is the margin
+        # to leave free per device, so the display cap is encoded as
+        # total_vram - CAP on the Vega -- baseline-independent, because the fit
+        # already sees the desktop's usage in `free`.
+        cmd += ["--fit", "on", "-fitt", args.fitt]
+    else:
+        cmd += ["-ngl", str(ngl), "-ts", args.ts]
     cmd += args.server_extra.split()
     if args.mtp:
         cmd += ["--spec-type", "draft-mtp", "-md", args.draft,
                 "-devd", args.draft_dev, "-ngld", str(args.ngld),
                 "-ctkd", args.ctkd, "-ctvd", args.ctvd]
 
-    rec = {"ngl": ngl, "ts": args.ts, "ctx": args.ctx, "mtp": args.mtp,
+    rec = {"ngl": ngl, "ts": "auto" if args.autofit else args.ts,
+           "ctx": args.ctx, "mtp": args.mtp,
            "cmd": cmd, "log": os.path.relpath(log, ROOT)}
     t0 = time.time()
     out_f = open(log, "wb")
@@ -145,6 +156,13 @@ def main(argv=None):
     ap.add_argument("--ngl-ladder", default="28,30",
                     help="comma-separated -ngl values to try, in order")
     ap.add_argument("--ts", default="6,1")
+    ap.add_argument("--autofit", action="store_true",
+                    help="omit -ngl/-ts and let llama.cpp's --fit choose them "
+                         "(single rung; the ladder is ignored)")
+    ap.add_argument("--fitt", default="256,3176",
+                    help="per-device margin in MiB for --fit, in -dev order "
+                         "(256 on the 1070, and 8176-CAP=3176 on the Vega so "
+                         "the fit leaves the display cap's worth free)")
     ap.add_argument("--dev", default="CUDA0,Vulkan0")
     ap.add_argument("--ctx", type=int, default=131072)
     ap.add_argument("--threads", type=int, default=8)
@@ -174,14 +192,15 @@ def main(argv=None):
     print("baseline VRAM: %.1f MiB (cap %.1f); prompt %d chars"
           % (guard.vram_used_mib(), args.cap_mib, len(prompt)))
 
-    for ngl in [int(x) for x in args.ngl_ladder.split(",") if x.strip()]:
+    for ngl in (["auto"] if args.autofit
+                else [int(x) for x in args.ngl_ladder.split(",") if x.strip()]):
         rec = run_rung(args, prompt, ngl)
         summarize(rec)
         if args.out:
             with open(os.path.join(ROOT, args.out), "a") as f:
                 f.write(json.dumps(rec) + "\n")
         if rec["vram_violation"]:
-            print("stopping: -ngl %d breached the display cap" % ngl)
+            print("stopping: -ngl %s breached the display cap" % ngl)
             break
     return 0
 
