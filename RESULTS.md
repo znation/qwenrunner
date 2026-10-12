@@ -78,7 +78,13 @@ Two different numbers, never subtracted across scopes:
 * **`vram_peak_mib` (system counter)** — the cap source of truth, must stay
   ≤ 5000 MiB. Includes the desktop, whose baseline drifts (measured 746–2188 MiB
   within one hour, traced to Firefox video and `claude-desktop`). Read the
-  printed baseline before interpreting any peak.
+  printed baseline before interpreting any peak. Attributed per DRM client at a
+  1790 MiB baseline: **plasmashell 487, firefox-esr 331, claude-desktop 254,
+  ghostty 250 MiB**, ~56 MiB of everything else. At the measured ~132 MiB per
+  trunk layer that is ~4 layers of budget sitting in the compositor and two
+  browsers — the desktop is a first-class tunable here, and `serve.sh`'s warning
+  fires at 1216 MiB precisely because the shipped 28-layer config is sized
+  against a light one.
 * **`client_vram_peak_mib` (per-DRM-client sum)** — the model's own footprint.
   The guarded child has no DRM client before it execs, so this baseline is zero
   by construction and the peak *is* the footprint. **This is the number to use
@@ -771,7 +777,12 @@ The same mid-document continuation as the content-dependence row above
   the ≤3.6 % spread is single-sample noise, not an effect. Probabilistic draft
   sampling does not move acceptance here, and chaining `ngram-simple` onto
   `draft-mtp` adds nothing — the ngram path found no usable match on this
-  prompt. Neither is worth carrying.
+  prompt. Neither is worth carrying. **Note the prompt:** this is prose, which an
+  n-gram drafter cannot help with by construction. Retested on the content it
+  exists for — output that is a verbatim copy of the context, 100 % of drafts
+  accepted — `ngram-simple` is not merely useless but a **22 % loss** chained
+  onto MTP and 26 % alone; see "`ngram-simple` is a loss even on verbatim
+  output".
 * The run also reproduced the content-dependence figure exactly (27/104, 26 %),
   which is a good check on that section.
 
@@ -1334,3 +1345,27 @@ can be discarded.
 * **`-t` at other contexts.** Verified at the shipped 128k split (8 beats 12, 6
   and 4); the 32k/8k splits were not swept, though the CPU work there is
   smaller still.
+* **The draft chain at the shipped 128k/28.** `-n-max` was swept at `-c 32768
+  -ngl 32`, because the desktop was holding ~1.6-1.8 GiB of the Vega and left
+  the shipped config ~16 MiB of cap margin. The transfer is expected to hold or
+  improve — the shipped config leaves more CPU work per target step, so a draft
+  step is relatively cheaper — but it is an inference. `serve.sh`'s `DNMAX=`
+  makes it a one-flag re-measure on a light desktop.
+* **`--spec-draft-n-max` above 14.** The marginal cost of a draft step (76 ms
+  for ~0.96 accepted tokens) was still below the arm's running rate at 14, so
+  the high-acceptance optimum has not been found — only bounded from below.
+* **A short n-gram draft.** `--spec-ngram-simple-size-m` defaults to 48 and it
+  is the *length* of the drafts that made `ngram-simple` lose (8.6 accepted
+  tokens per step at 1.9 s/step against MTP's 2.8 at 0.56 s). A much shorter
+  `size_m` was not tried.
+* **`--poll` / `-bs`.** The threadpool spin level (default 50) and backend
+  sampling are the last untested CPU-side flags; a sweep was written and then
+  dropped to shorten the critical path, so they are untested rather than
+  negative.
+* **Compaction at 130k.** The checkpoint bound is measured at 6.6k and 12.2k
+  depth; the 130k case follows from the `-cms` spacing rather than from depth,
+  but a 73-minute prefill is what it would take to confirm.
+* **A `--fit`-derived `-ngl` at the current desktop baseline.** With the desktop
+  at ~1.8 GiB the shipped 128k/28 config peaks ~5.3 GiB and is killed by the
+  watchdog; `FIT=1` would give up layers to hold the cap, and the resulting
+  throughput on a *heavy* desktop has not been measured.
