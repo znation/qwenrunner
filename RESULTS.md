@@ -548,14 +548,51 @@ conversations, i.e. four live slots plus headroom for a conversation displaced
 by a one-off request. It is host RAM, which is the resource this machine has
 most of; the cache only fills as conversations arrive, and `CRAM=0` disables it.
 
-**It is also a ceiling, and the default configuration commits to it.** Measured
-with the shipped defaults and four idle slots: 39.2 -> 89.4 GiB of host memory
-on load (54.0 GiB process RSS, 59.5 GiB summed GPU), swap unchanged. A full
-64 GiB of cache on top of that is 153 GiB, which this machine does not have —
-so `NP=4 CRAM=65536` is safe only while the cache stays under ~35 GiB, i.e.
-about four cached 128k conversations. `NP=4 CRAM=32768` (max ~121 GiB) is the
-configuration to use if the cache is expected to fill, and `CTK=q8_0 CTV=q8_0`
-halves both the slot KV and every cache entry.
+**It is also a ceiling, and the budget has to absorb it.** Measured with four
+idle slots and no traffic:
+
+| config | host `used` | free | server's own footprint |
+|---|---|---|---|
+| idle (other tenants + OS) | 39.3 GiB | 58.2 | — |
+| `NP=4`, f16 KV | 89.6 GiB | 15.4 | 50.3 GiB |
+| `NP=4`, **q8_0 KV (shipped)** | **78.4 GiB** | 24.4 | 39.1 GiB |
+| `NP=2`, q8_0 KV | 62.1 GiB | 42.1 | 22.8 GiB |
+
+A 128k conversation costs 8 GiB of cache at f16 and 4 GiB at q8_0 (64 KiB/token;
+the load footprints above confirm it — `NP=4` f16 is weights 14.3 + 4x8 KV +
+~4 compute). So `CRAM=65536` at f16 would commit 50 + 64 = 114 GiB on top of the
+39 GiB other tenants hold, i.e. 153 GiB on a 128 GB machine: it does not fit.
+**The shipped default is `q8_0` KV with `CRAM=32768`** — 39.1 + 32 = 71 GiB
+worst case, which fits with room to spare, and it keeps eight 128k conversations
+warm instead of four. That is the configuration change that makes "cover every
+simultaneous conversation" true rather than aspirational; the price is the
+measured −10 % generation at depth.
+
+## Disk-backed slot states (SLOT_SAVE) — works, but does not pay off yet
+
+The third cache tier persists a slot's KV to a file. `serve.sh` can pass
+`--slot-save-path` via `SLOT_SAVE=<dir>`; it is **off by default** and should
+stay off, because the round trip was measured and does not save a prefill.
+
+A ~30k-token (1.11 GiB) conversation, `CRAM=0` so the RAM cache cannot help:
+
+| step | result |
+|---|---|
+| `POST /slots/0?action=save` `{"filename":"a.bin"}` | n_saved 29 775, 1.11 GiB written, **346 ms** |
+| `POST /slots/0?action=restore` `{"filename":"a.bin"}` | n_restored 29 775, **112 ms** |
+| `GET /slots` immediately after the restore | `n_prompt_tokens = None` |
+| re-sending that conversation (also with `id_slot: 0`) | **29 772 tokens prefilled, 63.4 s** |
+
+Save and restore both work and are fast — 1.11 GiB round-tripped at ~3 GB/s, far
+cheaper than the ~60 s re-prefill it is meant to replace. But the restored state
+is not *matchable*: the slot reports no prompt after the restore, so the next
+request reprocesses the whole transcript anyway. The KV buffers come back; the
+slot's prompt bookkeeping does not. Also note the request must carry the
+filename in the JSON *body* — the query string only takes `action=save|restore`,
+and a GET returns 404.
+
+Until that is resolved, the disk tier is plumbing, not a performance tier, and
+`CRAM` is the only cache knob worth trusting.
 
 ## Concurrency and interference — the caveat behind the 4-slot default
 

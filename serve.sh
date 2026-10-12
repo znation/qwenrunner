@@ -24,7 +24,7 @@
 #
 # Overridable via env (anything unset is derived):
 #   MODEL CTX NP INSTANCES PORT THREADS HOST NGL LM BATCH UBATCH CTK CTV FA
-#   MTP MD NGLD NMAX CRAM SWAPCAP
+#   MTP MD NGLD NMAX CRAM SLOT_SAVE SWAPCAP
 #
 #   ./serve.sh                      # 4 agent slots, 64 GiB prompt cache, NMAX=6
 #   NP=1 CRAM=8192 ./serve.sh       # single session, minimal footprint
@@ -91,11 +91,16 @@ LM="${LM:-mmap}"
 BATCH="${BATCH:-1024}"
 UBATCH="${UBATCH:-256}"
 
-# f16 KV is affordable at 128k here (see above) and is the fastest option --
-# no per-token dequantization, and Metal works natively in f16. Use q8_0/q4_0
-# to trade a little speed for a much smaller cache when running many instances.
-CTK="${CTK:-f16}"
-CTV="${CTV:-f16}"
+# q8_0 KV, chosen for *capacity* rather than raw speed. It halves both the slot
+# KV (4 GiB per 128k slot instead of 8) and every prompt-cache entry, which is
+# what lets this configuration cover every simultaneous conversation at once --
+# measured server footprint is 35.7 GiB against 50.3 for f16, and a cached 128k
+# conversation costs 4 GiB against 8. The price is measured and small: -10 %
+# generation at 128k depth (12.89 vs 14.34 t/s, no MTP) and -4 % prefill.
+# A quantized V cache REQUIRES flash attention; -fa on below satisfies that.
+# CTK=f16 CTV=f16 restores the faster, hungrier configuration.
+CTK="${CTK:-q8_0}"
+CTV="${CTV:-q8_0}"
 FA="${FA:-on}"
 
 # MTP speculation: the biggest single lever on the Intel host (+97.8 %) and it
@@ -117,6 +122,31 @@ NMAX="${NMAX:-6}"
 
 SWAPCAP="${SWAPCAP:-0}"
 
+# Disk-backed tier for conversations beyond CRAM. With this set, a slot's KV
+# state can be written to and read from a file, so a conversation evicted from
+# both the slots and the RAM cache comes back for the cost of reading its state
+# (seconds) instead of re-prefilling its transcript (a 128k prefill is ~4.5 min
+# at ~490 t/s). The server is driven by its own API, not by a flag:
+#
+#   curl -X POST "http://127.0.0.1:8080/slots/0?action=save" \
+#        -H 'Content-Type: application/json' -d '{"filename":"conv-a.bin"}'
+#   curl -X POST "http://127.0.0.1:8080/slots/0?action=restore" \
+#        -H 'Content-Type: application/json' -d '{"filename":"conv-a.bin"}' 
+#
+# Save the slot that currently holds the conversation, restore it before the
+# request that would otherwise re-prefill. Files are written where SLOT_SAVE
+# points, and a 128k q8_0 state is ~4 GiB each -- size the disk accordingly.
+#
+# NOT ENABLED BY DEFAULT, and the round trip was measured to NOT pay off yet
+# (RESULTS.md, "Disk-backed slot states"): save and restore both work and are
+# fast (1.11 GiB written in 346 ms, restored in 112 ms for a 30k-token
+# conversation), but after a restore the slot reports n_prompt_tokens = None,
+# so the next matching request still prefilled the whole 29 772 tokens (63.4 s)
+# instead of reusing the state. The KV buffers come back; the slot's prompt
+# bookkeeping does not. Until that is resolved this is plumbing, not a tier --
+# treat SLOT_SAVE as untested.
+SLOT_SAVE="${SLOT_SAVE:-}"
+
 # Server prompt cache in host RAM (--cache-ram). This is the *prefill* cache,
 # and for agentic use it is the most important knob here.
 #
@@ -127,15 +157,21 @@ SWAPCAP="${SWAPCAP:-0}"
 # come back after another one displaced it -- measured A B A at 0.58 s vs 57 s
 # when it cannot; (3) --slot-save-path persists states to disk (not used here).
 #
-# The upstream default is 8192 MiB = ONE 128k conversation in f16 (64 KiB per
-# token). With two conversations the second evicts the first and every turn
-# re-prefills the whole transcript -- silently, because a cache miss looks
-# exactly like a first turn. Size it as (concurrent conversations) x
-# (context KV): 65536 holds eight 128k f16 conversations, i.e. four live slots
-# plus headroom for a conversation displaced by a one-off request. The cache
-# only fills as conversations arrive, so the limit costs nothing until used;
-# CRAM=0 disables it and CRAM=32768 holds four.
-CRAM="${CRAM:-65536}"
+# The upstream default is 8192 MiB, which at f16 (64 KiB/token) is ONE 128k
+# conversation: with two, the second evicts the first and every turn re-prefills
+# the whole transcript -- silently, because a cache miss looks exactly like a
+# first turn. Size it as (conversations to keep warm) x (context KV), and note
+# this is a *ceiling* that the rest of the budget has to absorb:
+#
+#   server footprint (measured, no traffic) = idle-others 39.3 + this server
+#     NP=4 q8_0: 35.7 GiB   + CRAM 32 GiB  = ~107 GiB total   <- the default
+#     NP=4 f16 : 50.3 GiB   + CRAM 64 GiB  = ~153 GiB         <- does not fit
+#
+# With q8_0 KV a 128k conversation costs 4 GiB, so 32768 keeps eight warm --
+# four live slots plus four displaced ones. Raise it only against the ceiling
+# above; CRAM=0 disables the cache, CRAM=65536 is the 16-conversation setting
+# that fits at q8_0 but not at f16.
+CRAM="${CRAM:-32768}"
 
 mkdir -p "$ROOT/logs"
 
@@ -147,6 +183,12 @@ if ! "$ROOT/build/bin/llama-bench" --list-devices 2>/dev/null | grep -qi 'MTL'; 
     echo "serve: no Metal device reported by llama-bench --list-devices." >&2
     echo "serve: rebuild with ./scripts/build.sh (GGML_METAL=ON)." >&2
     exit 1
+fi
+
+DISK_ARGS=()
+if [ -n "$SLOT_SAVE" ]; then
+    mkdir -p "$SLOT_SAVE"
+    DISK_ARGS=(--slot-save-path "$SLOT_SAVE")
 fi
 
 MTP_ARGS=()
@@ -180,7 +222,7 @@ else
     echo "serve: mtp=off"
 fi
 echo "serve: kv≈${KV_MIB} MiB/slot -> weights 15.4 GB shared + ${INSTANCES} server(s) x ${NP} slot(s) x (${KV_MIB} MiB kv)"
-echo "serve: prompt-cache=${CRAM}MiB (host RAM)  swap-cap=${SWAPCAP}MiB  http://$HOST:$PORT..$((PORT + INSTANCES - 1))  logs: $ROOT/logs/serve.$PORT.log"
+echo "serve: kv=$CTK/$CTV  prompt-cache=${CRAM}MiB${SLOT_SAVE:+  disk-tier=$SLOT_SAVE}  swap-cap=${SWAPCAP}MiB  http://$HOST:$PORT..$((PORT + INSTANCES - 1))  logs: $ROOT/logs/serve.$PORT.log"
 
 for i in $(seq 0 $((INSTANCES - 1))); do
     port=$((PORT + i))
@@ -191,6 +233,7 @@ for i in $(seq 0 $((INSTANCES - 1))); do
         -lm "$LM" -b "$BATCH" -ub "$UBATCH" \
         -ctk "$CTK" -ctv "$CTV" -fa "$FA" --cache-ram "$CRAM" \
         ${MTP_ARGS[@]+"${MTP_ARGS[@]}"} \
+        ${DISK_ARGS[@]+"${DISK_ARGS[@]}"} \
         --host "$HOST" --port "$port" "$@" &
 done
 

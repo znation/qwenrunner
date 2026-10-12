@@ -25,12 +25,12 @@ discarded and why.
 | model | `models/Qwen3.8-27B-UD-Q4_K_S.gguf`, 14.29 GiB, 27.32 B params | whole model fits *plus* 128k of KV. **Smaller quants are not faster here**: Q2_K_XL (9.83 GB, 36 % less weight traffic) buys just +7 % shallow and ≤+16 % at 128k, inside the run-to-run spread — decode at `-ngl 99` is not purely bandwidth-bound, so keep the quality |
 | `-ngl` | **99 — every layer, including `lm_head` and the MTP head** | pp512 680 t/s vs 416 at 64, 58 at 32, 21 at 0; tg 24.8 vs 17.1 at 64, 1.32 at 0. The last 3 layers are the two biggest matmuls in the model (vocab 248320 embedding/lm_head), worth +63 % prefill on their own |
 | `-fa` | **`on`** | pp512 705 vs 466 off (**+51 %**); generation equal at shallow depth (24.4 vs 23.0) |
-| KV cache | **`f16/f16` for a single 128k server**, `q8_0/q8_0` when running several | at 128k, f16 generates **14.3 t/s vs 12.9** for q8_0 and prefills faster (231 vs 222 t/s) but costs 4 GiB more per instance |
+| KV cache | **`q8_0/q8_0`** | chosen for *capacity*: it halves both the slot KV (4 GiB per 128k slot) and every prompt-cache entry, which is what lets the default cover every simultaneous conversation — measured server load 78.4 GiB against 89.6 for f16. Costs **−10 % generation at 128k depth** (12.89 vs 14.34 t/s, no MTP) and −4 % prefill. `CTK=f16 CTV=f16` restores the faster, hungrier configuration |
 | threads | **`-t 4`** | pp 758 vs 716 (t6), 693 (t8), 686 (t12), 529 (t18); generation flat from 4–18. The 12 performance cores cost more in contention than they return |
 | batch | **`-b 1024 -ub 256`** at depth, `-b 2048 -ub 512` if you only ever prefill shallow | at 98.6k depth with MTP: generation **37.45 vs 28.52 t/s (+31 %)** against 2048/512, prefill level (349 vs 340); the same pair wins both axes at 64k. Only shallow prefill prefers 2048/512 (709.6 vs 633.3). See `RESULTS.md` |
 | MTP | **on**, `--spec-type draft-mtp -md models/mtp-Qwen3.8-27B-Q4_0.gguf -ngld 99 --spec-draft-n-max 6` | draft on the GPU. **The gain is a property of the text, not the machine**: +180 % on patterned text (markdown/code/JSON, 99 % draft acceptance) and **−11 % on free-form prose** (14 %). The default draft depth is 6 because this repo serves agent/code traffic, where it is worth +40 % over upstream's 3; **if your traffic is prose, set `NMAX=3` or `MTP=0`**. Numbers in `RESULTS.md` |
 | context | **128k** (`-c 131072`) | 14.3 t/s generation and 176–231 t/s prefill *at* depth 131072; costs ~8 GiB of KV with f16 |
-| prefill cache | **`--cache-ram 65536`** (host RAM) | for agentic use this is the biggest lever there is. A growing transcript re-sent each turn prefills **only the delta**: 19 new tokens cost 0.41 s against 62.9 s cold. Upstream's 8 GiB budget holds exactly *one* 128k f16 conversation — with two, the second evicts the first and every turn silently re-prefills 29 772 tokens (measured: 57.1 s). Sized as conversations × context-KV; see the memory ceiling below |
+| prefill cache | **`--cache-ram 32768`** (host RAM) | for agentic use this is the biggest lever there is. A growing transcript re-sent each turn prefills **only the delta**: 19 new tokens cost 0.41 s against 62.9 s cold. Upstream's 8 GiB budget holds exactly *one* 128k f16 conversation — with two, the second evicts the first and every turn silently re-prefills 29 772 tokens (measured: 57.1 s). At q8_0 a 128k conversation costs 4 GiB, so 32768 keeps **eight** warm — four live slots plus four displaced |
 | parallel prompts | **`NP=N`** (slots in one server) beats **`INSTANCES=N`** (processes) | 128k per slot: `-np 6` fits in **70.4 GiB** where 6 processes die of a Metal OOM, and loads 2-3x faster; aggregate is workload-dependent — flat ~53-60 t/s where one stream was already GPU-saturated, ~91 t/s aggregate for two concurrent *code* requests. Slots buy concurrency, not throughput |
 
 **Offload is the lever that no longer exists, and context is the one that
@@ -190,22 +190,29 @@ NMAX=6` are the defaults. What each one buys:
   measured 92.8 t/s against 30.5 with `MTP=0`).
 * `NP=4` — one slot per concurrent agent session; slots are much cheaper than
   processes (52 GiB against 100 GiB at four).
-* `CRAM=65536` — the prompt cache is sized to the *number of live
-  conversations*. At 128k f16 each costs ~8 GiB, and a cache that is one entry
-  short does not degrade — it silently re-prefills a 128k transcript on every
-  turn. `CTK=q8_0 CTV=q8_0` halves it to 4 GiB each, and `CRAM=32768` is the
-  safer pairing if the cache is expected to fill on a machine that is also
-  doing something else.
+* `CRAM=32768` — the prompt cache, sized to the *number of live
+  conversations*. At 128k q8_0 each costs 4 GiB, so this keeps eight warm —
+  four live slots plus four displaced. A cache that is one entry short does not
+  degrade: it silently re-prefills a 128k transcript on every turn. `CTK=f16`
+  doubles the per-conversation cost and the cache then only covers four.
 
 Send requests with `"cache_prompt": true` (the default for the OpenAI-compatible
 endpoints) so the server can match the prefix; `scripts/agent_cache_probe.py`
 measures whether it actually did.
 
+There is a third, disk-backed tier (`SLOT_SAVE=<dir>` → `--slot-save-path`, with
+`POST /slots/{id}?action=save|restore`). It round-trips a 30k conversation's
+1.11 GiB state in **346 ms / 112 ms**, but a restored slot reports no prompt
+(`n_prompt_tokens = None`) and the next request re-prefilled all 29 772 tokens
+anyway. It is off by default and documented as unproven, not as a tier —
+`RESULTS.md`, "Disk-backed slot states".
+
 Two things to know about this default:
 
-* **It is not free.** Four slots reserve 32 GiB of KV up front and the server
-  measures 89.4 GiB of host memory on load. The cache cap is a ceiling on top of
-  that — see the note in `RESULTS.md`; `NP=1 CRAM=8192 ./serve.sh` is the
+* **It is not free.** Four slots reserve 16 GiB of KV up front (q8_0) and the
+  server measures **78.4 GiB** of host memory on load, against 89.6 GiB at f16.
+  `CRAM` is a ceiling on top of that: 39 GiB idle + 39 GiB server + 32 GiB cache
+  = fits, with ~18 GiB left. `NP=1 CRAM=8192 ./serve.sh` is the
   minimal-footprint configuration.
 * **Overlapping cold prefills hurt.** Slots share one batch, so while one
   session prefills an uncached transcript the others' generation falls to ~3.5
