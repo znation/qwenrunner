@@ -28,7 +28,7 @@ including six conclusions that earlier, load-contaminated measurements got wrong
 | KV cache | **`q4_0/q4_0` + `-fa on`** | free at depth 0 (all five dtypes within 3 %), **+9.6 % generation** at depth 8192; `q8_0/q8_0` is the balanced alternative |
 | flash attn | `-fa on` with a quantized V cache | `-fa off` aborts: `quantized V cache requires flash_attn to be enabled` |
 | threads | `-t 8` | Vega-only: 4–12 equivalent, 16 is ~8 % worse. Split: **8** beats 12 by 3 % and 6 by 13 % — the CPU work left is on the serial path, so fewer threads do not help |
-| MTP draft chain | `--spec-draft-n-max 6 --spec-draft-p-min 0.5` | llama.cpp defaults to `3` and `0.00`, which stops the chain on length and never on confidence. Sweeping them is worth **+18 % generation** where drafts land and nothing where they do not (2 interleaved reps, `bg_cpu_pct` ≤ 10). `-n-max 14` measures **+29–45 %** on high-acceptance content but **−13 %** on low — the optimum moves with the content, so 6 is the shipped compromise and `DNMAX=`/`DPMIN=` override it |
+| MTP draft chain | `--spec-draft-n-max 6 --spec-draft-p-min 0.5` | llama.cpp defaults to `3` and `0.00`, which stops the chain on length and never on confidence. Sweeping them is worth **+18 % generation** where drafts land and nothing where they do not (2 interleaved reps, `bg_cpu_pct` ≤ 10). `-n-max 14` measures **+29–45 %** on high-acceptance content but **−13 %** on low, and **does not load at 128k at all** — it is a 32k option. It also costs the 1070 VRAM (`n_outputs_max` scales with the chain): 7677 → **8013 of 8192 MiB**, which is why the shipped layer count dropped 28 → 26 to keep the reserve. `DNMAX=`/`DPMIN=` override |
 | MTP | `--spec-type draft-mtp -md models/mtp-Qwen3.8-27B-Q4_0.gguf -devd Vulkan0 -ngld 99 -ctkd q4_0 -ctvd q4_0` | **+97.8 % generation** on the Vega-only path (1.719 → 3.400 t/s), and **+38 %** on the two-GPU 128k split once the draft head runs on the **Vega 10** rather than the CPU (4.509 → 6.224 t/s). The largest lever on this host. Its win is content-dependent — +9 % to +132 % — because it is set by draft acceptance (26 % to 98 % on two prompts from the same document). Now the `serve.sh` default |
 | n-gram speculation | **off** — `ngram-simple` is a loss | retested on the content it exists for (output is a verbatim copy of a file in the context, 100 % of drafts accepted, 2 reps): MTP + `ngram-simple` **5.31** t/s and `ngram-simple` alone **5.05** against MTP alone **6.81**. Long drafts buy 8.6 accepted tokens per step at 1.9 s/step where MTP buys 2.8 at 0.56 s — the shape is wrong for a split whose CPU stage owns 33 of 65 layers |
 | context checkpoints | **on — shipped default `-ctxcp 32 -cms 8192`** | a mid-transcript rewrite resumes from a checkpoint on the chat path: at 12.2k depth it re-prefilled **3952 of 12214** tokens (3.1×, 318 s → 111 s) at the shipped setting, and `-cms 2048` is 3.4× on a 6.6k transcript where the default's 8k spacing leaves no checkpoint before the divergence. Only fires when the request carries chat message delimiters — `/v1/chat/completions` does, a raw `/completion` does not, which is why the older "compaction pays full price" measurement was wrong |
@@ -44,8 +44,15 @@ stays CPU-bound and desktop CPU load directly sets throughput.
 
 Two serving-path results are worth knowing before tuning anything else. **The
 desktop is a first-class tunable** — it currently holds ~1.4 GiB of the Vega
-(plasmashell 487, firefox 331, claude-desktop 254, ghostty 250 MiB), and at the
-measured ~132 MiB per trunk layer that is ~4 layers of budget. And **compaction
+(plasmashell 487, firefox 331, claude-desktop 254, ghostty 250 MiB), and the
+split's display footprint moves in *steps* of ~343 MiB (one Vega layer, i.e.
+7 `-ngl`), so that is roughly one rung of headroom sitting in the compositor and
+two browsers. It is also the reason the shipped default is only safe while the
+desktop baseline is **≤ ~1540 MiB** — a mid-range value of the 746-2188 MiB
+drift, so the default is under-provisioned rather than broken, and `serve.sh`
+warns instead of preventing it. When the display is tight the rung to drop to is
+`-ngl 26`, not 24: measured, 24 and 26 cost the display the same and 26 keeps two
+more layers on the 1070. And **compaction
 does resume from a context checkpoint, on the chat path only**: mid-prompt
 checkpoints are gated on `message_delimiters`, which the differential autoparser
 supplies for every `/v1/chat/completions` request and which a raw `/completion`
@@ -180,9 +187,13 @@ by arithmetic. It prints the live display baseline and warns when it is above th
 ~1216 MiB the default config was measured to survive. It forwards
 `SIGINT`/`SIGTERM` to the child, so Ctrl-C actually stops the server.
 
-The layer count comes from the measured formula (`34 - (CTX-32768)/16384` with
-MTP), two layers under the last startable rung, which leaves ~620 MiB of the
-cap as a reserve for desktop drift. `FIT=1` instead hands `-ngl` and the tensor
+The layer count comes from the measured formula (`32 - (CTX-32768)/16384` with
+MTP — 32, not 34, because the shipped 6-token draft chain moves the 128k ceiling
+from 30 to 28; see RESULTS.md "The draft chain spends the 1070's reserve"), two
+layers under the last startable rung, which leaves ~570 MiB of the cap clear at a
+1457 MiB baseline — safe while the desktop baseline is ≤ ~1880 MiB, i.e. most but
+not all of the 746-2188 MiB range it drifts over (the top of that range needs
+`FIT=1` or fewer layers). `FIT=1` instead hands `-ngl` and the tensor
 split to llama.cpp's own `--fit`, with the cap encoded as a `-fitt` margin
 (`vram_total - CAP` on the Vega, so it is baseline-independent); measured at
 128k it picks 28-30 layers — the same config to 2 MiB, or two layers faster —

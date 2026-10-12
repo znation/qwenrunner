@@ -189,6 +189,12 @@ def run_arm(name, args, prompt, idle0):
     rec["client_gtt_peak_mib"] = round(mon.gtt_peak, 1)
     rec["client_top"] = mon.top_clients
     rec["rss_peak_mib"] = round(mon.rss_peak_kib / 1024.0, 1)
+    # The 1070 sets every ceiling at the split (RESULTS.md "VRAM policy"), and
+    # the speculative chain length is what spends its reserve -- so record its
+    # peak alongside the display GPU's.
+    if mon.nvidia_total is not None:
+        rec["nvidia_vram_peak_mib"] = round(mon.nvidia_peak, 1)
+        rec["nvidia_vram_total_mib"] = mon.nvidia_total
     # Throughput on this host is CPU-bound, so an arm measured against a busy
     # desktop is not comparable to an idle one. Quote bg_cpu_pct with the rate.
     rec["cpu_busy_pct"] = None if mon.cpu_busy_pct is None else round(mon.cpu_busy_pct, 1)

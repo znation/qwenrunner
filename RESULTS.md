@@ -80,11 +80,12 @@ Two different numbers, never subtracted across scopes:
   within one hour, traced to Firefox video and `claude-desktop`). Read the
   printed baseline before interpreting any peak. Attributed per DRM client at a
   1790 MiB baseline: **plasmashell 487, firefox-esr 331, claude-desktop 254,
-  ghostty 250 MiB**, ~56 MiB of everything else. At the measured ~132 MiB per
-  trunk layer that is ~4 layers of budget sitting in the compositor and two
-  browsers — the desktop is a first-class tunable here, and `serve.sh`'s warning
-  fires at 1216 MiB precisely because the shipped 28-layer config is sized
-  against a light one.
+  ghostty 250 MiB**, ~56 MiB of everything else. The split's display footprint
+  moves in steps of ~343 MiB (one Vega layer — see "The split's display cost is a
+  staircase"), so that is roughly one rung of headroom sitting in the compositor
+  and two browsers. The desktop is a first-class tunable here, and `serve.sh`'s
+  warning fires at 1216 MiB precisely because the shipped 28-layer config is
+  sized against a light one.
 * **`client_vram_peak_mib` (per-DRM-client sum)** — the model's own footprint.
   The guarded child has no DRM client before it execs, so this baseline is zero
   by construction and the peak *is* the footprint. **This is the number to use
@@ -111,6 +112,75 @@ layers are nearly free (1522.1 → 1522.2), so never extrapolate below 2.
 Verified both ways: `-ngl 12` ran clean at a 765 MiB baseline (peak 4824.6 MiB)
 and breached at 1113.8 MiB (peak 5117.6 MiB, killed 5 s in). **Do not hard-code
 an `-ngl`** — read the printed baseline and let `guard.py` be the backstop.
+
+### The split's display cost is a staircase, not per-layer
+
+The `-ngl` 2-12 ladder above is the Vega-only path. With the eGPU split
+(`-dev CUDA0,Vulkan0 -sm layer -ts 6,1`) the display footprint moves in *steps*,
+because `-ts` hands the Vega whole layers at a 7:1 ratio, so the Vega holds about
+`-ngl/7` of them. Measured at the shipped shape (`-c 131072 -np 2`, MTP with the
+draft chain at 6, one run each, `results/ngl_staircase.jsonl`; the `safe baseline`
+column is `5000 - client - 148`, where 148 MiB is the largest transient measured
+above baseline+client when a real request runs):
+
+| `-ngl` | client MiB | NVIDIA MiB | system peak | safe baseline ≤ |
+|---|---|---|---|---|
+| 24 | 2972.5 | 7169.3 | 4579.7 | ~1880 MiB |
+| 26 | 2971.5 | 7689.3 | 4579.4 | ~1880 MiB |
+| 28 | 3314.2 | 8013.3 | 4936.7 | ~1540 MiB |
+
+* **24 and 26 cost the display exactly the same** (2972.5 vs 2971.5 MiB — both
+  hold 3 trunk layers on the Vega) while 26 keeps two more layers on the 1070
+  (7689 vs 7169 MiB). So when the display is tight **the rung to drop to is 26,
+  not 24**: the same display relief for 2 layers offloaded instead of 4.
+  `serve.sh`'s old advice, "Lower NGL= by 2-4", is wrong in one direction.
+* **One Vega layer is worth ~343 MiB of the cap and the lever is 7 `-ngl` wide**,
+  so the layer count is a blunt instrument for display pressure. The efficient
+  dials are the KV pool (`-c`, `-np`), the draft's residency (1.3 GB on the Vega
+  — see "MTP at the split") and the desktop itself (~1.4 GiB).
+* **The default is safe only while the baseline is ≤ ~1540 MiB, and the observed
+  drift is 746-2188 MiB.** At the 1483 MiB measured during this work it peaks
+  4794.1 MiB — 206 MiB of margin — and at the 1808 MiB measured an hour earlier
+  the same config would have peaked ~5120 and been killed. This is the failure
+  `serve.sh` warns about rather than prevents.
+
+### The draft chain spends the 1070's reserve
+
+`n_outputs_max` scales with `--spec-draft-n-max`, so the chain length costs the
+*1070*, not the display. At the shipped shape, one run each
+(`results/ngl_staircase.jsonl`):
+
+| `DNMAX` | client MiB | NVIDIA MiB | outcome |
+|---|---|---|---|
+| 3 (upstream) | 3282.7 | 7677.3 | loads; 28 layers is 2 under the 30-layer ceiling |
+| **6 (shipped)** | 3314.2 | **8013.3** | loads; **179 MiB of 8192 left**, so 28 *is* the ceiling |
+| 14 | — | — | **✗ fails to load** — `allocating 837.25 MiB on device 0: cudaMalloc failed` |
+
+* **`-n-max 14` is a 32k option only.** It was measured at `-c 32768 -ngl 32`,
+  where the compute buffer is smaller; at 128k it cannot allocate the pp compute
+  buffer at all. The +29-45 % figure stands, but not at the shipped context.
+* **At `DNMAX=6` the shipped 28 layers is the last startable rung, not two under
+  it** — the chain consumed the reserve the formula was built to keep. That is
+  why the safe baseline falls from ~1570 to ~1540 MiB even though the display
+  client only grows by 31 MiB: the 1070 is the device that sets every ceiling
+  here, and the chain ate 336 MiB of it.
+* **What the reserve costs, measured** (`results/ngl_reserve_*.jsonl`, 128k,
+  5189-token prompt, 64 tokens out, 2 reps each): `-ngl 26` measured pp 33.63 /
+  tg 6.413 at `bg_cpu_pct` 1.4, `-ngl 28` measured pp 34.06 / tg 6.663 at 31.1.
+  The two 26-layer reps bracket the background correction — 40.8 % background
+  costs 4.3 % of generation — so 28 layers is worth roughly **+5 % prefill and
+  +7 % generation**.
+* **`-ngl 28` is a coin flip against the watchdog.** Two runs of the *same*
+  command at the *same* baseline — 1457.4 and 1453.9 MiB, 3.5 MiB apart — peaked
+  at **5053.3 MiB (`vram_violation`, killed at 0 s of generation)** and 4850.9.
+  `-ngl 26` peaked 4529.1 and 4721.1: 280-470 MiB clear. And the shipped config
+  is `-np 2`, which stacks a second slot's buffers on top of these `-np 1` arms,
+  so its real margin is worse than the table above.
+* **Hence 26 ships and 28 is opt-in** (`NGL=28 ./serve.sh`, on a light desktop).
+  Verified at the new default: health 13 s, a completion returns, `exit_code 0`,
+  `vram_violation: false`, peak **4428.5** of 5000, client 2971.5, NVIDIA 7689.3
+  of 8192 — against 206 / 179 MiB of margin for the 28-layer version of the same
+  config.
 
 ## Correctness smoke (CPU, `-ngl 0`)
 
@@ -700,9 +770,12 @@ And the same two 128k rungs with the full 5246-token prompt
   32768/32 and 34 both 3025) because `-ts` rounding decides how many whole
   layers the Vega takes and extra layers land on CUDA0. Read the NVIDIA
   counter, not the client one, when tuning up.
-* `serve.sh` derives `-ngl` as `34 - (CTX - 32768)/16384`, which is exactly the
-  32k and 128k rows above — two layers under the last startable rung at both
-  ends, and deliberately conservative below 32k.
+* `serve.sh` derives `-ngl` as `32 - (CTX - 32768)/16384`, which is two layers
+  under the last startable rung at the 32k and 128k ends, and deliberately
+  conservative below 32k. Those rungs (38/36/30) were measured with upstream's
+  3-token draft chain; the shipped 6-token chain moves the 128k ceiling to 28,
+  which is why the formula's constant is 32 rather than 34 — see "The draft
+  chain spends the 1070's reserve".
 
 #### Threads at the split **[clean]**
 
@@ -962,15 +1035,16 @@ arithmetic. It serves one model split across both GPUs — `-dev CUDA0,Vulkan0
 -sm layer` — and **requires the eGPU**: without `/dev/nvidia0` or a CUDA build
 it exits 1 instead of degrading to a configuration the watchdog would kill.
 
-Defaults: `-a Qwen3.8-27B -ts 6,1 -ngl 28 -np 2 -t 8 -lm dio -b 2048 -ub 512 -ctk q4_0
+Defaults: `-a Qwen3.8-27B -ts 6,1 -ngl 26 -np 2 -t 8 -lm dio -b 2048 -ub 512 -ctk q4_0
 -ctv q4_0 -fa on`, plus MTP with the draft head **on the Vega 10**
 (`--spec-type draft-mtp -md models/mtp-Qwen3.8-27B-Q4_0.gguf -devd Vulkan0
--ngld 99 -ctkd q4_0 -ctvd q4_0`). `-c` is the shared pool — `CTX=131072` with
+-ngld 99 -ctkd q4_0 -ctvd q4_0 --spec-draft-n-max 6 --spec-draft-p-min 0.5`). `-c`
+is the shared pool — `CTX=131072` with
 `-np 2` is **65536 per slot**, so a client's `contextWindow` must say 65536
 (pi's `~/.pi/agent/models.json` does) — and `-ngl` is derived from the pool
-(`34 - (CTX-32768)/16384` with MTP, `40 - (CTX-8192)/15360` without) with `-ts`
+(`32 - (CTX-32768)/16384` with MTP, `40 - (CTX-8192)/15360` without) with `-ts`
 from whether the draft is resident; `MTP=0` disables speculation, `NGL=`,
-`TS=`, `NP=`, `DEVD=`, `NGLD=` override. `FIT=1` replaces the formula with
+`TS=`, `NP=`, `DEVD=`, `NGLD=`, `DNMAX=`, `DPMIN=` override. `FIT=1` replaces the formula with
 llama.cpp's own `--fit` (`-fitt "$FITT_CUDA,$(vram_total - CAP)"`, default
 `256,3176`), which re-derives `-ngl` and the split from live free VRAM — 28-30
 layers at a 128k pool with `-np 1`, **26 with `-np 2`** (it accounts for the

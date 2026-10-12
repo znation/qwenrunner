@@ -129,6 +129,24 @@ DCTV="${DCTV:-q4_0}"
 # of cap margin. The transfer is expected to hold or improve -- the shipped
 # config leaves *more* CPU work per target step, so a draft step is relatively
 # cheaper there -- but it is an inference, not a measurement.
+#
+# THE CHAIN LENGTH COSTS 1070 VRAM, because n_outputs_max scales with it. At the
+# shipped config (128k, -np 2), one run each:
+#
+#   DNMAX  client MiB  NVIDIA MiB  system peak  outcome
+#   3       3282.7      7677.3       4764.2      loads
+#   6       3314.2      8013.3       4943.7      loads, 179 MiB of 8192 left
+#   14        --         --          --          FAILS TO LOAD: cudaMalloc of
+#                                                 the 837 MiB compute buffer
+#
+# So 6 is affordable but it spends the 1070's reserve -- with n-max 3 the last
+# startable rung at 128k is 30 and 28 leaves two layers of slack; with n-max 6
+# the 1070 peaks at 8013 of 8192 and 28 is at the ceiling. DNMAX=14 is a 32k
+# option only (it was measured at -c 32768 -ngl 32, where the compute buffer is
+# smaller); it does not load at 128k. If the display or the 1070 is tight, the
+# rung to drop to is -ngl 26, not 24 -- measured, 24 and 26 both hold 3 trunk
+# layers on the Vega (client 2972.5 / 2971.5 MiB, i.e. the same display cost) but
+# 26 keeps two more layers on the 1070 (7169 vs 7689 MiB).
 DNMAX="${DNMAX:-6}"
 DPMIN="${DPMIN:-0.5}"
 
@@ -148,7 +166,7 @@ DEV="CUDA0,Vulkan0"
 # Layer budget. The default (FIT=0) is the measured formula; FIT=1 hands the
 # decision to llama.cpp's own --fit.
 #
-#   FIT=0  the measured formula, which is what RESULTS.md quotes: 34 -
+#   FIT=0  the measured formula, which is what RESULTS.md quotes: 32 -
 #          (CTX-32768)/16384 with MTP, 40 - (CTX-8192)/15360 without, floored at
 #          8 -- two layers under the last startable rung at the 32k and 128k
 #          anchors. Measured fit points (load + a real completion,
@@ -156,16 +174,25 @@ DEV="CUDA0,Vulkan0"
 #          layers at 8k, 36 at 32k, 30 at 128k; the margin is for depth, because
 #          those probes peak at 5246 tokens and the flash-attention workspace
 #          grows with context. Without a draft the anchors are 40 at 8k / 32 at
-#          128k. Deterministic, and the reserve it leaves (client 3384 MiB of a
-#          5000 MiB cap on a ~1100 MiB baseline) is what absorbs desktop drift.
+#          128k. The MTP form is 32 rather than 34 because those anchors were
+#          measured with upstream's 3-token draft chain: the shipped 6 costs the
+#          1070 ~1.3 layers, which moves the 128k ceiling from 30 to 28. See the
+#          DNMAX block for the measurement. Deterministic, and the reserve it
+#          leaves (client 2972 MiB of a 5000 MiB cap on a ~1480 MiB baseline,
+#          7689 MiB of the 1070's 8192) is what absorbs desktop drift -- it is
+#          safe to ~1880 MiB -- most, not all, of the 746-2188 MiB range the
+#          baseline is known to occupy; 28 layers is safe only to ~1540, and its
+#          two runs of the same command peaked 200 MiB apart, one of them over
+#          the cap.
 #   FIT=1  llama-server projects per-device weight + KV + compute + draft memory
 #          against live *free* VRAM and picks -ngl and the tensor split itself.
 #          The display cap is encoded as a margin: -fitt asks the fit to leave
 #          (vram_total - CAP) free on the Vega, which is baseline-independent
 #          because the fit already sees the desktop's usage in `free`. Measured
 #          at 128k + MTP it picks 28-30 layers (client 3383-3648 MiB, NVIDIA
-#          7479-7525 MiB) against the formula's 28 (3384/7541), and its
-#          projection tracked measurement to ~25 MiB. It re-derives the count
+#          7479-7525 MiB) against the formula's 28 (3384/7541) -- those runs also
+#          predate the 6-token chain, which is why the formula now ships 26 -- and
+#          its projection tracked measurement to ~25 MiB. It re-derives the count
 #          from live free memory instead of assuming a baseline -- but the
 #          choice is discrete and moves with a few MiB of desktop noise (28 at a
 #          7059 MiB free Vega, 30 at 7059+10), and at 30 it spends the reserve
@@ -183,7 +210,21 @@ if [ -n "${NGL:-}" ] || [ -n "${TS:-}" ]; then
 fi
 
 if [ "$MTP" = 1 ]; then
-    NGL="${NGL:-$(( 34 - (CTX - 32768) / 16384 ))}"
+    # 32, not 34: the two-layer reserve is unchanged, but the *ceiling* it is
+    # measured against moves with the draft chain. At 128k the last startable
+    # rung is 30 with upstream's n-max 3 and 28 with the shipped 6, because
+    # n_outputs_max scales with the chain and costs the 1070 336 MiB (~1.3
+    # layers) -- see the DNMAX block. Shipping 28 with the 6-token chain puts the
+    # 1070 at 8013 of 8192 MiB and leaves the config safe only while the desktop
+    # baseline is <= ~1540 MiB; 26 leaves it at 7689 and safe to ~1880. Measured
+    # at 28, two runs of the same command 3.5 MiB apart in baseline peaked 5053.3
+    # (killed) and 4850.9 -- a coin flip; at 26, 4529.1 and 4721.1, clear both
+    # times.
+    # Measured: -ngl 24 buys nothing over 26 on the display (both hold 3 trunk
+    # layers on the Vega, client 2972.5 vs 2971.5 MiB) and costs two more layers.
+    # Raising DNMAX further must lower NGL further; DNMAX=14 does not load at all
+    # at 128k.
+    NGL="${NGL:-$(( 32 - (CTX - 32768) / 16384 ))}"
     TS="${TS:-6,1}"
 else
     NGL="${NGL:-$(( 40 - (CTX - 8192) / 15360 ))}"
