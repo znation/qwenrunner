@@ -166,6 +166,46 @@ The defaults stay `NP=1`/`INSTANCES=1` because every slot reserves its full KV
 up front — 8 GiB per 128k slot whether or not anyone is connected, so four idle
 slots cost 32 GiB. Set them when you have clients.
 
+#### Which one to use
+
+They differ on three axes, and only one of them is speed.
+
+| | `NP=N` (slots, one process) | `INSTANCES=N` (N processes) |
+|---|---|---|
+| memory for 4 x 128k | **52 GiB** | 100 GiB |
+| largest measured N at 128k | **6+** | 4 (6 = Metal out-of-memory) |
+| load time | **4-5 s** | 9-13 s |
+| aggregate t/s at N=4 | 60.9 | **65.9** (+8 %) |
+| failure domain | one process — a crash or OOM drops **all** slots | per process — the others keep serving |
+| restart / upgrade one worker | no | **yes** |
+| per-port configuration | no | **yes** (see below) |
+| CPU threads | one `-t` pool shared by all slots | each process gets its own `-t` pool |
+| ports | one | N |
+
+**Use `NP=N`** when you just want N concurrent clients against one endpoint and
+care about memory: it is the difference between 6 parallel 128k conversations
+and 4, and it starts in a third of the time.
+
+**Use `INSTANCES=N`** when you need any of the things one process cannot give
+you: fault isolation (an OOM in one worker does not kill the rest), the ability
+to restart or upgrade one port while the others serve, separate logs — or
+**different settings per port**, which is the case worth knowing about. With one
+`serve.sh` every server gets the same flags, but nothing stops you running two:
+
+```
+PORT=8080 NMAX=6 ./serve.sh &        # code/agent traffic: deeper speculation
+PORT=8081 MTP=0   ./serve.sh &        # prose: speculation does not pay
+```
+
+That is not expressible with `-np`, and it follows directly from the MTP
+measurement above — the two workloads want opposite settings. Note each process
+takes the whole weight mapping as its own GPU working set, so keep the process
+count low (4 measured) and prefer slots when you only need more clients.
+
+The +8 % is confounded: four processes also get four `-t 4` CPU thread pools
+(16 threads) against one shared pool for slots. If you run `NP=4` and want that
+back, `THREADS=8` is the untested knob.
+
 ## Harness
 
 | script | purpose |
@@ -200,3 +240,9 @@ the Intel list, the second two are new here:
   allocations in one number, and it does not fall back to baseline the instant
   a process exits. Absolute figures are only meaningful against a baseline
   sampled the same way.
+* **macOS ships bash 3.2**, where `"${ARR[@]}"` on an *empty* array is an
+  unbound-variable error under `set -u`. `MTP=0 ./serve.sh` therefore died on
+  `line 161: MTP_ARGS[@]: unbound variable` — a flag the README had advertised
+  since before this branch. The portable form is
+  `${ARR[@]+"${ARR[@]}"}`, which is what `serve.sh` uses now. Any script here
+  that builds an argv array conditionally needs the same guard.

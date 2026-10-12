@@ -483,6 +483,27 @@ memory, most slots) or `INSTANCES=N` (N ports, separate processes, marginally
 better measured per-stream at N=4 but half the headroom and a hard ceiling at
 4). Pick slots for capacity, processes for isolation.
 
+### The N=4 gap is real but small, and it is confounded
+
+The first pass at this table was one sample per arm, and it showed four
+processes 26 % ahead of four slots. Two interleaved reps (`results/slots_vs_procs.jsonl`)
+halve that and make the direction reproducible:
+
+| N=4 | rep 1 | rep 2 | mean | total RSS | GPU (summed) |
+|---|---|---|---|---|---|
+| `-np 4` | 61.7 | 60.1 | **60.9** | 52.2 GiB | 57.8 GiB |
+| 4 processes | 66.4 | 65.4 | **65.9** | 99.7 GiB | 104.3 GiB |
+
+**+8 % aggregate for processes, for twice the memory and a ceiling of 4 instead
+of 6+.** Within-mode spread is now ±3 %, so the difference is real; the earlier
+26 % was drift.
+
+It is also *confounded*, which matters for how you use it: four processes each
+get their own `-t 4` CPU thread pool (16 threads total), while `-np 4` shares
+one `-t 4` pool across all four slots. The measured 8 % may be CPU scheduling
+for the sampling and SSM steps rather than anything about batching. Raising
+`THREADS` for the slot configuration is the obvious test and was not run.
+
 ## What was discarded
 
 * **`-ngl 0` took 830 s** for one arm (2 reps of pp512 + tg128 on 18 CPU

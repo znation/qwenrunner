@@ -164,7 +164,7 @@ for i in $(seq 0 $((INSTANCES - 1))); do
         -m "$MODEL" -ngl "$NGL" -c "$TOTAL_CTX" -np "$NP" -t "$THREADS" \
         -lm "$LM" -b "$BATCH" -ub "$UBATCH" \
         -ctk "$CTK" -ctv "$CTV" -fa "$FA" \
-        "${MTP_ARGS[@]}" \
+        ${MTP_ARGS[@]+"${MTP_ARGS[@]}"} \
         --host "$HOST" --port "$port" "$@" &
 done
 
