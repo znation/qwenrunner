@@ -265,6 +265,36 @@ The +8 % is confounded: four processes also get four `-t 4` CPU thread pools
 (16 threads) against one shared pool for slots. If you run `NP=4` and want that
 back, `THREADS=8` is the untested knob.
 
+## Clients — pi, omp, tumwater
+
+`serve.sh` advertises the model as **`qwen3.8-27b`** (llama-server's `--alias`,
+overridable with `ALIAS`). Without an alias the server reports the GGUF's own
+name, which changes with the file, so every client would have to track it — the
+three configs below all name this string.
+
+The API is OpenAI-compatible at `http://127.0.0.1:8080/v1`; the API key is a
+placeholder that llama-server ignores.
+
+| client | file | entry |
+|---|---|---|
+| pi | `~/.pi/agent/models.json` | provider `qwenrunner`, model `qwen3.8-27b`, cost 0 |
+| omp | `~/.omp/agent/models.yml` | same provider and model |
+| tumwater | `~/tumwater/tumwater.json` | `fallbackModel: { provider: qwenrunner, model: qwen3.8-27b }` |
+
+Two properties are load-bearing:
+
+* **It must price at zero.** tumwater's budget gate refuses a priced fallback
+  (it would spend past the cap), so the catalog entries carry
+  `cost: {input: 0, output: 0, ...}` like the other local providers. Verified
+  with the harness's own doctor:
+  `ok fallback — qwenrunner/qwen3.8-27b — priced at zero (cost n/a), serving not verified`.
+  "Serving not verified" is the doctor's normal wording for a free pair: only the
+  fallback's own ticks can prove the backend answers, and **the server must be
+  running** for any client to use it (`./serve.sh`).
+* **`reasoning: true`** — the model emits `reasoning_content` before its answer
+  (verified on `/v1/chat/completions`), so a small `max_tokens` can be consumed
+  entirely by thinking and return empty `content`.
+
 ## Harness
 
 | script | purpose |

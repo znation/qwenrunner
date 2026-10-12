@@ -24,7 +24,7 @@
 #
 # Overridable via env (anything unset is derived):
 #   MODEL CTX NP INSTANCES PORT THREADS HOST NGL LM BATCH UBATCH CTK CTV FA
-#   MTP MD NGLD NMAX CRAM SLOT_SAVE SWAPCAP
+#   MTP MD NGLD NMAX CRAM SLOT_SAVE ALIAS SWAPCAP
 #
 #   ./serve.sh                      # 4 agent slots, 64 GiB prompt cache, NMAX=6
 #   NP=1 CRAM=8192 ./serve.sh       # single session, minimal footprint
@@ -121,6 +121,12 @@ NGLD="${NGLD:-99}"
 NMAX="${NMAX:-6}"
 
 SWAPCAP="${SWAPCAP:-0}"
+
+# Model id llama-server advertises on /v1/models, and therefore the id every
+# client config must reference. Without it the server reports the GGUF's own
+# name, which changes with the file -- the pi/omp catalogs and tumwater's
+# fallbackModel all name this string, so keep them in step if you change it.
+ALIAS="${ALIAS:-qwen3.8-27b}"
 
 # Disk-backed tier for conversations beyond CRAM. With this set, a slot's KV
 # state can be written to and read from a file, so a conversation evicted from
@@ -219,7 +225,7 @@ kv_bytes_per_tok() {
 BYTES=$(python3 -c "print(2*16*4*256*($(kv_bytes_per_tok "$CTK")+$(kv_bytes_per_tok "$CTV"))/2)")
 KV_MIB=$(python3 -c "print(int($CTX*$BYTES/1048576))")
 
-echo "serve: model=$(basename "$MODEL") ctx=$CTX/slot slots=$NP instances=$INSTANCES threads=$THREADS"
+echo "serve: model=$(basename "$MODEL") alias=$ALIAS ctx=$CTX/slot slots=$NP instances=$INSTANCES threads=$THREADS"
 echo "serve: -ngl $NGL -lm $LM -b $BATCH -ub $UBATCH -ctk $CTK -ctv $CTV -fa $FA"
 if [ "$MTP" = 1 ]; then
     echo "serve: mtp=on (draft on GPU, -ngld $NGLD) $([ -f "$MD" ] && basename "$MD" || echo 'embedded nextn tensors')"
@@ -234,7 +240,7 @@ for i in $(seq 0 $((INSTANCES - 1))); do
     python3 "$ROOT/scripts/guard.py" --swap-cap-mib "$SWAPCAP" \
         --log "$ROOT/logs/serve.$port.log" -- \
         "$SERVER" \
-        -m "$MODEL" -ngl "$NGL" -c "$TOTAL_CTX" -np "$NP" -t "$THREADS" \
+        -m "$MODEL" --alias "$ALIAS" -ngl "$NGL" -c "$TOTAL_CTX" -np "$NP" -t "$THREADS" \
         -lm "$LM" -b "$BATCH" -ub "$UBATCH" \
         -ctk "$CTK" -ctv "$CTV" -fa "$FA" --cache-ram "$CRAM" \
         ${MTP_ARGS[@]+"${MTP_ARGS[@]}"} \
