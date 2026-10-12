@@ -28,14 +28,32 @@ including six conclusions that earlier, load-contaminated measurements got wrong
 | KV cache | **`q4_0/q4_0` + `-fa on`** | free at depth 0 (all five dtypes within 3 %), **+9.6 % generation** at depth 8192; `q8_0/q8_0` is the balanced alternative |
 | flash attn | `-fa on` with a quantized V cache | `-fa off` aborts: `quantized V cache requires flash_attn to be enabled` |
 | threads | `-t 8` | Vega-only: 4–12 equivalent, 16 is ~8 % worse. Split: **8** beats 12 by 3 % and 6 by 13 % — the CPU work left is on the serial path, so fewer threads do not help |
+| MTP draft chain | `--spec-draft-n-max 6 --spec-draft-p-min 0.5` | llama.cpp defaults to `3` and `0.00`, which stops the chain on length and never on confidence. Sweeping them is worth **+18 % generation** where drafts land and nothing where they do not (2 interleaved reps, `bg_cpu_pct` ≤ 10). `-n-max 14` measures **+29–45 %** on high-acceptance content but **−13 %** on low — the optimum moves with the content, so 6 is the shipped compromise and `DNMAX=`/`DPMIN=` override it |
 | MTP | `--spec-type draft-mtp -md models/mtp-Qwen3.8-27B-Q4_0.gguf -devd Vulkan0 -ngld 99 -ctkd q4_0 -ctvd q4_0` | **+97.8 % generation** on the Vega-only path (1.719 → 3.400 t/s), and **+38 %** on the two-GPU 128k split once the draft head runs on the **Vega 10** rather than the CPU (4.509 → 6.224 t/s). The largest lever on this host. Its win is content-dependent — +9 % to +132 % — because it is set by draft acceptance (26 % to 98 % on two prompts from the same document). Now the `serve.sh` default |
+| n-gram speculation | **off** — `ngram-simple` is a loss | retested on the content it exists for (output is a verbatim copy of a file in the context, 100 % of drafts accepted, 2 reps): MTP + `ngram-simple` **5.31** t/s and `ngram-simple` alone **5.05** against MTP alone **6.81**. Long drafts buy 8.6 accepted tokens per step at 1.9 s/step where MTP buys 2.8 at 0.56 s — the shape is wrong for a split whose CPU stage owns 33 of 65 layers |
+| context checkpoints | **on — shipped default `-ctxcp 32 -cms 8192`** | a mid-transcript rewrite resumes from a checkpoint on the chat path: at 12.2k depth it re-prefilled **3952 of 12214** tokens (3.1×, 318 s → 111 s) at the shipped setting, and `-cms 2048` is 3.4× on a 6.6k transcript where the default's 8k spacing leaves no checkpoint before the divergence. Only fires when the request carries chat message delimiters — `/v1/chat/completions` does, a raw `/completion` does not, which is why the older "compaction pays full price" measurement was wrong |
 | slots | **`-np 2`** | a second agent (or subagent) makes progress instead of queueing: two concurrent 1135-token requests take 100.0 s wall together against 91.4 s serialized — fairness, not throughput. Costs +160 MiB of the 1070's compute buffers (NVIDIA 7701 vs 7541) and **halves the per-slot context** (`-c` is a shared pool: 131072 / 2 = 65536, which is what pi's `contextWindow` must say). `-np 4` fits at load (NVIDIA 8093) but leaves 32768/slot and has aborted a real request in `ggml_cuda_pool_vmm::alloc` |
 
 **MTP speculation is the one large win — it more than doubles generation
 throughput, and where its draft head runs decides how much.** Everything else is
-worth single digits to tens of percent. The binding constraint is that **only
-8–12 of 64 layers fit in VRAM**, so the model stays CPU-bound and desktop CPU
-load directly sets throughput.
+worth single digits to tens of percent. Its *chain length* is the last thing on
+that path that was untuned: upstream stops at 3 drafts per step and never on
+confidence, and 6 with a 0.5 confidence floor is +18 % where drafts land. The
+binding constraint is that **only 8–12 of 64 layers fit in VRAM**, so the model
+stays CPU-bound and desktop CPU load directly sets throughput.
+
+Two serving-path results are worth knowing before tuning anything else. **The
+desktop is a first-class tunable** — it currently holds ~1.4 GiB of the Vega
+(plasmashell 487, firefox 331, claude-desktop 254, ghostty 250 MiB), and at the
+measured ~132 MiB per trunk layer that is ~4 layers of budget. And **compaction
+does resume from a context checkpoint, on the chat path only**: mid-prompt
+checkpoints are gated on `message_delimiters`, which the differential autoparser
+supplies for every `/v1/chat/completions` request and which a raw `/completion`
+prompt lacks, so the earlier "compaction pays full price" measurement described
+the probe rather than the model. Measured, the shipped `-cms 8192` already takes
+a mid-transcript rewrite at 12.2k depth from a 12214-token re-prefill to **3952**
+(3.1×), and the bound it sets — `-cms` tokens back from the divergence — is what
+turns a 73-minute 130k re-prefill into ~3.5 minutes.
 
 Best measured figures: **74.41 t/s prompt and 2.01 t/s generation** (`-ngl 10`,
 `-lm dio`, shallow context), rising to **3.40 t/s generation** with MTP at
@@ -268,8 +286,9 @@ window above 4 GB. Verify: `nvidia-smi` lists the card with 8192 MiB, and
 | `scripts/quant_compare.sh` | quant offload ceiling + throughput + perplexity |
 | `scripts/wait_idle.py` | block until a workload's CPU — or the whole host's — goes quiet |
 | `scripts/gguf_head.py` | read GGUF metadata from a local file or a remote URL without downloading it |
+| `scripts/ckpt_probe.py` | context-checkpoint/compaction probe — one prompt, then the same prompt with a block rewritten, and the `prompt_n` that comes back; `--mode chat` sends the `message_delimiters` a chat request carries, `--mode raw` is the bare `/completion` probe that made the old "compaction pays full price" measurement look like a model property |
 
-Four measurement traps this harness exists to catch, each of which produced a
+Five measurement traps this harness exists to catch, each of which produced a
 wrong answer before it was caught:
 
 * **Throughput here is CPU-bound** (54 of 64 layers run on the CPU), so
@@ -288,3 +307,9 @@ wrong answer before it was caught:
   19 GB by other sessions — non-evictable memory on a 39 GiB box with no swap.
   Run one model load at a time and check `MemAvailable` first. `-lm dio` peaks at
   ~300 MiB RSS where the mmap modes hold 13–14 GB resident.
+* **The probe's API surface picks the code path.** Mid-prompt context
+  checkpoints are gated on `message_delimiters`, which only a chat request
+  carries, so a raw `/completion` prompt can never exercise them — the
+  "compaction pays full price" measurement described the probe, not the model.
+  The clients post to `/v1/chat/completions`; `scripts/ckpt_probe.py --mode chat`
+  is the probe that matches them.

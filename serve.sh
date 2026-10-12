@@ -32,7 +32,7 @@
 #
 # Overridable via env (anything unset is derived):
 #   MODEL ALIAS CTX THREADS TS NGL LM BATCH UBATCH CTK CTV FA HOST PORT CAP NP
-#   MTP MD DEVD NGLD DCTK DCTV FIT FITT_CUDA
+#   MTP MD DEVD NGLD DCTK DCTV DNMAX DPMIN FIT FITT_CUDA
 #
 #   ./serve.sh                      # 2 slots x 64k, both GPUs, MTP on
 #   NP=1 ./serve.sh                 # one slot, the whole 128k pool for one agent
@@ -96,12 +96,41 @@ fi
 # -ctkd/-ctvd q4_0 is not optional at 128k: the draft's own f16 KV is ~537 MiB
 # at 131072 tokens and q4_0 cuts that to ~134 MiB. `-devd` must name a device
 # from -dev; the default (follow -dev) would put the draft's share on the 1070.
+# The chain length and early-stop (DNMAX/DPMIN below) are the one part of this
+# that upstream's defaults get wrong for this host -- see the block at DNMAX.
 MTP="${MTP:-1}"
 MD="${MD:-$ROOT/models/mtp-Qwen3.8-27B-Q4_0.gguf}"
 DEVD="${DEVD:-Vulkan0}"
 NGLD="${NGLD:-99}"
 DCTK="${DCTK:-q4_0}"
 DCTV="${DCTV:-q4_0}"
+# The MTP draft *chain* is the one knob left on the speculation path, and
+# llama.cpp's defaults are a compromise that costs this host a lot: -n-max 3 and
+# -p-min 0.00 mean the chain stops on length, never on confidence. Measured
+# (results/draft_chain*.jsonl, 2 interleaved reps each, bg_cpu_pct <= 10):
+#
+#   arm                     feature-list (46/48 accepted)  mid-doc (32/90)
+#   -n-max 3 (upstream)     5.98 t/s                        3.41-3.67 t/s
+#   -n-max 6                7.05                           2.64
+#   -n-max 6 -p-min 0.5     7.08 / 7.21                    3.63
+#   -n-max 14 -p-min 0.5    7.71 / 7.76                    not measured
+#
+# So 6 + p-min 0.5 is a strict win -- +18 % where drafts land, no loss where
+# they do not -- and 14 is worth +29-45 % on high-acceptance content at -13 % on
+# low. p-min is NOT a good acceptance proxy (on the 26 %-acceptance prompt it
+# still drafted 110 tokens for 38 accepted), so the chain length, not p-min, is
+# what has to be chosen for the content. 6 is the safe default; raise DNMAX for
+# a workload known to be high-acceptance, and MTP=0 disables speculation
+# outright. Neither flag changes the output: greedy drafting plus target
+# verification is exactly target-greedy decoding.
+#
+# Those figures are at -c 32768 -ngl 32, not at the shipped 128k/28, because the
+# desktop was holding ~1.6 GiB of the Vega and left the shipped config ~16 MiB
+# of cap margin. The transfer is expected to hold or improve -- the shipped
+# config leaves *more* CPU work per target step, so a draft step is relatively
+# cheaper there -- but it is an inference, not a measurement.
+DNMAX="${DNMAX:-6}"
+DPMIN="${DPMIN:-0.5}"
 
 # The eGPU is required, not optional: /dev/nvidia0 exists only once the
 # proprietary driver has bound the card, so this is an instant check (no
@@ -230,7 +259,7 @@ else
     echo "serve: dev=$DEV -ts $TS -ngl=$NGL -np=$NP -lm=$LM -b $BATCH -ub $UBATCH -ctk $CTK -ctv $CTV -fa $FA"
 fi
 if [ "$MTP" = 1 ]; then
-    echo "serve: mtp=on draft=$(basename "$MD") devd=$DEVD ngld=$NGLD ctkd=$DCTK ctvd=$DCTV"
+    echo "serve: mtp=on draft=$(basename "$MD") devd=$DEVD ngld=$NGLD ctkd=$DCTK ctvd=$DCTV n-max=$DNMAX p-min=$DPMIN"
 else
     echo "serve: mtp=off"
 fi
@@ -239,7 +268,8 @@ echo "serve: cap=${CAP}MiB (display GPU)  http://$HOST:$PORT  log: $ROOT/logs/se
 MTP_ARGS=()
 if [ "$MTP" = 1 ]; then
     MTP_ARGS=(--spec-type draft-mtp -md "$MD" -devd "$DEVD" -ngld "$NGLD"
-              -ctkd "$DCTK" -ctvd "$DCTV")
+              -ctkd "$DCTK" -ctvd "$DCTV"
+              --spec-draft-n-max "$DNMAX" --spec-draft-p-min "$DPMIN")
 fi
 
 exec python3 "$ROOT/scripts/guard.py" --cap-mib "$CAP" --label serve \

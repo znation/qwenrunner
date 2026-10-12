@@ -67,6 +67,9 @@ This host cannot be benchmarked naively, and learning that was most of the work.
 | `-nkvo 1` costs 28 % generation | **no measurable difference** |
 | MTP +55.6 % / −12 % / +120 % | **+97.8 %**, from an idle interleaved A/B |
 | MTP +29 % at the split (2.73 → 3.52) | **+38 %** with the draft on the Vega (4.509 → 6.224); MTP's win is content-dependent, +9 % to +132 % |
+| compaction pays full price (a rewrite re-prefills everything) | **it resumes from a checkpoint, but only on the chat path** — the old probe used a raw `/completion` prompt, which carries no `message_delimiters`, so no mid-prompt checkpoint could exist. 6630 → **1943** tokens of re-prefill at `-cms 2048` on a chat-shaped transcript, and 6630 → 6647 (i.e. nothing) at the shipped `-cms 8192` on a 6.6k prompt |
+| `ngram-simple` chained onto `draft-mtp` "adds nothing" | **it is a 22 % loss** (5.31 vs 6.81 t/s) on the content n-gram speculation exists for — output that is a verbatim copy of the context, 100 % of drafts accepted, 2 reps |
+| MTP's upstream defaults (`-n-max 3`, `-p-min 0.00`) are neutral | **they cost 18 %** where drafts land; `-n-max 6 -p-min 0.5` is a strict win and `-n-max 14` is worth +29-45 % on high-acceptance content |
 
 ## VRAM policy
 
@@ -429,6 +432,85 @@ Conclusions:
   (1.867 / 1.935 t/s) at the same prompt shape.
 * **History worth keeping:** across three earlier designs the figure came out as
   +56 %, −12 % and +120 %. Only the idle interleaved A/B is trustworthy.
+
+### The draft chain: `--spec-draft-n-max` and `--spec-draft-p-min` **[clean]**
+
+llama.cpp's MTP defaults are `--spec-draft-n-max 3` and `--spec-draft-p-min
+0.00` — the chain stops on *length*, never on confidence — and neither had been
+swept on this host. Measured at `-ngl 32 -c 32768 -ts 6,1 -np 1` (a real
+`serve.sh` rung, 4 layers under the measured 36-layer 32k ceiling; chosen over
+the shipped 128k/28 because the desktop was holding ~1.6 GiB of the Vega and
+would have left the shipped config ~16 MiB of cap margin), `-lm dio -b 2048 -ub
+512 -ctk q4_0 -ctv q4_0 -fa on`, `--n-predict 64`, interleaved reps,
+`results/draft_chain_*.jsonl` + `results/draft_chain2_*.jsonl`. Every row is
+`gen t/s (bg_cpu_pct)`; `bg_cpu_pct` is quoted because it is what decides
+whether two arms are comparable:
+
+| arm | feature-list continuation (46/48 accepted) | mid-document (32/90 = 26 %) |
+|---|---|---|
+| `-n-max 3` (upstream default) | 5.98 (7.6) / 5.33 (9.5) | 3.41 (8.8) / 3.67 (3.9) |
+| `-n-max 6` | 7.05 (1.4) | 2.64 (1.5) |
+| `-n-max 6 -p-min 0.5` | 7.08 (2.8) / 7.21 (6.7) | 3.63 (1.4) |
+| `-n-max 10 -p-min 0.5` | 6.07 (19.6) / 7.17 (12.9) | 2.95 (13.2) / 3.08 (9.3) |
+| `-n-max 14 -p-min 0.5` | **7.71 (24.7) / 7.76 (9.2)** | not measured |
+
+* **`-n-max 6 -p-min 0.5` is a strict win over the default: +18 % where drafts
+  land, no loss where they do not.** It is what `serve.sh` now ships.
+* **Chain length is the lever; `-p-min` is not an acceptance proxy.** On the
+  26 %-acceptance prompt `-n-max 6` alone costs **−25 %** (2.64 vs 3.41/3.67) —
+  the chain keeps drafting tokens the target then rejects, and on a pipelined
+  split every rejected position is still a full pass. `-p-min 0.5` removes that
+  loss (3.63) but cannot remove it *further*: at `-n-max 10` the same prompt
+  still drafted 110 tokens for 38 accepted (35 %), so the top draft token's
+  probability stayed above 0.5 throughout. **Confidence gating and acceptance
+  are different things on this model**, which is why the chain length has to be
+  chosen for the content and `-p-min` is only a safety net.
+* **Where acceptance is high the chain wants to be long, and the default leaves
+  a lot on the table.** `-n-max 14` measures **+29-45 %** over `-n-max 3`
+  (7.71/7.76 against 5.98/5.33), reproducibly (0.6 % spread across reps, and the
+  *higher*-background rep is the faster one). The marginal economics say why:
+  one extra draft step costs ~76 ms for ~0.96 accepted tokens — a marginal
+  ~12.6 t/s against the 7.1 t/s the arm already runs at, i.e. still worth buying
+  at 14. It is not the shipped default because it costs **−13 %** on the
+  low-acceptance prompt (2.95/3.08 against 3.63), and a coding agent's turns
+  vary in acceptance turn to turn.
+* **None of this changes the output.** Greedy drafting plus target verification
+  is exactly target-greedy decoding; `-n-max`/`-p-min` only decide how much work
+  is spent trying. The measured `draft_n_accepted / draft_n` stays 96-100 % on
+  the high-acceptance prompt across every arm.
+* **Cost is negligible:** client VRAM 3026.4 MiB at `-n-max 3` against 3035.8 at
+  6 and 3077.4 at 14 (+51 MiB, ~2 layers' worth of nothing — the extra output
+  rows, not weights).
+
+### `ngram-simple` is a loss even on verbatim output **[clean]**
+
+`RESULTS.md`'s earlier verdict on n-gram speculation — "the ngram path found no
+usable match on this prompt" — was measured on *prose*, which is the one content
+an n-gram drafter cannot help with. Retested on the case it exists for: a
+18292-char prompt containing all of `scripts/bench.py` with "return the complete
+file verbatim", whose output *is* the file (`.content` begins
+`#!/usr/bin/env python3`), `--n-predict 96`, `results/ngram_code_*.jsonl`:
+
+| arm | pp t/s | gen t/s | drafts accepted/generated | `bg_cpu_pct` |
+|---|---|---|---|---|
+| MTP (`-n-max 3`) | 40.36 / 40.38 | **6.769 / 6.848** | 71/71 | 1.4 / 0.6 |
+| MTP + `ngram-simple` | 40.37 / 40.43 | 5.308 / 5.311 | 91/91 | 0.8 / 0.6 |
+| `ngram-simple` alone | 43.00 / 42.93 | 5.054 / 5.053 | 86/86 | 0.6 / 0.5 |
+
+* **Slower, at 100 % acceptance, with 0.5 % reproducibility.** So the earlier
+  "adds nothing" was not a content artefact — chaining `ngram-simple` onto
+  `draft-mtp` is a **22 % loss** and n-gram speculation on its own is a **26 %
+  loss** against MTP alone, on the most favourable content that exists for it.
+* **The reason is the shape of the drafts, not their accuracy.** n-gram drafted
+  86 tokens over 96 emitted in 10 target steps (8.6 accepted per step) where MTP
+  drafted 71 in 25 steps (2.8 per step): n-gram buys *long* steps and pays for
+  them — 1.9 s per step against 0.56 s. On a split whose CPU stage owns 33 of 65
+  layers, every verified position costs real time, so the extra ~5 accepted
+  tokens per step do not cover a 3.4× step cost. MTP's short, high-confidence
+  chains are the right shape for this host; long ones are not.
+* Not a tuning problem in the way the split-mode gap is, but note it *is* the
+  `--spec-ngram-simple-size-m` (default 48) that sets the step length — a much
+  shorter `size_m` was not tried.
 
 ## Thunderbolt eGPU: one model across two GPUs **[clean]**
 
@@ -952,14 +1034,13 @@ At the shipped defaults (128k, `-ngl 28 -ts 6,1 -np 1`, MTP on the Vega), drivin
   costs 1 s. The marginal cost of a turn is set by the depth-dependent prefill
   rate (36.95 t/s at 5.2k depth, 29.79 t/s at 130k), i.e. ~30-70 s per 1-2k-token
   tool result at the deep end.
-* **Compaction pays full price, and `--cache-reuse` did not help on this build.**
-  A rewrite in the middle of the transcript re-prefilled everything, and
-  `--cache-reuse 256` measured *identical* to reuse off — the KV-shifting path
-  did not engage. Checkpoints are on by default (`-ctxcp 32`, `-cms` 8192 tokens
-  apart) and could in principle let a rewrite at depth resume from the last
-  multiple of 8192; **unmeasured**, because the probe above is at 1.5k depth,
-  below the checkpoint spacing. Nothing persists to disk (`--slot-save-path`
-  unset), so a server restart is a cold prefill.
+* **Compaction resumes from a checkpoint — but only on the chat path, and only
+  as far back as `-cms` allows.** The earlier claim here ("compaction pays full
+  price") was an artefact of the probe, not a property of the model; see
+  "Context checkpoints need `message_delimiters`" below. What is true: the KV
+  shift path is dead (`--cache-reuse 256` measured *identical* to reuse off), and
+  nothing persists to disk (`--slot-save-path` unset), so a server restart is a
+  cold prefill.
 * **The context ceiling is enforced, not silent.** A prompt longer than the
   slot's context is rejected — `input (N tokens) is larger than the max context
   size (M tokens)`, `ERROR_TYPE_EXCEED_CONTEXT_SIZE` — and with
@@ -1017,6 +1098,89 @@ At the shipped defaults (128k, `-ngl 28 -ts 6,1 -np 1`, MTP on the Vega), drivin
   the selector (`llama.cpp//home/zach/qwenrunner/models/Qwen3.8-27B-UD-Q4_K_M.gguf`).
   The alias is advisory — llama-server ignores the request's `model` field, so a
   client still sending an older id gets 200 (measured both ways), not an error.
+
+### Context checkpoints need `message_delimiters` **[clean]**
+
+The agentic probe above re-prefilled a mid-transcript rewrite in full and the
+conclusion drawn from it was that compaction pays full price. That is wrong for
+the path the clients actually use. `results/ckpt_probe.jsonl` — a raw
+`/completion` prompt, `cache_prompt: true`, 50000 chars (~11.5k tokens) with a
+2000-char block rewritten at char 47000 (~11.1k tokens), one server per arm:
+
+| arm | req1 `prompt_n` | req2 `prompt_n` | req2 ms |
+|---|---|---|---|
+| `-ctxcp 32 -cms 8192` (shipped) | 11557 | **11559** | 285785 |
+| `-ctxcp 32 -cms 2048` | 11557 | **11559** | 286070 |
+| `-ctxcp 0` (control) | 11557 | **11559** | 302284 |
+
+All three identical, and `-lv 4` says why: the only checkpoints that existed
+were the pair the server *always* makes near the end of the prompt
+(`server-context.cpp:3838`, offsets `4+n_ubatch` and `4`) at `[11040,11040]` and
+`[11552,11552]` — both at or past the divergence at 10812, so both were
+correctly rejected and it printed `forcing full prompt re-processing due to lack
+of cache data (likely due to SWA or hybrid/recurrent memory)`.
+
+**Mid-prompt checkpoints are gated on `spans.is_user_start(...)`
+(`server-context.cpp:3828`, `:3885`), and `spans` is built from the request's
+`message_delimiters` field.** A raw `/completion` prompt carries none. Every
+chat request does: the differential autoparser derives them from the template's
+`assistant_start`/`user_start` (`common/chat.cpp:1363-1370`), so pi and omp —
+which post to `/v1/chat/completions` — are on a different path from the probe
+that produced the old conclusion.
+
+Retested with the delimiters sent explicitly on `/completion`
+(`results/ckpt_chat_probe.jsonl`; a 10-turn Qwen-format transcript, 6630 tokens,
+the *user* content of turn 8 rewritten — `prompt_n` is a deterministic token
+count, so single reps are decisive here):
+
+| arm | req1 `prompt_n` | req2 `prompt_n` | req2 ms | trace |
+|---|---|---|---|---|
+| `-ctxcp 32 -cms 8192` (shipped) | 6630 | 6647 | 186706 | checkpoints at `[11]`, `[6078]`, `[6142]`, `[6654]` |
+| `-ctxcp 32 -cms 2048` | 6630 | **1943** | **63880** | `restored context checkpoint (pos_min = 4715, n_tokens = 4716, n_past = 4716)` |
+| `-ctxcp 0` (control) | 6630 | 6659 | 169676 | `forcing full prompt re-processing` |
+
+* **The mechanism works, and it is worth 3.4× on a 6.6k-token transcript**
+  (6630 → 1943 tokens of re-prefill, 170 s → 64 s). The checkpoint is created at
+  a user-message start, so this is a *transcript-shaped* win: it fires where a
+  coding agent rewrites the middle of its history.
+* **The shipped default is too coarse to help at this depth, and that is a
+  spacing artefact, not a mechanism failure.** With `-cms 8192` and user turns
+  ~2.85k tokens apart, the nearest checkpoint before the divergence was at token
+  **11** — so the "resume" was a full re-prefill with extra bookkeeping. With
+  `-cms 2048` the checkpoint at 4715 was reachable. `-cms` therefore sets the
+  *bound* on compaction cost: the resume point is at most `-cms` tokens before
+  the divergence.
+
+The same probe at **12.2k depth** (`results/ckpt_depth_probe.jsonl`, 1.23k-token
+turns so that turn boundaries fall past the 8192 spacing, rewrite in turn 9 of
+10) shows the shipped default working, because now there *is* a checkpoint
+before the divergence:
+
+| arm | req1 `prompt_n` | req2 `prompt_n` | req2 ms |
+|---|---|---|---|
+| `-ctxcp 32 -cms 8192` (shipped) | 12214 | **3952** | 111020 |
+
+* **3.1× off the re-prefill at the shipped setting** — 12214 → 3952 tokens,
+  318 s → 111 s, resuming from the checkpoint at 8262. `-cms 8192` was never the
+  problem; a 6.6k prompt was.
+* **At the shipped 128k depth this bound is the whole story.** A compaction at
+  depth re-prefills at most `-cms` tokens instead of 130 729 (73 min) — ~8k
+  tokens, ~3.5 min, at the default. **Still unmeasured at 130k** (that is a
+  73-minute run), but the mechanism is now measured at both 6.6k and 12.2k and
+  the bound follows from the checkpoint spacing, not from the depth.
+* **Cost is host RAM, not VRAM.** Each checkpoint is a `std::vector<uint8_t>` of
+  the sequence's recurrent state — measured `size = 149.6-157.1 MiB` for this
+  model — so `-ctxcp 32` caps the bill at ~5 GiB of the 39 GiB box, and
+  `-cms 2048` fills that cap sooner than `-cms 8192` does. VRAM peaks were
+  4738-4893 MiB in every arm, i.e. unchanged.
+* **`-cms 2048` is a lever for shallow transcripts, not the depth case.** The
+  shipped `-cms 8192` already bounds a deep compaction to ~8k tokens of
+  re-prefill; `-cms 2048` only helps when the transcript is short enough that
+  8k spacing leaves no checkpoint between the last user message and the
+  divergence — measured 3.4× at 6.6k depth, where the default gave nothing. It
+  costs RAM (the `-ctxcp 32` cap fills sooner) and `serve.sh` does not set it;
+  pass `-cms 2048` as an extra argument if the workload compacts shallow
+  transcripts rather than deep ones.
 
 ## Reproducing
 
@@ -1095,6 +1259,39 @@ build/bin/llama-completion -m models/Qwen3.8-27B-UD-Q4_K_M.gguf \
     -dev CUDA0,Vulkan0 -sm layer -ts 4,1 -ngl 40 -lm dio \
     -ctk q4_0 -ctv q4_0 -fa on -no-cnv -t 8 -c 8192 \
     --seed 42 -f data/long_prompt.txt -n 32
+
+# MTP draft chain (see "The draft chain"). One invocation per arm, because
+# --server-extra is global to a run; alternate the arms by hand for reps.
+# SP is data/long_prompt.txt (feature-list, 46/48 accepted) or its first 4500
+# chars (mid-document, 32/90). Substitute "--spec-draft-n-max 3" for the
+# upstream default and "--spec-draft-n-max 14" for the aggressive arm.
+./scripts/mtp_ab.py --ngl 32 --ctx 32768 --threads 8 --arms base --n-predict 64 \
+    --prompt-file "$SP" --out results/draft_chain_P1_nmax6p50_r1.jsonl \
+    --server-extra "-dev CUDA0,Vulkan0 -sm layer -ts 6,1 -lm dio -b 2048 -ub 512 \
+    -ctk q4_0 -ctv q4_0 -fa on --spec-type draft-mtp \
+    -md models/mtp-Qwen3.8-27B-Q4_0.gguf -devd Vulkan0 -ngld 99 -ctkd q4_0 -ctvd q4_0 \
+    --spec-draft-n-max 6 --spec-draft-p-min 0.5"
+
+# n-gram speculation on the content it exists for: all of scripts/bench.py in the
+# prompt with "return the complete file verbatim", whose output is the file.
+python3 -c "open('/tmp/code_edit.txt','w').write('Here is the complete contents of a Python file from a project.\n\nChange the default \`--reps\` value from 1 to 2 and return the complete file, verbatim in every other respect. Output only the file, with no commentary, no markdown fences, and no summary.\n\n----- BEGIN bench.py -----\n' + open('scripts/bench.py').read() + '\n----- END bench.py -----\n')"
+./scripts/mtp_ab.py --ngl 32 --ctx 32768 --threads 8 --arms base --n-predict 96 \
+    --prompt-file /tmp/code_edit.txt --out results/ngram_code_C1_mtpngram_r1.jsonl \
+    --server-extra "-dev CUDA0,Vulkan0 -sm layer -ts 6,1 -lm dio -b 2048 -ub 512 \
+    -ctk q4_0 -ctv q4_0 -fa on --spec-type draft-mtp,ngram-simple \
+    -md models/mtp-Qwen3.8-27B-Q4_0.gguf -devd Vulkan0 -ngld 99 -ctkd q4_0 -ctvd q4_0"
+# ...and "--spec-type ngram-simple" alone, and the plain draft-mtp control.
+
+# Context checkpoints / compaction (see "Context checkpoints need
+# message_delimiters"). --mode raw is the probe that produced the old
+# "compaction pays full price" conclusion; --mode chat sends the delimiters the
+# differential autoparser sends for every /v1/chat/completions request.
+./scripts/ckpt_probe.py --mode raw  --out results/ckpt_probe.jsonl
+./scripts/ckpt_probe.py --mode chat --out results/ckpt_chat_probe.jsonl
+# ...and the same at ~12.5k depth, where the shipped -cms 8192 spacing can show
+# itself: --chunk 5200 --rewrite-turn 9
+./scripts/ckpt_probe.py --mode chat --chunk 5200 --rewrite-turn 9 \
+    --out results/ckpt_depth_probe.jsonl
 ```
 
 `bench.py` does not export `PATH`/`LD_LIBRARY_PATH` itself — set them on the same

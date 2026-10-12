@@ -189,6 +189,10 @@ def run_arm(name, args, prompt, idle0):
     rec["client_gtt_peak_mib"] = round(mon.gtt_peak, 1)
     rec["client_top"] = mon.top_clients
     rec["rss_peak_mib"] = round(mon.rss_peak_kib / 1024.0, 1)
+    # Throughput on this host is CPU-bound, so an arm measured against a busy
+    # desktop is not comparable to an idle one. Quote bg_cpu_pct with the rate.
+    rec["cpu_busy_pct"] = None if mon.cpu_busy_pct is None else round(mon.cpu_busy_pct, 1)
+    rec["bg_cpu_pct"] = None if mon.bg_cpu_pct is None else round(mon.bg_cpu_pct, 1)
     rec["timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%S")
     return rec
 

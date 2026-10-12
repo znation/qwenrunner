@@ -1,18 +1,5 @@
-0.00.035.788 W srv  llama_server: security: no API key is set and CORS allows all origins (see https://github.com/ggml-org/llama.cpp/pull/25655)
-0.00.894.553 W model has unused tensor blk.64.attn_norm.weight (size = 20480 bytes) -- ignoring
-0.00.894.558 W model has unused tensor blk.64.post_attention_norm.weight (size = 20480 bytes) -- ignoring
-0.00.894.567 W model has unused tensor blk.64.attn_q.weight (size = 51609600 bytes) -- ignoring
-0.00.894.570 W model has unused tensor blk.64.attn_k.weight (size = 5570560 bytes) -- ignoring
-0.00.894.573 W model has unused tensor blk.64.attn_v.weight (size = 5570560 bytes) -- ignoring
-0.00.894.583 W model has unused tensor blk.64.attn_output.weight (size = 25804800 bytes) -- ignoring
-0.00.894.586 W model has unused tensor blk.64.attn_q_norm.weight (size = 1024 bytes) -- ignoring
-0.00.894.589 W model has unused tensor blk.64.attn_k_norm.weight (size = 1024 bytes) -- ignoring
-0.00.894.592 W model has unused tensor blk.64.ffn_gate.weight (size = 73113600 bytes) -- ignoring
-0.00.894.595 W model has unused tensor blk.64.ffn_down.weight (size = 73113600 bytes) -- ignoring
-0.00.894.598 W model has unused tensor blk.64.ffn_up.weight (size = 73113600 bytes) -- ignoring
-0.00.894.602 W model has unused tensor blk.64.nextn.eh_proj.weight (size = 43008000 bytes) -- ignoring
-0.00.894.605 W model has unused tensor blk.64.nextn.enorm.weight (size = 20480 bytes) -- ignoring
-0.00.894.608 W model has unused tensor blk.64.nextn.hnorm.weight (size = 20480 bytes) -- ignoring
-0.00.894.617 W model has unused tensor blk.64.nextn.shared_head_norm.weight (size = 20480 bytes) -- ignoring
-0.07.606.959 W read_raw_unsafe: Falling back to buffered IO due to Bad address
-0.10.004.534 W srv          init: chat template supports preserving reasoning, it is enabled by default (may use more tokens, disable via --no-reasoning-preserve)
+0.00.237.444 W srv  llama_server: security: no API key is set and CORS allows all origins (see https://github.com/ggml-org/llama.cpp/pull/25655)
+0.01.248.563 W common_fit_params: failed to fit params to free device memory: n_gpu_layers already set by user to 32, abort
+0.09.583.190 W read_raw_unsafe: Falling back to buffered IO due to Bad address
+0.11.773.127 W read_raw_unsafe: Falling back to buffered IO due to Bad address
+0.12.027.607 W srv          init: chat template supports preserving reasoning, it is enabled by default (may use more tokens, disable via --no-reasoning-preserve)
