@@ -24,12 +24,13 @@
 #
 # Overridable via env (anything unset is derived):
 #   MODEL CTX NP INSTANCES PORT THREADS HOST NGL LM BATCH UBATCH CTK CTV FA
-#   MTP MD NGLD NMAX SWAPCAP
+#   MTP MD NGLD NMAX CRAM SWAPCAP
 #
 #   ./serve.sh                      # one server, one slot, 128k, MTP on
 #   NP=4 ./serve.sh                 # one server, four parallel 128k slots
 #   INSTANCES=4 ./serve.sh          # four servers, ports 8080-8083
 #   NMAX=6 ./serve.sh               # deeper speculation for code/agent traffic
+#   CRAM=65536 NP=8 ./serve.sh      # bigger prefill cache, more agent sessions
 #   MTP=0 ./serve.sh                # no speculative decoding
 #   CTK=q8_0 CTV=q8_0 ./serve.sh    # halve the KV cache per slot
 # Extra args are appended verbatim to every llama-server command line.
@@ -111,6 +112,24 @@ NMAX="${NMAX:-3}"
 
 SWAPCAP="${SWAPCAP:-0}"
 
+# Server prompt cache in host RAM (--cache-ram). This is the *prefill* cache,
+# and for agentic use it is the most important knob here.
+#
+# Three layers exist: (1) a slot reuses its own KV prefix automatically, so a
+# turn that appends to a transcript prefills only the delta -- measured: a
+# 19-token delta cost 19 tokens and 0.41 s instead of a 60 s re-prefill of
+# 29 772; (2) this RAM cache holds *evicted* slot states so a conversation can
+# come back after another one displaced it -- measured A B A at 0.58 s vs 57 s
+# when it cannot; (3) --slot-save-path persists states to disk (not used here).
+#
+# The default is 8192 MiB = ONE 128k conversation in f16 (64 KiB/token). With
+# two conversations and the default budget the second evicts the first and every
+# turn re-prefills the whole transcript -- silently, because a cache miss looks
+# exactly like a first turn. Size it as (concurrent conversations) x (context
+# KV): 32768 holds ~4 at 128k f16, ~8 at q8_0. Lower it (or 0) to give the RAM
+# back; the cache only fills as conversations arrive.
+CRAM="${CRAM:-32768}"
+
 mkdir -p "$ROOT/logs"
 
 if [ ! -x "$SERVER" ]; then
@@ -154,7 +173,7 @@ else
     echo "serve: mtp=off"
 fi
 echo "serve: kv≈${KV_MIB} MiB/slot -> weights 15.4 GB shared + ${INSTANCES} server(s) x ${NP} slot(s) x (${KV_MIB} MiB kv)"
-echo "serve: swap-cap=${SWAPCAP}MiB  http://$HOST:$PORT..$((PORT + INSTANCES - 1))  logs: $ROOT/logs/serve.$PORT.log"
+echo "serve: prompt-cache=${CRAM}MiB (host RAM)  swap-cap=${SWAPCAP}MiB  http://$HOST:$PORT..$((PORT + INSTANCES - 1))  logs: $ROOT/logs/serve.$PORT.log"
 
 for i in $(seq 0 $((INSTANCES - 1))); do
     port=$((PORT + i))
@@ -163,7 +182,7 @@ for i in $(seq 0 $((INSTANCES - 1))); do
         "$SERVER" \
         -m "$MODEL" -ngl "$NGL" -c "$TOTAL_CTX" -np "$NP" -t "$THREADS" \
         -lm "$LM" -b "$BATCH" -ub "$UBATCH" \
-        -ctk "$CTK" -ctv "$CTV" -fa "$FA" \
+        -ctk "$CTK" -ctv "$CTV" -fa "$FA" --cache-ram "$CRAM" \
         ${MTP_ARGS[@]+"${MTP_ARGS[@]}"} \
         --host "$HOST" --port "$port" "$@" &
 done

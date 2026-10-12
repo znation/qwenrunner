@@ -504,6 +504,46 @@ one `-t 4` pool across all four slots. The measured 8 % may be CPU scheduling
 for the sampling and SSM steps rather than anything about batching. Raising
 `THREADS` for the slot configuration is the obvious test and was not run.
 
+## The prefill cache — the knob that matters most for agentic use
+
+An agent loop re-sends a transcript that grows every turn, so the cost that
+dominates is *prefill*, and whether it can be skipped. It can. There are three
+layers, and `scripts/agent_cache_probe.py` measures them via
+`timings.prompt_n` — how many tokens the server actually had to process:
+
+1. **Slot prefix reuse.** A request that shares a prefix with the slot's
+   current KV prefills only the suffix.
+2. **The server prompt cache in host RAM** (`--cache-ram`, default 8192 MiB).
+   Holds *evicted* slot states, so a conversation can come back after another
+   displaced it. This is the layer with a budget, and therefore the one that
+   fails silently.
+3. **`--slot-save-path`** persists a state to disk. Not used here.
+
+Measured with ~30 000-token prompts, `NP=1`:
+
+| sequence | what it tests | prompt_n | wall |
+|---|---|---|---|
+| A, then A again | slot prefix reuse | 29 772 -> **4** | 55.5 s -> **0.24 s** |
+| A, then A + 19 tokens | **the agent turn** (append and re-send) | **19** | **0.41 s** |
+| A, B, A (default 8192) | eviction + restore by the RAM cache | 3rd = **4** | 0.58 s |
+| A, B, A (`--cache-ram 2048`) | the budget too small to hold both | 3rd = **29 772** | **57.1 s** |
+| A, B, A (`--cache-ram 32768`, in `serve.sh`) | the shipped default | 3rd = **4** | 0.50 s |
+
+**A growing transcript costs its delta.** The second row is the whole agentic
+case: 19 new tokens, 0.41 s, against 62.9 s to prefill the same context cold —
+a 150x difference on every turn of every conversation.
+
+**And the default budget is too small for more than one conversation.** A cache
+entry costs the context's KV, 64 KiB/token at f16, so a 128k conversation is
+~8 GiB and the 8192 MiB default holds exactly one. The fourth row is the failure
+mode: with two 30k conversations and a 2 GiB budget, the third request
+re-prefilled all 29 772 tokens and nothing in the response says so — a cache
+miss and a first turn look identical from outside. `serve.sh` therefore ships
+`CRAM=32768` (four 128k conversations, or eight with `CTK=q8_0`), sized by
+`conversations x context-KV`. It is host RAM, which is the resource this machine
+has most of; the cache only fills as conversations arrive, and `CRAM=0` disables
+it.
+
 ## What was discarded
 
 * **`-ngl 0` took 830 s** for one arm (2 reps of pp512 + tg128 on 18 CPU

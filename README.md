@@ -30,6 +30,7 @@ discarded and why.
 | batch | **`-b 1024 -ub 256`** at depth, `-b 2048 -ub 512` if you only ever prefill shallow | at 98.6k depth with MTP: generation **37.45 vs 28.52 t/s (+31 %)** against 2048/512, prefill level (349 vs 340); the same pair wins both axes at 64k. Only shallow prefill prefers 2048/512 (709.6 vs 633.3). See `RESULTS.md` |
 | MTP | **on**, `--spec-type draft-mtp -md models/mtp-Qwen3.8-27B-Q4_0.gguf -ngld 99`, `NMAX=3` | draft on the GPU. **The gain is a property of the text, not the machine**: +180 % on patterned text (markdown/code/JSON, 99 % draft acceptance) and **−11 % on free-form prose** (14 %). `NMAX=6` is a further +40 % on structured/code traffic — the agent case this repo serves — but costs more on prose; `MTP=0` is the prose setting. Numbers in `RESULTS.md` |
 | context | **128k** (`-c 131072`) | 14.3 t/s generation and 176–231 t/s prefill *at* depth 131072; costs ~8 GiB of KV with f16 |
+| prefill cache | **`--cache-ram 32768`** (host RAM) | for agentic use this is the biggest lever there is. A growing transcript re-sent each turn prefills **only the delta**: 19 new tokens cost 0.41 s against 62.9 s cold. The default budget (8 GiB) holds exactly *one* 128k f16 conversation — with two, the second evicts the first and every turn silently re-prefills 29 772 tokens (measured: 57.1 s). Sized as conversations × context-KV |
 | parallel prompts | **`NP=N`** (slots in one server) beats **`INSTANCES=N`** (processes) | 128k per slot: `-np 6` fits in **70.4 GiB** where 6 processes die of a Metal OOM, and loads 2-3x faster; aggregate is workload-dependent — flat ~53-60 t/s where one stream was already GPU-saturated, ~91 t/s aggregate for two concurrent *code* requests. Slots buy concurrency, not throughput |
 
 **Offload is the lever that no longer exists, and context is the one that
@@ -166,9 +167,34 @@ The defaults stay `NP=1`/`INSTANCES=1` because every slot reserves its full KV
 up front — 8 GiB per 128k slot whether or not anyone is connected, so four idle
 slots cost 32 GiB. Set them when you have clients.
 
+#### For agentic coding
+
+The workload is a transcript that grows every turn, so the config that matters
+is the one that keeps prefill near zero and gives each concurrent session its
+own cached conversation:
+
+```
+NP=4 CRAM=65536 NMAX=6 ./serve.sh
+```
+
+* `NMAX=6` — code and tool output are patterned, and that is where deep
+  drafting pays (+40 % over the default on structured text; a live code prompt
+  measured 92.8 t/s against 30.5 with `MTP=0`).
+* `NP=4` — one slot per concurrent agent session; slots are much cheaper than
+  processes (52 GiB against 100 GiB at four).
+* `CRAM=65536` — the prompt cache is sized to the *number of live
+  conversations*. At 128k f16 each costs ~8 GiB (`-cram` 32768 holds four),
+  and a cache that is one entry short does not degrade — it silently
+  re-prefills a 128k transcript on every turn. `CTK=q8_0 CTV=q8_0` halves it to
+  4 GiB each.
+
+Send requests with `"cache_prompt": true` (the default for the OpenAI-compatible
+endpoints) so the server can match the prefix; `scripts/agent_cache_probe.py`
+measures whether it actually did.
+
 #### Which one to use
 
-They differ on three axes, and only one of them is speed.
+`NP` and `INSTANCES` differ on three axes, and only one of them is speed.
 
 | | `NP=N` (slots, one process) | `INSTANCES=N` (N processes) |
 |---|---|---|
@@ -216,6 +242,7 @@ back, `THREADS=8` is the untested knob.
 | `scripts/bench.py` | `llama-bench` sweeps: `ngl`, `fa`, `kv`, `depth`, `ctx`, `threads`, `batch`, `load`, `nkvo`, `nopo`, `quant` |
 | `scripts/mtp_ab.py` | MTP A/B over HTTP, with `--server-extra` for arbitrary flags |
 | `scripts/parallel_ab.py` | `-np N` slots vs N processes: how many 128k slots fit, and what N does to throughput |
+| `scripts/agent_cache_probe.py` | does the prefill cache actually fire? Reports `prompt_n` for a re-send, an A/B/A eviction, and a growing transcript |
 | `scripts/quant_compare.sh` | throughput + perplexity across quants |
 | `scripts/wait_idle.py` | block until the GPU — or the host CPU — goes quiet |
 | `scripts/gguf_head.py` | read GGUF metadata from a local file or a remote URL |
