@@ -59,6 +59,24 @@ def arms_for(name, args):
         return extra
     if name == "mtp-nomd":
         return ["--spec-type", "draft-mtp"]
+    if name == "mtp-sidecar-qkv":
+        # mtp-sidecar with a quantized draft KV cache. At 128k the draft's f16
+        # KV is ~500 MiB per draft layer, and the draft is a full attention
+        # block, so this is the cheapest VRAM/RAM lever on the MTP path.
+        extra = ["--spec-type", "draft-mtp", "-md", args.draft,
+                 "-ctkd", "q4_0", "-ctvd", "q4_0"]
+        if args.ngld is not None:
+            extra += ["-ngld", str(args.ngld)]
+        return extra
+    if name == "mtp-draftgpu":
+        # Same sidecar as mtp-sidecar, but the draft head is offloaded to a
+        # specific device (-devd) instead of following -dev. On this host the
+        # point is the Vega 10, which has VRAM to spare under the display cap
+        # while the 1070 is full of trunk layers. Uses its own -ngld so the
+        # trunk's --ngld stays comparable to the CPU-draft arm.
+        extra = ["--spec-type", "draft-mtp", "-md", args.draft,
+                 "-devd", args.draft_dev, "-ngld", str(args.ngld_gpu)]
+        return extra
     raise SystemExit("unknown arm %r" % name)
 
 
@@ -195,6 +213,10 @@ def main(argv=None):
     ap.add_argument("--ngl", type=int, default=8)
     ap.add_argument("--ngld", type=int, default=None,
                     help="GPU layers for the draft model (-ngld); unset = default")
+    ap.add_argument("--draft-dev", default="Vulkan0",
+                    help="device for the mtp-draftgpu arm's -devd")
+    ap.add_argument("--ngld-gpu", type=int, default=99,
+                    help="draft GPU layers for the mtp-draftgpu arm")
     ap.add_argument("--ctx", type=int, default=8192)
     ap.add_argument("--threads", type=int, default=8)
     ap.add_argument("--port", type=int, default=8081)

@@ -1,0 +1,46 @@
+[
+ {
+  "label": "mid_base",
+  "ok": true,
+  "err": null,
+  "pp": 36.22,
+  "tg": 2.757,
+  "dn": null,
+  "da": null,
+  "client": 1917.8,
+  "bg": 1.8
+ },
+ {
+  "label": "mid_mtp",
+  "ok": true,
+  "err": null,
+  "pp": 34.13,
+  "tg": 3.008,
+  "dn": 104,
+  "da": 27,
+  "client": 3384.1,
+  "bg": 1.7
+ },
+ {
+  "label": "mid_base2",
+  "ok": true,
+  "err": null,
+  "pp": 36.24,
+  "tg": 2.735,
+  "dn": null,
+  "da": null,
+  "client": 1917.8,
+  "bg": 1.7
+ },
+ {
+  "label": "mid_mtp2",
+  "ok": true,
+  "err": null,
+  "pp": 34.04,
+  "tg": 2.985,
+  "dn": 104,
+  "da": 27,
+  "client": 3384.1,
+  "bg": 1.6
+ }
+]

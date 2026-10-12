@@ -1,0 +1,11 @@
+0.00.037.194 W srv  llama_server: security: no API key is set and CORS allows all origins (see https://github.com/ggml-org/llama.cpp/pull/25655)
+0.00.947.542 W common_fit_params: failed to fit params to free device memory: n_gpu_layers already set by user to 32, abort
+0.09.400.913 W read_raw_unsafe: Falling back to buffered IO due to Bad address
+0.10.691.075 E ggml_backend_cuda_buffer_type_alloc_buffer: allocating 901.25 MiB on device 0: cudaMalloc failed: out of memory
+0.10.691.079 E ggml_gallocr_reserve_n_impl: failed to allocate CUDA0 buffer of size 945033728
+0.10.691.080 E graph_reserve: failed to allocate compute buffers
+0.10.698.851 E llama_init_from_model: failed to initialize the context: failed to allocate compute pp buffers
+0.10.698.856 E cmn  common_init_: failed to create context with model 'models/Qwen3.8-27B-UD-Q4_K_M.gguf'
+0.10.698.858 E cmn  common_init_: failed to create context with model 'models/Qwen3.8-27B-UD-Q4_K_M.gguf'
+0.10.698.861 E srv    load_model: failed to create_context with model 'models/Qwen3.8-27B-UD-Q4_K_M.gguf'
+0.10.699.406 E srv  llama_server: exiting due to model loading error

@@ -24,27 +24,44 @@ including six conclusions that earlier, load-contaminated measurements got wrong
 | `-b`/`-ub` | **2048/512 (default)** | 70.26 vs 59.09/45.06/29.48 t/s prompt; smaller batches buy VRAM, not speed |
 | KV cache | **`q4_0/q4_0` + `-fa on`** | free at depth 0 (all five dtypes within 3 %), **+9.6 % generation** at depth 8192; `q8_0/q8_0` is the balanced alternative |
 | flash attn | `-fa on` with a quantized V cache | `-fa off` aborts: `quantized V cache requires flash_attn to be enabled` |
-| threads | `-t 8` | 4–12 are equivalent; 16 is ~8 % worse |
-| MTP | `--spec-type draft-mtp -md models/mtp-Qwen3.8-27B-Q4_0.gguf -ngld 0` | **+97.8 % generation** (1.719 → 3.400 t/s, 2/2 interleaved pairs) for −8 % prompt and +498 MiB; **+29 %** on the two-GPU 128k split (2.73 → 3.52 t/s) at a cost of 6 layers of offload. Now the `serve.sh` default |
+| threads | `-t 8` | Vega-only: 4–12 equivalent, 16 is ~8 % worse. Split: **8** beats 12 by 3 % and 6 by 13 % — the CPU work left is on the serial path, so fewer threads do not help |
+| MTP | `--spec-type draft-mtp -md models/mtp-Qwen3.8-27B-Q4_0.gguf -devd Vulkan0 -ngld 99 -ctkd q4_0 -ctvd q4_0` | **+97.8 % generation** on the Vega-only path (1.719 → 3.400 t/s), and **+38 %** on the two-GPU 128k split once the draft head runs on the **Vega 10** rather than the CPU (4.509 → 6.224 t/s). The largest lever on this host. Its win is content-dependent — +9 % to +132 % — because it is set by draft acceptance (26 % to 98 % on two prompts from the same document). Now the `serve.sh` default |
+| slots | `-np 1` | llama-server's own default is `-np 4`, which reserves compute for four sequences: ~570 MiB more on the 1070 at 128k, and a real request aborts in `ggml_cuda_pool_vmm::alloc` (exit −6). One slot costs no concurrency for a single agent client |
 
-**MTP speculation is the one large win — it nearly doubles generation
-throughput.** Everything else is worth single digits to tens of percent. The
-binding constraint is that **only 8–12 of 64 layers fit in VRAM**, so the model
-stays CPU-bound and desktop CPU load directly sets throughput.
+**MTP speculation is the one large win — it more than doubles generation
+throughput, and where its draft head runs decides how much.** Everything else is
+worth single digits to tens of percent. The binding constraint is that **only
+8–12 of 64 layers fit in VRAM**, so the model stays CPU-bound and desktop CPU
+load directly sets throughput.
 
 Best measured figures: **74.41 t/s prompt and 2.01 t/s generation** (`-ngl 10`,
 `-lm dio`, shallow context), rising to **3.40 t/s generation** with MTP at
 `-ngl 8`.
 
 **With the Thunderbolt eGPU attached, `serve.sh` splits one model across both
-GPUs and runs MTP speculation on top** — 26 layers at 128k and 34 at 8k with MTP
-on (`MTP=0` restores the 32/40 split) — which is +28 % generation over the 1070
-alone and roughly triples the offloadable layer count (40 vs 12). The eGPU is
-now required: `serve.sh` exits rather than fall back to the Vega 10 alone, which
-cannot hold 128k context under the cap. A genuine 128k context runs at
-**1.19 t/s generation and 29.8 t/s prompt** (73-minute prefill) without MTP,
-inside the display-GPU cap; at 5.2k depth MTP is worth **+29 %** generation
-(2.73 → 3.52 t/s), and it is unmeasured at 130k. See [`RESULTS.md`](RESULTS.md).
+GPUs and runs MTP speculation on top, with the draft head on the Vega 10** — 28
+layers at 128k and 38 at 8k with MTP on (`MTP=0` restores the 32/40 split) —
+which is +28 % generation over the 1070 alone and roughly triples the offloadable
+layer count (40 vs 12). The eGPU is now required: `serve.sh` exits rather than
+fall back to the Vega 10 alone, which cannot hold 128k context under the cap.
+
+The draft head is the newest lever: it is a *serial* forward pass, so with 26+
+trunk layers offloaded the CPU is the bottleneck and the 1070 has no room to
+take it — but the Vega 10 does. Measured at 128k, `data/long_prompt.txt` (5246
+tokens), 64 tokens out, two interleaved reps each:
+
+| arm | prompt t/s | generation t/s | client MiB |
+|---|---|---|---|
+| no speculation | 39.21 | 2.681 | 2174 |
+| MTP, draft on the CPU (`-ngld 0`), `-ngl 28` | 36.17 | 4.640 | 2528 |
+| MTP, draft on the Vega, `-ngld 1` | 36.79 | 5.67 | 3151 |
+| **MTP, draft on the Vega, `-ngld 99`** | **36.90** | **6.22** | 3384 |
+
+A genuine 128k context runs at **1.19 t/s generation and 29.8 t/s prompt**
+(73-minute prefill) without MTP, inside the display-GPU cap. MTP's benefit is
+**content-dependent — +9 % to +132 %** on this host, set by how often the draft
+is accepted (26 % to 98 % across two prompts from the same document), and it is
+unmeasured at 130k depth. See [`RESULTS.md`](RESULTS.md).
 
 ## Prerequisites
 
@@ -91,7 +108,8 @@ present. Both backends end up in one binary and `-dev` selects between them.
 ./serve.sh                       # 128k context, both GPUs, MTP on (the default)
 MTP=0 ./serve.sh                 # the same split without speculative decoding
 CTX=32768 ./serve.sh             # shorter context, more layers (faster)
-NGL=36 TS=4,1 ./serve.sh         # override the split
+NGL=26 TS=6,1 ./serve.sh         # override the layer count / tensor split
+NP=4 ./serve.sh                  # concurrent slots (costs ~570 MiB on the 1070)
 ```
 
 `serve.sh` requires the eGPU and prints the configuration it picked. It errors
@@ -99,18 +117,23 @@ out if `/dev/nvidia0` is absent or the binary was built without CUDA, because
 the Vega 10 alone cannot hold 128k context under the display cap:
 
 * **eGPU present** — one model instance split across the GTX 1070 (CUDA) and the
-  Vega 10 (Vulkan), with the remainder on CPU: `-dev CUDA0,Vulkan0 -sm layer
-  -ts 4,1`. The layer count is derived from the context, because the KV cache
-  competes with the weights for the same VRAM — **40 layers at 8k, 32 at 128k**,
-  both measured — and MTP subtracts a further **6 layers** for the draft's CUDA
-  compute buffer, giving the default **34 at 8k and 26 at 128k**. MTP offloads
-  6 more layers to the CPU at 128k than the split otherwise would.
+  Vega 10 (Vulkan), with the remainder on CPU: `-dev CUDA0,Vulkan0 -sm layer`.
+  The layer count is derived from the context, because the KV cache competes
+  with the weights for the same VRAM, and the tensor split is derived from
+  whether the draft head is resident on the Vega. Without speculation the
+  measured anchors are **40 layers at 8k, 32 at 128k**; with the draft on the
+  Vega the last startable rungs are **38 at 8k, 36 at 32k, 30 at 128k**, and
+  `serve.sh` derives two under those (34/28) because its fit probes peak at 5.2k
+  depth and the flash-attention workspace grows with context. `-ts 6,1` rather
+  than `4,1`, because the draft's ~1.5 GB otherwise sits on top of six trunk
+  layers. Every ceiling here is set by the **1070**, not the display cap.
 
 `serve.sh` runs `llama-server` under `scripts/guard.py`, which polls system-wide
 VRAM every 50 ms and `SIGKILL`s the process group if it exceeds `CAP`
 (default 5000 MiB), so the display GPU is protected by measurement rather than
-by arithmetic. It forwards `SIGINT`/`SIGTERM` to the child, so Ctrl-C actually
-stops the server.
+by arithmetic. It prints the live display baseline and warns when it is above the
+~1216 MiB the default config was measured to survive. It forwards
+`SIGINT`/`SIGTERM` to the child, so Ctrl-C actually stops the server.
 
 **Read the printed baseline before trusting `-ngl`.** The desktop is the other
 tenant of this GPU and its footprint drifts (measured 746–2188 MiB within one
@@ -118,17 +141,19 @@ hour). `-ngl 12` fits at 765 MiB and breaches at 1114; 10 fits at 785 and
 breaches at 1592; 8 survives a loaded desktop. Pick from the measured client
 peak, not from a constant.
 
-**MTP costs the 1070 about 900 MiB of compute buffer, so it trades against
-`-ngl`.** Measured: with MTP on, `-ngl 32` at 128k aborts in `cudaMalloc` for a
-901 MiB pp buffer, and `-ngl 40` at 8k fails the same way; `-ngl 26` and `-ngl
-34` start clean, which is where the 6-layer reserve comes from. On the Vega 10
-alone MTP was stricter still — it needed `-ngl 8` or lower and breached the
-display cap at `-ngl 10` (measured twice) — and that path is no longer a
-`serve.sh` mode now that the eGPU is required. Its win is also
-configuration-dependent: **+97.8 %** generation on Q4_K_M at `-ngl 8` and
-**+29 %** on the two-GPU 128k split at `-ngl 26`, but only **+3.6 %** on Q2_K_XL
-at `-ngl 16`, where the target is fast enough that the CPU-resident draft head
-becomes the bottleneck. `MTP=0` turns it off.
+**MTP costs the 1070 compute buffer, so it trades against `-ngl`.** Measured:
+with MTP on, `-ngl 32` at 128k aborts before load in `cudaMalloc` (`allocating
+901.25 MiB on device 0`) and at 8k `-ngl 40` exits before health; the last
+startable rungs are **30 at 128k, 36 at 32k, 38 at 8k**, all 1070-limited.
+`serve.sh` derives two layers under those, because the probes peak at 5.2k depth
+and the flash-attention workspace grows with context. On the Vega 10 alone MTP
+was stricter still — it needed `-ngl 8` or lower and breached the display cap at
+`-ngl 10` (measured twice) — and that path is no longer a `serve.sh` mode now
+that the eGPU is required. Its win is also configuration-dependent: **+97.8 %**
+generation on Q4_K_M at `-ngl 8`, **+38 %** on the two-GPU 128k split with the
+draft on the Vega, **+3.6 %** on Q2_K_XL at `-ngl 16` where the target is fast
+enough that the draft becomes the bottleneck, and **+9 %** on a mid-document
+continuation where only 26 % of drafts are accepted. `MTP=0` turns it off.
 
 ## Thunderbolt eGPU (optional)
 
@@ -195,7 +220,8 @@ window above 4 GB. Verify: `nvidia-smi` lists the card with 8192 MiB, and
 | `serve.sh` | launch `llama-server` under the VRAM watchdog |
 | `scripts/guard.py` | VRAM watchdog + measurement: display-GPU VRAM, per-DRM-client VRAM, NVIDIA VRAM via NVML, RSS, `cpu_busy_pct`, `bg_cpu_pct` |
 | `scripts/bench.py` | `llama-bench` sweeps: `ngl`, `kv`, `fa`, `depth`, `ctx`, `threads`, `batch`, `load`, `nkvo`, `nopo`, `quant` |
-| `scripts/mtp_ab.py` | MTP A/B over HTTP, with `--server-extra` for arbitrary flags |
+| `scripts/mtp_ab.py` | MTP A/B over HTTP, with `--server-extra` for arbitrary flags. Arms: `base`, `mtp-sidecar` (CPU draft), `mtp-sidecar-qkv`, `mtp-draftgpu` (`--draft-dev`/`--ngld-gpu`, the Vega-draft arm), `mtp-nomd` |
+| `scripts/split_fit.py` | fit probe for the two-GPU split — `llama-bench` cannot do it. Sweeps `-ngl`/`-ts`, loads, issues one real completion, reports both GPUs' peaks |
 | `scripts/quant_compare.sh` | quant offload ceiling + throughput + perplexity |
 | `scripts/wait_idle.py` | block until a workload's CPU — or the whole host's — goes quiet |
 | `scripts/gguf_head.py` | read GGUF metadata from a local file or a remote URL without downloading it |

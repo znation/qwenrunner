@@ -1,0 +1,4 @@
+0.00.034.846 W srv  llama_server: security: no API key is set and CORS allows all origins (see https://github.com/ggml-org/llama.cpp/pull/25655)
+0.07.978.679 W read_raw_unsafe: Falling back to buffered IO due to Bad address
+0.10.353.788 W read_raw_unsafe: Falling back to buffered IO due to Bad address
+0.10.626.091 W srv          init: chat template supports preserving reasoning, it is enabled by default (may use more tokens, disable via --no-reasoning-preserve)

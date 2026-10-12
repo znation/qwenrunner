@@ -1,0 +1,58 @@
+[
+ {
+  "label": "ngld1",
+  "ngld": 1,
+  "ok": true,
+  "err": null,
+  "pp": 36.79,
+  "tg": 5.659,
+  "sys": 4454.3,
+  "client": 3150.5,
+  "nv": 7541.3,
+  "viol": false,
+  "bg": 1.5,
+  "rep": 0
+ },
+ {
+  "label": "ngld99",
+  "ngld": 99,
+  "ok": true,
+  "err": null,
+  "pp": 36.92,
+  "tg": 6.221,
+  "sys": 4328.2,
+  "client": 3384.4,
+  "nv": 7541.3,
+  "viol": false,
+  "bg": 1.5,
+  "rep": 0
+ },
+ {
+  "label": "ngld1",
+  "ngld": 1,
+  "ok": true,
+  "err": null,
+  "pp": 36.76,
+  "tg": 5.668,
+  "sys": 4454.8,
+  "client": 3150.5,
+  "nv": 7541.3,
+  "viol": false,
+  "bg": 1.5,
+  "rep": 1
+ },
+ {
+  "label": "ngld99",
+  "ngld": 99,
+  "ok": true,
+  "err": null,
+  "pp": 36.89,
+  "tg": 6.227,
+  "sys": 4328.2,
+  "client": 3384.4,
+  "nv": 7541.3,
+  "viol": false,
+  "bg": 1.5,
+  "rep": 1
+ }
+]
