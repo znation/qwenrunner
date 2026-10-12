@@ -167,11 +167,16 @@ SLOT_SAVE="${SLOT_SAVE:-}"
 #     NP=4 q8_0: 35.7 GiB   + CRAM 32 GiB  = ~107 GiB total   <- the default
 #     NP=4 f16 : 50.3 GiB   + CRAM 64 GiB  = ~153 GiB         <- does not fit
 #
-# With q8_0 KV a 128k conversation costs 4 GiB, so 32768 keeps eight warm --
-# four live slots plus four displaced ones. Raise it only against the ceiling
-# above; CRAM=0 disables the cache, CRAM=65536 is the 16-conversation setting
-# that fits at q8_0 but not at f16.
-CRAM="${CRAM:-32768}"
+# Default 24576 = SIX 128k conversations: the four live slots plus two
+# displaced, which is the coverage this configuration is sized for. A q8_0
+# 128k conversation costs ~4.3 GiB (64 KiB/token halved, plus the 1-in-16
+# scale block), so six entries need ~26 GiB; entries are cut to the
+# conversation's actual length, so shorter sessions fit more than six.
+#
+# Worst case with the shipped defaults: 39.3 GiB idle-others + 39.1 GiB server
+# + 24 GiB cache = ~102 GiB, leaving ~25 GiB of headroom on a 128 GB machine.
+# Raise it only against that ceiling; CRAM=0 disables the cache.
+CRAM="${CRAM:-24576}"
 
 mkdir -p "$ROOT/logs"
 

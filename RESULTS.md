@@ -558,15 +558,44 @@ idle slots and no traffic:
 | `NP=4`, **q8_0 KV (shipped)** | **78.4 GiB** | 24.4 | 39.1 GiB |
 | `NP=2`, q8_0 KV | 62.1 GiB | 42.1 | 22.8 GiB |
 
-A 128k conversation costs 8 GiB of cache at f16 and 4 GiB at q8_0 (64 KiB/token;
-the load footprints above confirm it — `NP=4` f16 is weights 14.3 + 4x8 KV +
-~4 compute). So `CRAM=65536` at f16 would commit 50 + 64 = 114 GiB on top of the
-39 GiB other tenants hold, i.e. 153 GiB on a 128 GB machine: it does not fit.
-**The shipped default is `q8_0` KV with `CRAM=32768`** — 39.1 + 32 = 71 GiB
-worst case, which fits with room to spare, and it keeps eight 128k conversations
-warm instead of four. That is the configuration change that makes "cover every
-simultaneous conversation" true rather than aspirational; the price is the
-measured −10 % generation at depth.
+A 128k conversation costs 8 GiB of cache at f16 and ~4.3 GiB at q8_0
+(64 KiB/token; the load footprints above confirm the f16 figure — `NP=4` f16 is
+weights 14.3 + 4x8 KV + ~4 compute = 50.3). So `CRAM=65536` at f16 would commit
+50 + 64 = 114 GiB on top of the 39 GiB other tenants hold, i.e. 153 GiB on a
+128 GB machine: it does not fit. **The shipped default is `q8_0` KV with
+`CRAM=24576`** — 39.3 + 39.1 + 24 = ~102 GiB worst case, ~25 GiB of headroom —
+which keeps six 128k conversations warm: the four live slots plus two displaced.
+That is the configuration change that makes "cover every simultaneous
+conversation" true rather than aspirational, for a fleet of that size; the price
+is the measured −10 % generation at depth.
+
+**And `CRAM=24576` covers the fleet it is sized for.** Six *independent*
+conversations (non-overlapping 42k-char slices of the corpus, ~13.5k tokens
+each, so no shared prefixes) pushed through four slots:
+
+| | first send | re-send |
+|---|---|---|
+| A (displaced twice) | 26 s, prompt_n 13 549 | **0.99 s, prompt_n 4** |
+| B (displaced twice) | 27 s, prompt_n 14 081 | **0.68 s, prompt_n 4** |
+| C, D (live slots) | 26-27 s | **1.12 s / 0.75 s, prompt_n 4** |
+| E, F (live slots) | 25-27 s | **0.65 s / 0.75 s, prompt_n 4** |
+
+Four live slots plus two displaced, all six warm; host usage grew 78.4 -> 82.5
+GiB, i.e. the six entries cost ~4 GiB in total because entries are cut to the
+conversation's actual length (13.5k tokens ~ 0.6 GiB at q8_0), not to the 128k
+slot size.
+
+Two things this also corrected:
+
+* **Prefix reuse is partial, not exact.** A first attempt used *nested*
+  truncations of one document, and the re-sends came back with prompt_n of
+  3840, 3122, 2578, 1827, 1034, 4 — each exactly the tail beyond the resident
+  prompt's shared prefix, i.e. the server reused whatever prefix the slot or
+  cache happened to hold rather than falling back to a full prefill. That is
+  the agent case working from the other direction: a turn costs its delta even
+  when the slot holds a related-but-different transcript.
+* The same run is why the "cache that is one entry short" warning above is
+  about *independent* conversations, which is what N agent sessions are.
 
 ## Disk-backed slot states (SLOT_SAVE) — works, but does not pay off yet
 
