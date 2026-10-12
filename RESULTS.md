@@ -1,636 +1,317 @@
-# qwenrunner — measured results
+# RESULTS — Apple M5 Max, 128 GB
 
-All numbers were measured on this host, serially, through `scripts/guard.py`
-(hard VRAM cap enforced by measurement). Nothing is extrapolated unless it says
-so.
+Measured evidence for the `mbp_m5_max` configuration. Every number here comes
+from a run recorded under `results/`; the table rows are the CSV exports of
+`scripts/bench.py`, `scripts/mtp_ab.py` and `scripts/parallel_ab.py`.
 
-Sections marked **[clean]** were taken while the host was idle
-(`bg_cpu_pct` < 10 %). Anything measured under load is marked **[loaded]** and
-its absolute rates should not be quoted — see "Method" for why that distinction
-carries most of the weight in this file.
+> `results/` and `logs/` also still contain the Intel host's measurement files
+> (`bench_*.jsonl`, `qc_*`, `mtp_q2.jsonl`, …). None of them were produced on
+> this machine and none of them are referenced below; the files created by this
+> branch are `bench_shallow.*`, `depth_f16.*`, `depth_q8.*`, `mtp_m5.jsonl`,
+> `parallel.jsonl` and `parallel_hi.jsonl`.
 
-## Host
+## Provenance
 
 | | |
 |---|---|
-| CPU | Intel i9-9900K, 8c/16t |
-| RAM | 39 GiB, **swap 0** |
-| GPU | AMD Vega 10 [Radeon Pro Vega 48], `03:00.0`, `amdgpu` |
-| GPU compute path | Vulkan / RADV (Mesa 25.0.7), apiVersion 1.4.305 — **no ROCm/HIP** |
-| VRAM total | 8176 MiB (shared with the desktop compositor) |
-| `RLIMIT_MEMLOCK` | 8 MiB soft **and** hard — cannot be raised unprivileged |
+| host | MacBook Pro, Apple M5 Max, 18 cores (6 super + 12 performance), 128 GB unified |
+| OS | macOS 27 |
+| runtime | llama.cpp `aa5e0092f` (build 11487), backends `MTL,BLAS` |
+| GPU | `MTL0 (Apple M5 Max)`, `MTLGPUFamilyMetal4` (5002), simdgroup matrix mul = true, **has tensor = true**, unified memory = true, `recommendedMaxWorkingSetSize` = 112.8 GiB |
+| model | `Qwen3.8-27B-UD-Q4_K_S.gguf` — 14.29 GiB, 27.32 B params, arch `qwen35` (64 blocks, `full_attention_interval` 4, 4 KV heads x 256 dims, 1 `nextn` MTP block) |
+| draft | `mtp-Qwen3.8-27B-Q4_0.gguf` (upstream `MTP/` subdirectory) |
 
-## Build
-
-llama.cpp pinned at `aa5e0092fdb8980b9e89498dfb73049b4fe204c2`, built with
-Vulkan, `GGML_NATIVE=ON`, `LLAMA_CURL=OFF`. `scripts/build.sh` reproduces it.
-The pinned checkout is never patched; the one missing SPIRV include is worked
-around caller-side with `-isystem tools/local/usr/include`.
-
-`glslc` + `libshaderc.so.1` + `spirv-headers` were extracted from Debian
-packages into `tools/local/`.
-
-## Method: what makes a measurement here trustworthy
-
-This host cannot be benchmarked naively, and learning that was most of the work.
-
-* **Throughput is CPU-bound.** At `-ngl 10`, 54 of 64 layers still run on the
-  CPU, so background load scales throughput directly. Every result carries
-  `cpu_busy_pct` (all cores, benchmark included) and `bg_cpu_pct` (all cores
-  *excluding* the guarded process tree).
-* **Contended numbers here are wrong by 3–8x, not by percent.** Repeats of the
-  *identical* configuration spanned 4.6x, and a background indexer holding
-  3–10 of 16 cores depressed generation 6x. Six conclusions in earlier drafts of
-  this file were load artefacts and are corrected below with the clean figure.
-* **A just-exited arm's DRM client lingers for seconds.** Sampling the baseline
-  in that window made a whole stage look already over the cap and `guard.py`
-  killed every arm at 0 s. `bench.py` now settles VRAM before every *arm* and
-  every *stage*, requiring the reading to be stable *and* inside the cap.
-* **Gate on `python3 scripts/wait_idle.py --system --idle-cores 3 --hold 30`.**
-  A process-name gate is not enough — the load moved from one named job to
-  another during this work.
-* **RAM, not VRAM, is the other constraint.** `/tmp` was a 20 GB tmpfs filled to
-  19 GB by other sessions; four back-to-back model loads OOM-killed a run. Run
-  one load at a time and prefer `-lm dio`, which peaks at ~300 MiB RSS where the
-  mmap modes hold 13–14 GB.
-
-### Corrections made from clean data
-
-| earlier claim (loaded) | clean measurement |
-|---|---|
-| generation collapses with depth — 0.18 t/s at 8192 | **1.53 t/s**; the 0.18 was a 6x load artefact |
-| `-t 12` halves generation | **1.99 t/s**, equal to `-t 8` |
-| `-t 16` collapses to 0.14 t/s | **1.86 t/s** — ~8 % worse, not catastrophic |
-| prompt saturates at `-ngl 8` | flat to rising: **74.41 at 10** vs 74.00 at 8 |
-| `-lm` non-mmap modes are ~60 % faster | **~12 % faster** (74.55 vs 66.32) |
-| `-b 1024 -ub 256` beats the default | **default 2048/512 wins** (70.26 vs 59.09) |
-| `-nkvo 1` costs 28 % generation | **no measurable difference** |
-| MTP +55.6 % / −12 % / +120 % | **+97.8 %**, from an idle interleaved A/B |
-
-## VRAM policy
-
-Two different numbers, never subtracted across scopes:
-
-* **`vram_peak_mib` (system counter)** — the cap source of truth, must stay
-  ≤ 5000 MiB. Includes the desktop, whose baseline drifts (measured 746–2188 MiB
-  within one hour, traced to Firefox video and `claude-desktop`). Read the
-  printed baseline before interpreting any peak.
-* **`client_vram_peak_mib` (per-DRM-client sum)** — the model's own footprint.
-  The guarded child has no DRM client before it execs, so this baseline is zero
-  by construction and the peak *is* the footprint. **This is the number to use
-  for the `-ngl` rule** — it is baseline-independent and reproduced to within
-  5 MiB across many runs.
-
-### The safe `-ngl` is a function of the live desktop baseline
-
-Client peaks, measured at `-d 0`, `-p 512 -n 128`:
-
-| `-ngl` | client MiB | fits while baseline <= |
-|---|---|---|
-| 2 | 1522.2 | ~3480 MiB |
-| 4 | 2049.7 | ~2950 MiB |
-| 6 | 2551.2 | ~2450 MiB |
-| 8 | 3039.4 | ~1960 MiB |
-| 10 | 3540.9 | ~1460 MiB |
-| 12 | 4014.6 | ~985 MiB |
-
-**~252 MiB of client VRAM per offloaded layer** from `-ngl` 2 up; the first two
-layers are nearly free (1522.1 → 1522.2), so never extrapolate below 2.
-`-ngl 14` (~4530 MiB client) cannot fit at any baseline observed here.
-
-Verified both ways: `-ngl 12` ran clean at a 765 MiB baseline (peak 4824.6 MiB)
-and breached at 1113.8 MiB (peak 5117.6 MiB, killed 5 s in). **Do not hard-code
-an `-ngl`** — read the printed baseline and let `guard.py` be the backstop.
-
-## Correctness smoke (CPU, `-ngl 0`)
+Build:
 
 ```
-build/bin/llama-completion -m models/Qwen3.8-27B-UD-Q4_K_M.gguf -ngl 0 -no-cnv \
-    -t 8 -c 512 --seed 42 -p "The capital of France is" -n 24
+./scripts/build.sh        # Metal + Accelerate + BLAS, Release, -j 18     ~1 min
 ```
-→ `The capital of France is Paris. The capital of Germany is Berlin. The
-capital of the United States is Washington, D.C. The capital of`
-(`exit_code 0`, 42.0 s wall, RSS peak 15.8 GiB, no cap violation).
 
-## Model load mode **[clean]**
+The build produces one device. There is no `-dev`, no `-ts`, no `-sm`, and no
+second backend to select between — the entire Intel design (Vulkan shaders
+unpacked into `tools/local`, a SPIRV-Headers include hack, a `g++-13` pin for
+CUDA, `-ngl` derived from a VRAM cap) is gone with the hardware.
 
-`results/cl_load.jsonl`, `-ngl 10 -d 0`, baseline 788.7 MiB.
+## Where every layer lives (`-ngl`)
 
-| `-lm` | pp t/s | gen t/s | RSS peak MiB | client MiB |
-|---|---|---|---|---|
-| `auto` (default) | 67.06 | 1.99 | 12 861 | 3540.8 |
-| `mmap` | 66.32 | 1.97 | 14 391 | 3540.8 |
-| `none` | 74.35 | 1.97 | **296** | 3540.9 |
-| `mlock` | — | — | 254 | ✗ abort, exit −6 |
-| **`dio`** | **74.55** | 1.97 | **339** | 3540.9 |
+`llama-bench -p 512 -n 128 -r 2`, f16 KV, `-t 6`, default batch, shallow
+context. `results/bench_shallow.csv`.
 
-Conclusions:
-
-* **`-lm dio` is the best mode, `-lm none` a close second; both beat the default
-  by ~12 % on prompt throughput.** They are also **~40x lighter**: a `-lm dio`
-  arm peaks at ~300 MiB RSS and commits nothing (`MemAvailable` *rose* 422 MiB
-  across a re-verified arm), where `auto`/`mmap` hold 12.9–14.4 GB resident.
-* Generation is unaffected by load mode (1.97–1.99 across all four).
-* **`-lm mlock` is unavailable and unnecessary.** `RLIMIT_MEMLOCK` is 8 MiB soft
-  and hard; llama.cpp aborts rather than run unlocked. Raising it needs a
-  privileged change and buys nothing — `mlock` pins a *mapping* so its pages
-  cannot be reclaimed, but `none`/`dio` already avoid the reclaimable-mapping
-  problem, and swap is 0 so there is nothing to swap to.
-
-## `-ngl` **[clean]**
-
-`results/dio9_ngl.jsonl`, two samples each, `-lm dio`, `-d 0 -p 512 -n 128 -r 1`,
-baselines 785–789 MiB, `bg_cpu_pct` 1.1–1.7 %.
-
-| `-ngl` | pp t/s (A / B) | gen t/s (A / B) | client MiB |
+| `-ngl` | pp512 t/s | tg128 t/s | what is on the GPU |
 |---|---|---|---|
-| 8 | 73.35 / 74.00 | 1.927 / 1.942 | 3039.4 |
-| **10** | 73.67 / **74.41** | **1.996** / **2.008** | 3540.9 |
+| 0 | 21.28 | 1.32 | nothing — pure CPU, and this arm alone took 830 s |
+| 8 | 25.31 | 6.18 | first blocks |
+| 16 | 40.88 | 8.42 | the 4 full-attention blocks land |
+| 32 | 57.50 | 9.86 | half the linear-attention blocks |
+| 48 | 101.58 | 13.62 | |
+| 64 | 416.20 | 17.09 | all 64 transformer blocks |
+| **99** | **680.58** | **24.80** | `lm_head` + `output_norm` + the MTP block |
 
-Conclusions:
+Two things are worth pulling out.
 
-* **`-ngl 10` beats 8 on both axes, 2 of 2** — ~1 % prompt, ~3.5 % generation.
-  Take the largest `-ngl` the live baseline allows.
-* **Offload does not saturate.** The low rungs, from the loaded ladder
-  (`results/clean_ngl.jsonl`, `bg_cpu_pct` 24–51 %): `-ngl 0` 28.10 pp / 0.325
-  gen, `-ngl 2` 41.19 / 1.313. `-ngl 0` is **not** a zero-VRAM configuration on
-  Vulkan — 1522.1 MiB of client VRAM before a single layer is offloaded.
-* The loaded ladder showed a non-monotonic prompt curve (peak at 4–6, *falling*
-  at 8–10) that vanishes on an idle host. That curve was the artefact that
-  motivated building the idle gate.
+* Prefill is *19x* faster with the whole model on the GPU than with none of it
+  (680 vs 21 t/s), and generation *19x* (24.80 vs 1.32). The Intel host was
+  CPU-bound by arithmetic; the constraint here is bandwidth.
+* The jump from 64 to 99 — two layers — is worth **+63 % prefill**. Those two
+  tensors are the token embedding and `lm_head` over a 248 320-token vocab,
+  which is ~1.27 B params, i.e. as large as several transformer blocks. A
+  "everything fits, 99 is free" reading of the layer count would have
+  understated this by a wide margin.
+* `-ngl 64` at 17.09 t/s versus `-ngl 99` at 24.80: **the last layer is worth
+  more than the previous 48 combined** in *relative* terms, so there is no
+  reason ever to run this model partially offloaded on this machine.
 
-## Thread count **[clean]**
+## Flash attention
 
-`results/cl_threads.jsonl`, `-ngl 10 -d 0 -p 512 -n 128 -r 1 -lm dio`,
-baseline 792.8 MiB.
+`results/bench_shallow.csv`, `-ngl 99`.
 
-| `-t` | pp t/s | gen t/s |
+| `-fa` | pp512 t/s | tg128 t/s |
 |---|---|---|
-| 4 | 74.44 | 2.03 |
-| 6 | 74.25 | **2.10** |
-| **8** | 74.18 | 1.98 |
-| 12 | **74.44** | 1.99 |
-| 16 | 68.32 | 1.86 |
+| off | 465.89 | 23.02 |
+| auto | 639.38 | 25.11 |
+| **on** | **705.07** | **24.36** |
 
-Conclusions:
+`-fa on` is worth **+51 % prefill** over `off` and is free-to-slightly-better on
+generation. `auto` picks something close to `on` but not the same thing, which
+is why it is spelled out in `serve.sh` rather than left to the default.
 
-* **`-t 4` through `-t 12` are equivalent** (74.18–74.44 pp, 1.98–2.10 gen) with
-  no consistent ordering. Keep the default `-t 8`.
-* **`-t 16` is mildly worse** (−8 % prompt, −6 % generation). Do not raise the
-  thread count above the physical core count.
-* The earlier "`-t 12` halves generation / `-t 16` collapses to 0.14 t/s" was
-  load, not configuration.
+## KV cache dtype
 
-## KV cache dtype **[clean]**
+Shallow (`results/bench_shallow.csv`, `-ngl 99 -fa` default) and at 128k
+(`results/depth_*.csv`).
 
-`results/dio9_kv.jsonl` at depth 8192 and `results/cl_kv0.jsonl` at depth 0, both
-`-ngl 10 -p 512 -n 128 -r 1 -lm dio`, baselines 785.5 / 794.8 MiB.
-
-Depth 0 — **all five are equivalent** (spread ~3 %, within noise):
-
-| ctk/ctv | pp t/s | gen t/s | client MiB |
-|---|---|---|---|
-| f16/f16 | 72.21 | 1.802 | 3540.9 |
-| q8_0/f16 | 71.20 | 1.802 | 3540.2 |
-| q8_0/q8_0 | 72.40 | 1.796 | 3541.2 |
-| q4_0/q4_0 | 72.50 | 1.800 | 3538.2 |
-| bf16/bf16 | 73.36 | 1.848 | 3540.9 |
-
-Depth 8192 — **quantizing now pays**:
-
-| ctk/ctv | pp t/s | gen t/s | client MiB |
-|---|---|---|---|
-| f16/f16 | 66.35 | 1.579 | 3605.3 |
-| q8_0/f16 | 64.24 | 1.699 | 3589.4 |
-| **q8_0/q8_0** | **66.72** | 1.685 | 3607.4 |
-| **q4_0/q4_0** | 61.56 | **1.730** | 3556.4 |
-| bf16/bf16 | 65.75 | 1.632 | 3605.3 |
-
-Conclusions:
-
-* **KV dtype is free at shallow context and worth ~9 % generation at depth.** At
-  depth 0 the five dtypes are indistinguishable; at depth 8192 `q4_0/q4_0`
-  generates 1.730 against f16's 1.579 (**+9.6 %**) for 7 % less prompt, and
-  `q8_0/q8_0` is the balanced choice (best prompt, 1.685 gen).
-* **For a generation-bound workload, use `q4_0/q4_0` with `-fa on`** — it costs
-  nothing shallow and wins deep.
-* **KV dtype barely moves VRAM** (±50 MiB across all ten arms). Only 16 of the 64
-  layers carry a KV cache — the rest are Gated DeltaNet linear-attention layers —
-  and only layers 3 and 7 fall inside `-ngl 10`.
-* `-fa on` is **mandatory** with a quantized V cache; `-fa off` aborts at
-  context creation with `quantized V cache requires flash_attn to be enabled`
-  (exit 1, ~4 s, no rows).
-
-## Flash attention at depth 8192 **[clean]**
-
-`results/cl_fa.jsonl`, pinned to `q4_0/q4_0`, `-ngl 10 -d 8192 -lm dio`:
-`-fa on` → 61.79 pp / 1.77 gen, client 3556.4, 214 s.
-`-fa off` → exit 1 at 4 s (above), a flag-validation abort, not a crash.
-
-## Generation cost vs context depth **[clean]**
-
-`results/cl_depth.jsonl`, `-ngl 10 -r 1 -lm dio`, baseline 785.5 MiB.
-
-| depth | pp t/s (p512) | pp t/s (p128) | gen t/s | client MiB |
-|---|---|---|---|---|
-| 0 | **74.46** | 47.65 | **2.00** | 3540.9 |
-| 2048 | 71.76 | 45.24 | 1.92 | 3557.3 |
-| 4096 | 69.97 | 44.07 | 1.83 | 3573.3 |
-| 8192 | 66.29 | 42.07 | 1.53 | 3605.3 |
-| 16384 | 59.17 | 38.18 | 1.20 | 3669.3 |
-| 32768 | 50.70 | 33.49 | 0.85 | 3797.4 |
-
-Conclusions:
-
-* **Depth degrades throughput gracefully and monotonically** — generation
-  2.00 → 1.53 at 8k (−24 %) → 1.20 at 16k (−40 %) → 0.85 at 32k (−58 %); prompt
-  −32 % at 32k. There is no cliff.
-* **`-d 32768` fits at `-ngl 10` with `-lm dio`** (peak 4639.2 MiB at a 785.5 MiB
-  baseline, client 3797.4). Earlier drafts had it breaching, under a heavier
-  desktop and the mmap load mode.
-* **The KV cache is not the VRAM problem at depth.** Client VRAM grows only
-  3540.9 → 3797.4 MiB from depth 0 → 32768 (+257 MiB) because only 16 layers
-  have a KV cache.
-* `-d/--n-depth` is the only context-size knob in `llama-bench`; `-o json` does
-  not echo `n_ctx`, so read `n_depth` from the rows.
-
-## KV offload and op offload **[clean]**
-
-`results/dio8_nkvo.jsonl`, `results/dio8_nopo.jsonl`, `-ngl 8 -d 0 -lm dio`,
-`bg_cpu_pct` 0.8–8.6 %.
-
-| flag | pp t/s | gen t/s |
-|---|---|---|
-| `-nkvo 0` (default) | 74.12 | 1.773 |
-| `-nkvo 1` | 74.02 | 1.748 |
-| `-nopo 0` (default) | 74.02 | 1.879 |
-| `-nopo 1` | **12.22** | 1.930 |
-
-* **`-nkvo` makes no measurable difference** — keep the default. An earlier
-  claim that `-nkvo 1` cost 28 % generation was load.
-* **`-nopo 1` is catastrophic** — 12.22 t/s prompt, an 84 % collapse. Never use
-  it.
-
-## Batch size at depth 4096 **[clean]**
-
-`results/dio9_batch.jsonl`, `-ngl 10 -d 4096 -lm dio`, baseline 785.5 MiB.
-
-| `-b`/`-ub` | pp t/s | gen t/s | client MiB |
-|---|---|---|---|
-| **2048/512 (default)** | **70.26** | 1.819 | 3573.3 |
-| 1024/256 | 59.09 | 1.816 | 3310.7 |
-| 512/128 | 45.06 | 1.808 | 3180.6 |
-| 256/64 | 29.48 | 1.837 | 3168.4 |
-
-Conclusions:
-
-* **The llama-server default is the fastest.** Prompt throughput falls
-  monotonically with the micro-batch (70.26 → 29.48) while generation is flat
-  ~1.82. Smaller micro-batches buy VRAM (3573 → 3168 MiB client) and nothing
-  else — lower them only if the cap is tight.
-* An earlier draft had 1024/256 winning; that was the default arm running at
-  55.5 % background load against 33.8 % for its rival.
-
-## Context-shape reference **[clean]**
-
-`results/cl_ctx.jsonl`, `-ngl 10 -lm dio`, baseline 785.5 MiB.
-
-| shape | pp t/s | gen t/s |
-|---|---|---|
-| pp512 / tg128 | 74.49 | 1.98 |
-| pp2048 / tg128 | 73.27 | 1.95 |
-| pp128 / tg512 | 47.55 | 1.95 |
-| tg128 only | — | 1.99 |
-| pp512 only | 74.53 | — |
-
-Prompt throughput is flat in prompt *length* (74.49 at 512 vs 73.27 at 2048) and
-generation is flat in generation *length*. What costs is accumulated context
-depth — see the depth ladder above.
-
-## Quant comparison **[clean]**
-
-A smaller quant has smaller layers, so it can offload more before hitting the
-cap — and this workload wants offload. Measured with `scripts/quant_compare.sh`,
-all `-lm dio`, baselines ~800–850 MiB.
-
-### Offload ceiling
-
-Client VRAM per layer, from a `-ngl` ladder per quant
-(`results/qc_ladder.jsonl`, `results/qc_hi.jsonl`):
-
-| quant | file size | MiB per layer | max `-ngl` | client at max |
-|---|---|---|---|---|
-| UD-Q4_K_M | 16.46 GB | 243 | 12 | 4015.1 |
-| UD-Q3_K_XL | 13.15 GB | 194 | 16 | 4114.6 |
-| UD-IQ3_S | 12.04 GB | 182 | 16 | 3968.3 |
-| UD-Q2_K_XL | 9.83 GB | **155** | **20** | 3929.3 |
-
-### Throughput at each quant's own ceiling
-
-`-d 0 -p 512 -n 128 -r 1 -lm dio`:
-
-| quant | `-ngl` | pp t/s | gen t/s |
-|---|---|---|---|
-| UD-Q4_K_M | 12 | 74.73 | 1.88 |
-| UD-Q3_K_XL | 16 | 77.93 | 2.14 |
-| UD-IQ3_S | 16 | 78.16 | 2.18 |
-| **UD-Q2_K_XL** | **20** | **80.79** | **2.86** |
-
-For Q2_K_XL the three rungs give 80.62 / 2.65, 80.97 / 2.75 and 80.79 / **2.86**
-at `-ngl` 16 / 18 / 20 — generation rises monotonically with offload. **A smaller
-quant is worth +52 % generation**, which is not a marginal lever.
-
-### Quality — and why the first corpus was not good enough
-
-| quant | PPL on `data/ppl_corpus.txt` (184 k tokens) | Δ | PPL on `data/eval_corpus.txt` (3 k tokens) | Δ |
-|---|---|---|---|---|
-| UD-Q4_K_M | **3.9057** | — | 4.0136 | — |
-| UD-Q3_K_XL | 4.4392 | **+13.7 %** | 4.1417 | +3.2 % |
-| UD-IQ3_S | 4.8361 | **+23.8 %** | 4.1614 | +3.7 % |
-| UD-Q2_K_XL | 6.2984 | **+61.3 %** | 4.3511 | +8.4 % |
-
-`logs/ppl-*.log` (6 chunks) and `logs/pplbig-*.log` (40 chunks).
-
-Conclusions:
-
-* **UD-Q4_K_M is the right choice, but not for the reason first assumed.** The
-  speed gain from a smaller quant is large (+52 % generation), not marginal — the
-  quality cost is simply larger still. Q2_K_XL buys 52 % speed for **+61 %
-  perplexity**.
-* **`data/eval_corpus.txt` is the llama.cpp README**, and perplexity over 6
-  chunks of it understated every gap by 3–7×: Q2_K_XL read as +8.4 % there and
-  +61.3 % on 184 k tokens of prose. A ±3 % standard error cannot resolve a
-  +3.2 % gap, and a narrow technical domain flatters every quant. Use the larger
-  corpus — `data/ppl_corpus.txt` is Project Gutenberg 1342, sha256 `81300b79…`.
-* **Perplexity is load-insensitive**, making these the most trustworthy numbers
-  in this file: they were taken while other stages' throughput was still being
-  depressed by host load.
-* The intermediate quants are not compelling either: Q3_K_XL +13.7 % PPL for
-  +14 % generation; IQ3_S +23.8 % for +16 %.
-
-## MTP (multi-token prediction) speculation **[clean]**
-
-`results/final_mtp.jsonl`, `-ngl 8 -c 8192 -t 8 -np 1`, 5189-token prompt,
-`--n-predict 64`, `--server-extra "-lm dio -b 2048 -ub 512"`, interleaved
-`--reps 2` so arm order cannot confound, baseline 788.7 MiB.
-
-| arm | pp t/s | **gen t/s** | `draft_n` / accepted | client MiB | load s |
+| dtype | pp512 shallow | tg shallow | pp512 @128k | **tg @128k** | GPU footprint @128k |
 |---|---|---|---|---|---|
-| `base` r0 | 67.61 | 1.7189 | — | 2793.9 | 6.0 |
-| **`mtp-sidecar`** r0 | 62.42 | **3.3989** | 48 / 47 | 3291.6 | 7.0 |
-| `base` r1 | 68.53 | 1.7189 | — | 2793.9 | 6.0 |
-| **`mtp-sidecar`** r1 | 63.10 | **3.4018** | 48 / 47 | 3291.2 | 7.0 |
+| **f16/f16** | 583.0 | **27.89** | **230.96** | **14.34** | 24 689 MiB |
+| bf16/bf16 | 609.8 | 25.68 | — | — | — |
+| q8_0/f16 | 718.4 | 24.02 | — | — | — |
+| q8_0/q8_0 | 717.8 | 21.90 | 221.81 | 12.894 | 20 763 MiB |
+| q4_0/q4_0 | **723.3** | 22.91 | — | — | — |
 
-Conclusions:
+The shallow numbers are misleading in both directions: at depth 0 the KV cache
+is a few hundred KiB, so the dtype only changes which kernel gets selected
+(quantized KV wins prefill by ~23 %, f16 wins generation by ~27 %). **At 128k,
+where the cache is ~8 GiB, f16 wins both axes** — 14.34 vs 12.89 t/s generation
+and 231 vs 222 t/s prefill — for 4 GiB more memory per instance.
 
-* **MTP nearly doubles generation: 1.7189 → 3.4004 t/s, +97.8 %**, winning
-  **2 of 2** interleaved pairs. `base` measured *bit-identical* (1.7189) across
-  both reps, so this is the most trustworthy number in the file.
-* **Cost: ~8 % prompt throughput, +498 MiB client VRAM, ~17 % longer load.**
-  Worth it for generation-dominated workloads; not for long prompts.
-* **`--spec-type draft-mtp -md models/mtp-Qwen3.8-27B-Q4_0.gguf -ngld 0` is the
-  configuration to use.** `-md` is *not* mandatory on qwen35 — `mtp-nomd`
-  (`--spec-type draft-mtp` alone) also drafts, because UD-Q4_K_M already carries
-  the four `blk.64.nextn.*` tensors — but the sidecar is the higher-precision
-  replacement. `base`'s loader log lists all four as `unused tensor … ignoring`;
-  the speculative arms do not.
-* **`--ngld 0` is required.** The default `-1` (auto) offloads the 1.37 GB draft
-  file to VRAM and breaches the cap. With `-ngld 0` the draft head runs on the
-  CPU — fine at `-ngl 8`, and the reason the sidecar will **not** fit at
-  `-ngl 10`: client 3787–3809 MiB, breached twice in `results/clean_mtp.jsonl`.
-* **The default `--spec-draft-n-max` (3) is optimal.** Drafting further ahead
-  costs more than it gains — acceptance falls and the draft head does more work:
+So the default is f16, and `CTK=q8_0 CTV=q8_0` is the lever to pull when the
+goal is more concurrent instances rather than a faster single stream.
 
-  | `--spec-draft-n-max` | gen t/s | draft / accepted | acceptance |
-  |---|---|---|---|
-  | **3 (default)** | **3.4004** | 48 / 47 | 98 % |
-  | 5 | 3.283 | 53 / 52 | 98 % |
-  | 8 | 3.242 | 59 / 55 | 93 % |
+A quantized V cache requires flash attention; with `-fa on` that is satisfied
+either way.
 
-  (`results/mtp_nmax.jsonl`; the `n-max 5` pair was unstable at 3.051/3.515, the
-  others reproduced to <1 %.) Leave the flag alone.
-* **MTP's benefit is configuration-dependent — it is not additive with a smaller
-  quant.** The same interleaved A/B run against `UD-Q2_K_XL` at `-ngl 16` gives
-  only **+3.6 %**, not ~2x:
+## Threads
 
-  | trunk | `-ngl` | base gen t/s | sidecar gen t/s | delta |
-  |---|---|---|---|---|
-  | UD-Q4_K_M | 8 | 1.7189 | **3.4004** | **+97.8 %** |
-  | UD-Q2_K_XL | 16 | 1.867 | 1.935 | +3.6 % |
+`results/bench_shallow.csv`, `-ngl 99`, shallow.
 
-  (`results/mtp_q2.jsonl`.) Speculation still works — 47/48 accepted — so this is
-  not an acceptance failure. With `-ngld 0` the draft head runs on the CPU: at
-  `-ngl 8` the target is so CPU-bound that drafting ahead pays, whereas at
-  `-ngl 16` the target is fast enough that the CPU draft becomes the bottleneck
-  and there is nothing left to win. **MTP is a `-ngl 8` / Q4_K_M win.**
-* **The fastest generation configuration measured is therefore Q4_K_M + sidecar
-  at `-ngl 8` (3.4004 t/s)** — ahead of Q2_K_XL at `-ngl 16` with or without MTP
-  (1.867 / 1.935 t/s) at the same prompt shape.
-* **History worth keeping:** across three earlier designs the figure came out as
-  +56 %, −12 % and +120 %. Only the idle interleaved A/B is trustworthy.
-
-## Thunderbolt eGPU: one model across two GPUs **[clean]**
-
-An NVIDIA GTX 1070 (GP104, 8 GB) in a Thunderbolt 3 enclosure was added, giving a
-second, independent VRAM pool. Setup (driver, the 288 MB BAR1 window fix, the
-CUDA build) is in the README. Both backends live in one binary:
-
-```
-CUDA0:   NVIDIA GeForce GTX 1070   (8106 MiB, 8022 MiB free)
-Vulkan0: AMD Radeon Graphics (RADV VEGA10) (8176 MiB, 6933 MiB free)
-```
-
-One model instance spreads across both, with the remainder on CPU, via
-`-dev CUDA0,Vulkan0 -sm layer -ts 4,1 -ngl N`.
-
-### Measured at a realistic shape
-
-5188-token prompt, `-c 8192`, `-n 32`, `-lm dio`, `-ctk q4_0 -ctv q4_0 -fa on`:
-
-| config | layers offloaded | sys peak MiB | NVIDIA peak MiB | prompt t/s | gen t/s |
-|---|---|---|---|---|---|
-| Vega 10 only, `-ngl 8` | 8 | 4349 | 87 | **66.66** | 1.640 |
-| Vega 10 only, `-ngl 10` | 10 | 4846 | 87 | **66.96** | 1.740 |
-| 1070 only, `-ngl 24` | 24 | 1237 | 6967 | 36.74 | 2.160 |
-| 1070 only, `-ngl 28` | 28 | 1228 | 7873 | 39.63 | 2.540 |
-| 1070 only, `-ngl 30` | 30 | 1220 | 7445 | **✗ fail** | **✗ fail** |
-| **split `-ts 4,1 -ngl 40`** | **40** | 4304 | 7633 | 50.60 | **3.240** |
-
-Conclusions:
-
-* **The split dominates on generation and is second on prompt.** 40 layers
-  offloaded against 28 for the 1070 alone and 10 for the Vega 10; +28 %
-  generation over the best 1070-only config.
-* **The 1070-only configuration fails at this shape.** `-ngl 30` cannot allocate
-  the compute buffer for a 5188-token batch alongside 30 layers of weights in
-  8 GB. Splitting moves weights to a second device and frees the room — so the
-  split is not just faster, it is the configuration that works.
-* **The Vega 10 is the better prefill engine, the 1070 the better offloader.**
-  Vega-only prompts at 66.7 t/s against the 1070's 39.6, because the Vega 48 has
-  ~2× the FP32 throughput (3840 vs 1920 shaders) and prefill is compute-bound;
-  the 1070 wins generation purely by holding more layers.
-* The Thunderbolt link trains at **2.5 GT/s ×4** (PCIe 1.0, ~1 GB/s) where
-  8.0 GT/s is available — and it does **not** matter: only ~20 KB crosses the
-  CPU↔GPU boundary per token.
-
-### Context length trades against layer count
-
-At 128k the KV cache competes with the weights for the same VRAM. Only 16 of the
-64 layers are full-attention, and with `q4_0` KV they cost ~18 KiB/token across
-all 16, i.e. ~37 MiB per offloaded layer at 131 072 tokens:
-
-| `-ts` | `-ngl` | `-c` | exit | sys peak MiB | NVIDIA peak MiB |
-|---|---|---|---|---|---|
-| 4,1 | 40 | 131072 | 1 | — | ✗ needs 1152 MiB KV with 7067 MiB of weights |
-| 4,1 | 32 | 131072 | **0** | 3893 | 7839 |
-| 4,1 | 36 | 131072 | 1 | 3765 | 6453 |
-| 3,1 | 32 | 131072 | **0** | 4518 | 7213 |
-
-So **128k costs ~8 layers of offload** (40 → 32). f16 KV is not an option here:
-~8.6 GB across the 16 full-attention layers, more than either GPU has free.
-`-ctk q4_0 -ctv q4_0 -fa on` is mandatory at this context.
-
-### 128k measured end to end
-
-A genuine 130 729-token prompt, `-dev CUDA0,Vulkan0 -sm layer -ts 4,1 -ngl 32
--ctk q4_0 -ctv q4_0 -fa on -c 131072`, on an idle host (`bg_cpu_pct` 2.9 %):
-
-| | |
-|---|---|
-| exit | 0 |
-| wall | 4413 s |
-| prompt eval | 130 729 tokens in 4388 s = **29.79 t/s** |
-| generation | 838.13 ms/token = **1.19 t/s** |
-| system peak | 4314 MiB (cap 5000) |
-| NVIDIA peak | 7945 of 8192 MiB |
-| RSS peak | 9629 MiB |
-
-So 128k is **usable**: 1.19 t/s generation, 29.8 t/s prompt, at the cost of a
-73-minute prefill. Generation at this depth beats what the single-GPU depth ladder
-would predict — extrapolating `-ngl 10` at 32k (0.85 t/s) suggested 0.3-0.4 t/s,
-but offloading 32 layers across two GPUs more than compensates for the context.
-The 1070 finishes at 7945 of 8192 MiB, so `-ngl 32` is at the edge; `-ngl 36`
-does not fit.
-
-### MTP at the split **[clean]**
-
-MTP is the `serve.sh` default on this split. `--spec-type draft-mtp -md
-models/mtp-Qwen3.8-27B-Q4_0.gguf -ngld 0`, 128k context, `data/long_prompt.txt`
-(5246-token prompt), one request each, idle host:
-
-| config | prompt t/s | generation t/s |
+| `-t` | pp512 t/s | tg128 t/s |
 |---|---|---|
-| base, `-ngl 32` | 40.24 | 2.73 |
-| base, `-ngl 26` | 35.77 | 2.49 |
-| **MTP, `-ngl 26`** | 32.99 | **3.52** |
+| 4 | **758.00** | 25.51 |
+| 6 | 715.70 | 24.93 |
+| 8 | 693.03 | 25.34 |
+| 12 | 685.73 | 25.10 |
+| 18 | 528.66 | 25.06 |
 
-* **+29 % generation over the `-ngl 32` base config** (2.73 → 3.52 t/s), and
-  +41 % over base at the same `-ngl`, for −18 % prompt and 6 layers moved to the
-  CPU. The same run's slot log reports 21 of 33 drafts accepted.
-* **MTP cannot run at the base layer count.** At 128k, `-ngl 32` with MTP aborts
-  before load: `ggml_backend_cuda_buffer_type_alloc_buffer: allocating 901.25
-  MiB on device 0: cudaMalloc failed: out of memory` → `failed to allocate
-  compute pp buffers`. At 8k, `-ngl 40` fails the same way while `-ngl 36` and
-  `-ngl 34` start clean (load 14 s). Hence the 6-layer reserve: **26 at 128k,
-  34 at 8k**.
-* **Unmeasured at 130k depth.** These figures are at depth 5246; the 1.19 t/s
-  figure above is the base config at 130 729 tokens. MTP's benefit at that depth
-  is unknown, and the reserve costs 6 layers, so the two effects trade.
-* `-ngld 0` is what keeps the 1.37 GB draft file off the GPUs; the 1070 has no
-  room for it at any tested `-ngl`.
+Generation is flat from 4 to 18 — the GPU does that work. Prefill is not:
+`-t 18` (all cores, including the 12 slower ones) costs **30 %** versus `-t 4`.
+The Intel result was the same shape (`-t 16` was ~8 % worse than 8); here the
+penalty is larger and the optimum lower. `serve.sh` defaults to the super-core
+count (6) and the sweep says 4 is marginally better; anywhere in 4–12 is fine,
+18 is not.
 
-### Traps
+## Batch
 
-* **`llama-bench` cannot measure a combined split.** Its `-dev` lists devices to
-  benchmark *separately*: it loaded the model twice, once CUDA-only and once
-  Vulkan-only (two independent 5172 MiB buffers). A `-ngl 44` attempt "OOM'd"
-  because it was 44 layers on one card. Use `llama-cli`/`llama-completion`/
-  `llama-server`, where `-dev` is a real device list.
-* **`-ts` is not honoured as written.** `-ts 2,1` breached the display cap while
-  `-ts 4,1` fit, and measured layer counts land nearer 2:1 than 4:1 — non-layer
-  tensors appear to land on the primary device. Tune against the two VRAM
-  counters, do not trust the ratio.
-* **`guard.py` needed extending.** It read only `card0` sysfs, so it was blind to
-  the 1070. It now reads NVIDIA VRAM through NVML via `ctypes` (microseconds;
-  `nvidia-smi` costs ~150 ms per spawn) and records `nvidia_vram_peak_mib`. The
-  5000 MiB cap still governs the display GPU only.
+`results/bench_shallow.csv`, `-ngl 99`, shallow. This is the one lever that
+trades the two axes against each other.
 
-## Serving (`llama-server`)
+| `-b`/`-ub` | pp512 t/s | tg128 t/s |
+|---|---|---|
+| 2048/512 (default) | 709.56 | 25.54 |
+| 4096/1024 | 667.68 | 24.89 |
+| 4096/2048 | 583.03 | 28.34 |
+| 8192/2048 | 621.65 | 28.21 |
+| 1024/256 | 633.32 | **28.76** |
 
-`serve.sh` runs `llama-server` under `guard.py`, which polls system-wide
-VRAM every 50 ms and `SIGKILL`s the process group above `CAP` (default
-5000 MiB), so the display GPU is protected by measurement rather than by
-arithmetic. It serves one model split across both GPUs — `-dev CUDA0,Vulkan0
--sm layer -ts 4,1` — and **requires the eGPU**: without `/dev/nvidia0` or a CUDA
-build it exits 1 instead of degrading to a configuration the watchdog would
-kill. Defaults: `-c 131072` with `-ngl` derived from the context (32 at 128k,
-40 at 8k) **minus 6 when MTP is on**, `-t 8 -lm dio -b 2048 -ub 512 -ctk q4_0
--ctv q4_0 -fa on`, and MTP (`MTP=0` disables it, `NGL=` overrides the reserve).
-It forwards `SIGINT`/`SIGTERM` to the child, so Ctrl-C actually stops the server.
+Small ubatches win generation (+13 % at `-b 1024 -ub 256`) and lose prefill
+(−11 %). The default `-b 2048 -ub 512` is the balanced choice and is what
+`serve.sh` uses; use `BATCH=1024 UBATCH=256` for a generation-heavy workload.
+
+## Context depth to 128k
+
+`results/depth_f16.csv` (f16 KV) and `results/depth_q8.csv` (q8_0), `-ngl 99
+-fa on`. Each row is one `llama-bench` invocation at that depth; llama-bench
+also exercises the default `-p 512` / `-n 128` pair per invocation, so both are
+listed.
+
+| depth | f16 tg128 t/s | f16 pp128 t/s | q8_0 tg128 t/s | q8_0 pp128 t/s | GPU peak MiB (f16 / q8_0) |
+|---|---|---|---|---|---|
+| 0 | 22.0 / 22.6 | 439.3 | 25.8 / 26.2 | 490.8 | 15 994 / 15 999 |
+| 4 096 | 24.3 / 25.0 | 465.4 | 19.3 / 21.6 | 466.2 | 16 091 / 16 135 |
+| 16 384 | 26.4 / 26.0 | 453.9 | 17.7 / 18.6 | 422.0 | 17 036 / 16 554 |
+| 32 768 | 17.4 / 18.4 | 363.0 | 20.4 / 21.5 | 367.0 | 18 143 / 17 548 |
+| 65 536 | 16.1 / 16.2 | 264.2 | 15.2 / 15.4 | 261.2 | 20 306 / 18 484 |
+| **131 072** | **14.3 / 14.0** | **175.8** | **12.9 / 12.5** | **172.6** | **24 689 / 20 763** |
+
+**A 128k context runs at 14.3 t/s generation and 176–231 t/s prefill.** On the
+Intel host the equivalent was 1.19 t/s generation and 29.8 t/s prefill with a
+73-minute prefill. The gap is the whole point of this branch.
+
+The mid-depth rows disagree with each other (f16 dips at 32 768 while q8_0
+rises; both have ±30 % scatter that the shallow stages did not), so treat the
+interior as a trend and the two endpoints as the measured values. Two candidates
+for the scatter, neither confirmed: the desktop's own GPU tenant (see traps),
+and the KV/weight split crossing a residency-set boundary as the cache grows
+past ~4 GiB.
+
+The memory column is the sum of `"In use system memory"` across accelerators at
+its peak, which includes the mapped weights — it is a footprint, not a budget.
+The per-instance marginal cost of 128k is the *difference* between one instance
+and two, which is what `parallel_ab.py` measures.
+
+## MTP speculation
+
+`results/mtp_m5.jsonl`, `llama-server -ngl 99 -c 131072 -t 4`, one
+`POST /completion` with `n_predict=64` against the ~4 k-token
+`data/long_prompt.txt`. Each arm is SIGKILLed after the request, hence
+`exit_code = -9` throughout.
+
+| arm | prefill t/s | **generation t/s** | draft accepted | GPU peak MiB | load s |
+|---|---|---|---|---|---|
+| base | 507.36 | 21.06 | — | 24 337 | 7.2 |
+| `--spec-type draft-mtp -md mtp-…Q4_0.gguf -ngld 99` | **579.71** | **40.40** | 47/48 | 27 720 | 6.1 |
+| `--spec-type draft-mtp` (no `-md`) | 484.61 | 37.90 | 47/48 | 26 434 | 3.0 |
+
+**MTP nearly doubles generation: 21.06 → 40.40 t/s (+92 %)**, and it does not
+cost prefill here (579.7 vs 507.4 — the draft head shares the same offload).
+That is a much larger win than the +29 % measured on the Intel two-GPU split,
+and for the predicted reason: there the draft head ran on the CPU (`-ngld 0`)
+because the 1070 had no room for it, and the CPU-resident draft was the
+bottleneck. With unified memory the whole draft goes on the GPU (`-ngld 99`).
+
+The third row corrects a claim inherited from the Intel harness. Its comment
+said that `--spec-type draft-mtp` without `-md` leaves `ctx_dft` null and never
+enables the driver; here it accepted 47 of 48 draft tokens and ran at 37.9 t/s.
+The main GGUF carries its own `blk.64.nextn` block (`nextn_predict_layers = 1`),
+and this build drives speculation from it. The sidecar is still preferred —
++7 % generation, and it keeps the draft separate — but `serve.sh` falls back to
+the embedded tensors when the sidecar is missing, and that fallback is measured,
+not assumed.
+
+Not measured: MTP at 128k *depth* (this row is at ~4k), and MTP with a
+quantized KV cache.
+
+## Parallel instances
+
+`results/parallel.jsonl`. MTP on, `-c 131072 -ngl 99 -t 4`, one
+`n_predict=128` request per server, all fired at once. `sum(RSS)` is the total
+resident set of every server process.
+
+| instances | sum(RSS) GiB | single-stream t/s | aggregate t/s | per-stream t/s |
+|---|---|---|---|---|
+| 1 | 24.9 | 41.96 | 53.51 | 53.51 |
+| 2 | 49.9 | 38.71 | 67.16 | 33.58 |
+| 4 | 99.8 | 62.09 | 68.32 | 17.08 |
+
+**Memory is not the constraint; the Metal working set is.** `sum(RSS)` grows
+22.3 GiB per instance, which is an artefact — resident set counts shared
+file-backed pages once per process. The physical cost was measured directly by
+sampling `vm_stat` around each server start:
+
+| | host used | file-backed pages |
+|---|---|---|
+| idle | 42.8 GiB | 35.1 GiB |
+| + 1st server | **+15.1 GiB** | 21.1 GiB |
+| + 2nd server | **+8.2 GiB** | 21.1 GiB |
+
+The 14.29 GiB of weights are mapped once and shared: file-backed pages *fall*
+when the first server starts (they become wired, and stay shared), and the
+second server costs exactly its 128k f16 KV cache and nothing else. So at 128k
+f16 the marginal cost of an instance is ~8.2 GiB, and the machine's 128 GB is
+not what stops you.
+
+What stops you is the GPU. Six instances at f16 failed during the *concurrent*
+phase with
 
 ```
-./serve.sh                       # → http://127.0.0.1:8080, 128k context + MTP
-curl -sf localhost:8080/health           # ok after a ~13 s load
-curl -s localhost:8080/v1/chat/completions -H 'Content-Type: application/json' \
-     -d '{"messages":[{"role":"user","content":"Reply with exactly: pong"}],"max_tokens":64}'
+E ggml_metal_synchronize: error: command buffer 1 failed with status 5
+E error: Insufficient Memory (00000008:kIOGPUCommandBufferCallbackErrorOutOfMemory)
 ```
 
-Smoke-tested end to end at the pre-MTP defaults (MTP off, `-ngl 32`),
-`n_ctx_slot = 131072` confirmed in the log: `exit_code 0`, `vram_violation:
-false`, peak **3972.8 MiB** of the 5000 MiB cap (client 2456.8 MiB, RSS 10 152.3
-MiB, NVIDIA 8019.3 of 8192 MiB), and a clean teardown (`SIGTERM` to the guard
-leaves `pgrep -c llama-server` at 0). The completion returns `content: "pong"`
-in 38 tokens. The MTP default re-smoke-tested the same way: `n_ctx_slot =
-131072`, `content: "pong"`, slot log `draft acceptance = 0.63636 (21 accepted /
-33 generated)`, `pgrep -c llama-server` 0 after `SIGTERM`. Qwen-3.8-27B is a
-thinking model, so a `max_tokens` smaller than the reasoning trace returns an
-**empty `content`** with everything in `reasoning_content` — budget for the trace
-or the visible answer is truncated away.
+on 3 of the 6 servers — the host was not swapping (swap moved +16 MiB over the
+whole experiment) and host usage peaked at ~107 GiB, but Metal's per-process
+working-set budget (~112.8 GiB recommended, summed over processes) ran out.
+**Four instances at 128k f16 is the largest configuration measured to work.**
+The bisect above it, in `results/parallel_hi.jsonl`:
 
-`guard.py` forwarding signals is load-bearing: the child is started with
-`start_new_session=True`, so before the fix a Ctrl-C on `serve.sh` killed only
-the guard and **orphaned `llama-server` holding ~3 GB of the 5 GB budget**.
+| instances | KV | outcome |
+|---|---|---|
+| 4 | f16 | all 4 streams served, aggregate 68.3 t/s |
+| 5 | f16 | 3 of 5 streams failed; the survivors averaged 21.4 t/s |
+| 6 | f16 | servers died during load with the Metal OOM above |
+| 6 | **q8_0** (half the KV) | 4 of 6 streams still failed |
 
-## Reproducing
+Halving the KV cache did not buy back the sixth instance, so the binding term
+is not the KV cache alone — MTP adds ~3.4 GiB of draft/compute buffers per
+instance (24 337 MiB → 27 720 MiB measured for the single-server case), and it
+is the summed Metal working set that runs out. More instances with `MTP=0` is
+plausible and unmeasured.
 
-```
-./scripts/build.sh                                     # once
-export PATH=$PWD/tools/local/usr/bin:$PATH
-export LD_LIBRARY_PATH=$PWD/build/bin:$PWD/tools/local/usr/lib/x86_64-linux-gnu
-python3 scripts/wait_idle.py --system --idle-cores 3 --hold 30
-./scripts/bench.py --stage ngl     --ngl-ladder 8,10 --depth 0 --reps 1 --lm dio --out results/dio9_ngl.jsonl
-./scripts/bench.py --stage kv      --ngl 10 --depth 8192 --reps 1 --lm dio --out results/dio9_kv.jsonl
-./scripts/bench.py --stage threads --ngl 10 --depth 0 --reps 1 --lm dio --out results/cl_threads.jsonl
-./scripts/bench.py --stage depth   --ngl 10 --reps 1 --lm dio --out results/cl_depth.jsonl
-./scripts/bench.py --stage batch   --ngl 10 --depth 4096 --reps 1 --lm dio --out results/dio9_batch.jsonl
-./scripts/bench.py --stage load    --ngl 10 --depth 0 --reps 1 --lm dio --out results/cl_load.jsonl
-./scripts/mtp_ab.py --ngl 8 --ctx 8192 --n-predict 64 --arms base,mtp-sidecar \
-    --ngld 0 --reps 2 --server-extra "-lm dio -b 2048 -ub 512" --out results/final_mtp.jsonl
-./scripts/quant_compare.sh                              # quant ceiling, speed, perplexity
+Throughput saturates much earlier than memory: aggregate generation is flat
+from 2 instances (67.2) to 4 (68.3), while per-stream speed falls 33.6 → 17.1
+t/s. One GPU with one memory-bandwidth budget serves them all, so **N instances
+buy concurrency, not throughput.** The measured spread on identical work is
+large — the single-stream figure for the *1-instance* configuration was 42.0
+t/s in one measurement and 53.5 t/s in the next, a 27 % gap with nothing
+changed — so treat these as ±25 %, and read the shape rather than the digits.
 
-# one model across both GPUs, remainder on CPU (see "Thunderbolt eGPU")
-build/bin/llama-completion -m models/Qwen3.8-27B-UD-Q4_K_M.gguf \
-    -dev CUDA0,Vulkan0 -sm layer -ts 4,1 -ngl 40 -lm dio \
-    -ctk q4_0 -ctv q4_0 -fa on -no-cnv -t 8 -c 8192 \
-    --seed 42 -f data/long_prompt.txt -n 32
-```
+## What was discarded
 
-`bench.py` does not export `PATH`/`LD_LIBRARY_PATH` itself — set them on the same
-command line, or the child `llama-bench` cannot find `libllama.so`.
-`--out` is appended to, and `.csv`/`.md` siblings are derived from it — use a
-distinct `--out` per stage, and delete stale ones first. `--dry-run` prints the
-argv it would run; it does not load a model, so it cannot show the baseline.
-`--ngl-ladder` overrides the built-in `NGL_LADDER` for `--stage ngl` (the rung
-wins over a base `--ngl`, which that stage ignores).
+* **`-ngl 0` took 830 s** for one arm (2 reps of pp512 + tg128 on 18 CPU
+  cores, with the model streaming from page cache). It is kept in the table
+  because it is the floor, but it dominates the wall clock of the `ngl` stage
+  and nothing else in this file was measured at that speed.
+* **The `depth` stage's `-p`/`-n` duplication.** `bench.py` applies the base
+  `-p 512 -n 128` and the `depth` stage adds `-p 128 -n 128` to the same
+  command line, and llama-bench treats repeated flags as a set of tests. Every
+  depth row therefore contains four measurements, two of them duplicates. The
+  data is consistent, the duplication is wasted time, and the fix is to pass
+  `--pp 128 --tg 128` when sweeping depth.
+* **`ioreg` GPU baselines are noisy.** Idle accelerator memory readings drifted
+  18.2 → 498.2 → 831.3 MiB across three consecutive runs with nothing loaded —
+  a 46x spread — so `bench.py`'s `gpu_mem_delta_mib` is reported but not used
+  to make any decision. Peaks are stable; baselines are not.
 
-**Measure on an idle host.** `bench.py` settles VRAM before every arm and stage,
-and `wait_idle.py --system` gates on total host CPU, but neither can fix a busy
-machine. Results taken under load are recorded with their `bg_cpu_pct` so they
-can be discarded.
+## Traps this port had to solve
 
-## Still open
+**1. `host_statistics(HOST_CPU_LOAD_INFO)` reports an idle machine as 100 %
+busy.** The obvious `/proc/stat` replacement reads cumulative ticks per CPU
+state and computes `busy = total - idle`. On this kernel the *idle* counter
+never advances: sampled twice two seconds apart, user grew 1890 and system
+1721 ticks while idle grew 0. A busy fraction computed from those counters is
+1.0 by construction, and the first version of `guard.py` reported
+`cpu_busy_pct = 100.0` while the box was asleep. `guard.py` now sums
+`ps -o time=` across all processes — CPU *seconds*, no tick rate, no state
+enumeration — and normalizes by `cores x wall`. A single spinning process
+reads 1 core, which was verified against the process's own
+`time.process_time()`.
 
-* **`-lm mlock`** — blocked on `RLIMIT_MEMLOCK` (8 MiB, needs a privileged
-  change) and argued to be redundant against `-lm dio`.
-* **The `-ngl` 0–6 rungs** were last measured under load; their VRAM figures are
-  sound but their rates are not.
+**2. The contended resource is the GPU, and nothing about our process reveals
+that.** With `-ngl 99` the CPU is nearly idle during generation; the 12-core
+"saturation" test above still moved the needle only through prefill. What
+actually steals throughput is the desktop compositor and anything else on the
+GPU: `Device Utilization %` reads **24 % on an idle machine** with no model
+loaded. So `wait_idle.py --gpu` gates on a rise *above* a sampled baseline
+rather than an absolute threshold (an absolute 5 % threshold can never be met
+here), and every bench record carries `gpu_busy_pct_peak`.
+
+**3. Unified memory breaks the old accounting.** "In use system memory" counts
+the model's mapped weights, the KV cache and the desktop's own allocations as
+one number, and it lags process exit, so the Intel habit of reading a client
+counter before and after is not portable. Memory decisions here are made from
+*peaks* and from the *difference* between N instances, not from deltas against
+an idle baseline.
+
+**4. `ps` was trusted only after cross-checking.** `ps -o time=` agreeing with
+a child's own `time.process_time()` (0.47 s vs 0.66 s on the same interval) is
+what proved the CPU number was right and the process genuinely starved; the
+mach-API result was the outlier, not `ps`.

@@ -1,45 +1,46 @@
 #!/usr/bin/env bash
-# quant_compare.sh — is a smaller quant actually faster on this machine?
+# quant_compare.sh — what does a bigger quant buy, and what does it cost?
 #
-# Three questions, in order of how much they decide:
+# On the Intel host this compared *offload ceilings*: a smaller quant has
+# smaller layers, so more of them fit under the 5000 MiB display cap and
+# throughput went up. That whole framing is gone — every quant fits here, so
+# `-ngl 99` for all of them and the question becomes purely:
 #
-#   1. How many layers fit?  A smaller quant has smaller layers, so it can
-#      offload more before hitting the 5000 MiB cap. Measured as a per-quant
-#      `-ngl` ladder, which yields the client-VRAM-per-layer slope directly.
-#   2. Throughput at a common `-ngl`, shallow and at depth 4096 — so the quants
-#      are compared at the same offload rather than at their own ceilings.
-#   3. Perplexity on data/eval_corpus.txt. This is deterministic, so it is the
-#      one part of the comparison that host load cannot corrupt.
+#   1. Throughput at depth 0 and at depth 131072. Decode is bandwidth-bound, so
+#      a bigger quant streams more bytes per token and should cost roughly
+#      linearly in model size. This is the number that decides Q4 vs Q8.
+#   2. Perplexity on data/eval_corpus.txt. Deterministic, so it is the one part
+#      of the comparison that host load cannot corrupt — which matters more
+#      here than it did there, because the shared GPU is the contended
+#      resource and no counter can tell a slow arm from a busy one.
 #
 # Usage: ./scripts/quant_compare.sh
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
-export PATH="$ROOT/tools/local/usr/bin:$PATH"
-export LD_LIBRARY_PATH="$ROOT/build/bin:$ROOT/tools/local/usr/lib/x86_64-linux-gnu"
 
-QUANTS="IQ3_S Q2_K_XL Q3_K_XL Q4_K_M"
-MODELS="models/Qwen3.8-27B-UD-IQ3_S.gguf,models/Qwen3.8-27B-UD-Q2_K_XL.gguf,models/Qwen3.8-27B-UD-Q3_K_XL.gguf,models/Qwen3.8-27B-UD-Q4_K_M.gguf"
+QUANTS="UD-Q4_K_S"
+MODELS="models/Qwen3.8-27B-UD-Q4_K_S.gguf"
+# Add more once scripts/dl_smaller.sh has fetched them, e.g.
+#   QUANTS="UD-Q2_K_XL UD-Q3_K_XL UD-Q4_K_S UD-Q5_K_M"
+CTX="${CTX:-131072}"
 
-echo "=== quant compare start $(date +%T)"
-echo "--- ladder 8,10,12,14 at depth 0 (client VRAM per layer) $(date +%T)"
-for q in $QUANTS; do
-    ./scripts/bench.py --stage ngl --model "models/Qwen3.8-27B-UD-$q.gguf" \
-        --ngl-ladder 8,10,12,14 --depth 0 --reps 1 --lm dio \
-        --out results/qc_ladder.jsonl
-done
+echo "=== quant compare start $(date +%T)  ctx=$CTX"
+echo "--- throughput, depth 0 $(date +%T)"
+./scripts/bench.py --stage quant --models "$MODELS" --ngl 99 --depth 0 \
+    --reps 2 --out results/qc_d0.jsonl
 
-echo "--- common -ngl 10 at depth 4096 $(date +%T)"
-./scripts/bench.py --stage quant --models "$MODELS" --ngl 10 --depth 4096 \
-    --reps 1 --lm dio --out results/qc_d4096.jsonl
+echo "--- throughput at $CTX depth $(date +%T)"
+./scripts/bench.py --stage quant --models "$MODELS" --ngl 99 --depth "$CTX" \
+    --reps 1 --out results/qc_deep.jsonl
 
 echo "--- perplexity, data/eval_corpus.txt $(date +%T)"
 for q in $QUANTS; do
-    python3 scripts/guard.py --cap-mib 5000 --label "ppl-$q" \
+    python3 scripts/guard.py --label "ppl-$q" \
         --log "logs/ppl-$q.log" -- \
-        build/bin/llama-perplexity -m "models/Qwen3.8-27B-UD-$q.gguf" \
-        -f data/eval_corpus.txt -c 512 --chunks 6 -ngl 10 -lm dio -t 8
+        build/bin/llama-perplexity -m "models/Qwen3.8-27B-$q.gguf" \
+        -f data/eval_corpus.txt -c 512 --chunks 6 -ngl 99 -fa on -t 6
 done
 
 echo "=== quant compare done $(date +%T)"

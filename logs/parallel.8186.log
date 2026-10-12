@@ -1,0 +1,6 @@
+0.14.001.375 E ggml_metal_synchronize: error: command buffer 1 failed with status 5
+0.14.001.385 E error: Insufficient Memory (00000008:kIOGPUCommandBufferCallbackErrorOutOfMemory)
+2.05.573.515 E ggml_metal_synchronize: error: command buffer 1 failed with status 5
+2.05.573.526 E error: Insufficient Memory (00000008:kIOGPUCommandBufferCallbackErrorOutOfMemory)
+2.05.573.584 E ggml_metal_synchronize: error: command buffer 1 failed with status 5
+2.05.573.585 E error: Insufficient Memory (00000008:kIOGPUCommandBufferCallbackErrorOutOfMemory)

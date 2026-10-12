@@ -1,0 +1,13 @@
+=== instances=5 ctx=131072 mtp=1
+    rss=124.7 GiB gpu=107.5 GiB load=16s  single=0.00 t/s  concurrent: aggregate=42.88 t/s, per-stream=21.44 t/s (wall 30.2s)
+
+| instances | kv | sum(RSS) GiB | single t/s | aggregate t/s | per-stream t/s | streams failing |
+|---|---|---|---|---|---|---|
+| 5 | f16 | 124.7 | 0.00 | 42.88 | 21.44 | 3 |
+==== now 6 x q8_0
+=== instances=6 ctx=131072 mtp=1
+    rss=127.2 GiB gpu=107.3 GiB load=41s  single=0.00 t/s  concurrent: aggregate=40.08 t/s, per-stream=20.04 t/s (wall 40.7s)
+
+| instances | kv | sum(RSS) GiB | single t/s | aggregate t/s | per-stream t/s | streams failing |
+|---|---|---|---|---|---|---|
+| 6 | q8_0 | 127.2 | 0.00 | 40.08 | 20.04 | 4 |

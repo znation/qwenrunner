@@ -1,493 +1,429 @@
 #!/usr/bin/env python3
-"""VRAM/RSS-guarded subprocess runner with per-process VRAM attribution.
+"""Guarded subprocess runner for Apple Silicon (Metal / unified memory).
 
-Hard rule for this machine: the display GPU (Radeon Pro Vega 48, 8 GiB total)
-is shared with the compositor, so total `mem_info_vram_used` MUST stay under
-5 GB. This module runs a command, polls VRAM while it runs, and kills it if the
-cap is exceeded, so no experiment can wedge the desktop.
+The Intel build of this harness existed to protect a *display* GPU: it read
+sysfs DRM counters (and NVML for the eGPU) every 50 ms and SIGKILLed the tree
+when VRAM exceeded 5000 MiB. None of that survives the port:
 
-Three numbers are recorded, because they answer different questions:
+  * macOS has no separate VRAM. Metal allocates from the same 128 GB unified
+    pool the OS uses, so "VRAM" is just RSS plus GPU page tables.
+  * There is no `/sys/class/drm`, no `/proc`, no O_DIRECT. Every counter here
+    comes from a supported macOS API (`host_statistics`, `sysctl`, `ps`,
+    `ioreg`).
 
-  * `vram_peak_mib`   -- system-wide `mem_info_vram_used`. This is the real
-                         display constraint and is what the cap is enforced on.
-  * `vram_delta_mib`  -- `vram_peak_mib` minus the system value sampled before
-                         launch. Diagnostic only: the compositor reclaims under
-                         pressure, so this can understate the app's own peak.
-  * `client_vram_peak_mib` -- VRAM attributable to the guarded process tree,
-                         summed from `/proc/<pid>/fdinfo/*` amdgpu client
-                         counters, deduped by `drm-client-id`. This is the
-                         model's actual footprint; the system counter also
-                         contains the desktop, which drifts by >1 GiB.
+What is still worth guarding against is *swap*: with 128 GB unified and a
+16 GB model there is no cap to breach, but a run that spills to swap is a run
+whose latency numbers are worthless. So the cap is reinterpreted -- kill only
+if `--swap-cap-mib` of new swap appears (default 0: never).
 
-The system and client numbers do not add up exactly: kernel-side allocations
-(page tables, kernel buffers) have no DRM client, so
-sum(clients) < mem_info_vram_used. Measured idle gap on this host is ~400 MiB
-and stable.
+The measurement fields are kept because the old traps are still real:
 
-Do NOT subtract a system-wide client baseline from `client_vram_peak_mib`: the
-guarded tree has no DRM client before it execs, so its own baseline is zero by
-construction and the peak already IS the footprint. (An earlier version did
-subtract one and produced meaningless negative deltas.)
+  * `bg_cpu_pct` -- host CPU busy excluding the guarded tree. With `-ngl 99`
+    the Metal device runs the matmuls, so CPU contention matters far less than
+    it did on the Intel host, but a contended arm is still detectable.
+  * `gpu_busy_pct_peak` -- peak `Device Utilization %` from ioreg. This is the
+    Mac analogue of background CPU load: another GPU tenant (a browser, a
+    video call) steals Metal time even though our own process looks idle.
+  * `gpu_mem_peak_mib` -- peak "In use system memory" across accelerators, so a
+    phantom baseline left by a just-exited arm is visible.
 
-Stdlib only. Usable as a library (run_guarded) or as a CLI:
-
-    scripts/guard.py [--cap-mib 5000] [--timeout 600] [--out results/guard.jsonl] \
-        [--label NAME] -- <cmd> [args...]
+Stdlib only.
 """
 
 import argparse
 import ctypes
-import glob
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
 import threading
 import time
 
-DRM = "/sys/class/drm/card0/device"
-VRAM_USED = DRM + "/mem_info_vram_used"
-VRAM_TOTAL = DRM + "/mem_info_vram_total"
-GTT_USED = DRM + "/mem_info_gtt_used"
-GTT_TOTAL = DRM + "/mem_info_gtt_total"
+# ------------------------------------------------------------------ probes
 
-PCI_DEV = "0000:03:00.0"
+POLL_S = 1.0
 
-DEFAULT_CAP_MIB = 5000.0
-POLL_S = 0.05
+_TIME_RX = re.compile(r"^(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+(?:\.\d+)?)$")
 
 
-def _read_int(path):
-    try:
-        with open(path) as f:
-            return int(f.read().strip())
-    except OSError:
+def _parse_cputime(s):
+    """Parse `ps -o time=` ([[dd-]hh:]mm:ss[.ss]) into seconds, or None."""
+    m = _TIME_RX.match(s.strip())
+    if not m:
         return None
+    days, hours, mins, secs = m.groups()
+    return (int(days or 0) * 86400 + int(hours or 0) * 3600
+            + int(mins) * 60 + float(secs))
 
 
-def _mib(v):
-    return None if v is None else v / 1048576.0
+_PAGE = os.sysconf("SC_PAGE_SIZE")
+_NCPU = os.sysconf("SC_NPROCESSORS_ONLN")
 
 
-def vram_used_mib():
-    return _mib(_read_int(VRAM_USED))
+def ps_snapshot():
+    """Return {pid: (ppid, rss_kib, cpu_s)} for every process.
 
-
-def vram_total_mib():
-    return _mib(_read_int(VRAM_TOTAL))
-
-
-def gtt_used_mib():
-    return _mib(_read_int(GTT_USED))
-
-
-class _NvmlMem(ctypes.Structure):
-    _fields_ = [("total", ctypes.c_ulonglong),
-                ("free", ctypes.c_ulonglong),
-                ("used", ctypes.c_ulonglong)]
-
-
-_NVML = None
-_NVML_TRIED = False
-
-
-def nvidia_vram_mib():
-    """Return (used_mib, total_mib) for NVIDIA GPU 0, or None if unavailable.
-
-    The display GPU's VRAM is visible via sysfs (`card0`), but a second, discrete
-    GPU — e.g. a Thunderbolt eGPU — is not. `nvidia-smi` costs ~150 ms per
-    invocation, far too much to poll at 20 Hz, whereas NVML is a shared library
-    so the query is a few microseconds.
+    One `ps -A` per tick is the whole CPU story on macOS. `host_statistics
+    (HOST_CPU_LOAD_INFO)` is the /proc/stat analogue and looks like the obvious
+    primitive, but on this kernel the idle tick counter is frozen -- it never
+    advances, so a busy fraction computed from it reads 100 % on an idle
+    machine. `ps -o time=` carries each process's CPU time in seconds, which
+    needs no tick rate and sums to host CPU time directly. Returns {} on
+    failure.
     """
-    global _NVML, _NVML_TRIED
-    if not _NVML_TRIED:
-        _NVML_TRIED = True
-        try:
-            lib = ctypes.CDLL("libnvidia-ml.so.1")
-            if lib.nvmlInit_v2() == 0:
-                _NVML = lib
-        except (OSError, AttributeError):
-            _NVML = None
-    if _NVML is None:
-        return None
     try:
-        h = ctypes.c_void_p()
-        if _NVML.nvmlDeviceGetHandleByIndex_v2(0, ctypes.byref(h)) != 0:
-            return None
-        m = _NvmlMem()
-        if _NVML.nvmlDeviceGetMemoryInfo(h, ctypes.byref(m)) != 0:
-            return None
-        return m.used / 1048576.0, m.total / 1048576.0
-    except Exception:
-        return None
-
-
-def drm_clients(pids=None):
-    """Per-DRM-client VRAM/GTT usage in KiB, deduped by drm-client-id.
-
-    amdgpu reports the same client totals for every fd of a process, so the
-    dedupe is mandatory -- summing raw fdinfo entries over-counts by ~4x here.
-
-    `pids` limits the scan to those processes. The unrestricted scan opens
-    every fdinfo file of every process on the machine (thousands of files),
-    which is enough CPU to perturb the run being measured; the guarded monitor
-    therefore always passes its tree.
-
-    Returns {client_id: {"pid", "vram_kib", "shared_vram_kib", "gtt_kib",
-                         "shared_gtt_kib", "gfx_ns", "compute_ns"}}.
-    """
-    out = {}
-    if pids is None:
-        paths = glob.glob("/proc/[0-9]*/fdinfo/*")
-    else:
-        paths = []
-        for p in pids:
-            paths.extend(glob.glob("/proc/%d/fdinfo/*" % p))
-    for path in paths:
-        try:
-            with open(path) as f:
-                txt = f.read()
-        except OSError:
-            continue
-        if PCI_DEV not in txt:
-            continue
-        vals = {}
-        for line in txt.splitlines():
-            if not line.startswith("drm-"):
-                continue
-            key, _, rest = line.partition(":")
-            rest = rest.strip().split()
-            if rest:
-                vals[key.strip()] = rest[0]
-        cid = vals.get("drm-client-id")
-        if cid is None:
-            continue
-        pid = int(path.split("/")[2])
-
-        def num(k):
-            try:
-                return int(vals.get(k, "0"))
-            except ValueError:
-                return 0
-
-        rec = {
-            "pid": pid,
-            "vram_kib": num("drm-memory-vram"),
-            "shared_vram_kib": num("drm-shared-vram"),
-            "gtt_kib": num("drm-memory-gtt"),
-            "shared_gtt_kib": num("drm-shared-gtt"),
-        }
-        prev = out.get(cid)
-        # Same client seen via several fds: keep the largest reading, but
-        # prefer a pid inside our own tree when both are present.
-        if prev is None or rec["vram_kib"] + rec["gtt_kib"] > \
-                prev["vram_kib"] + prev["gtt_kib"]:
-            out[cid] = rec
-    return out
-
-
-_PAGE_KIB = os.sysconf("SC_PAGE_SIZE") // 1024
-
-
-def _cpu_stat():
-    """Return (busy_jiffies, total_jiffies) summed over all CPUs, or None."""
-    try:
-        with open("/proc/stat") as f:
-            parts = f.readline().split()[1:]
-    except OSError:
-        return None
-    try:
-        v = [int(x) for x in parts]
-    except ValueError:
-        return None
-    idle = v[3] + (v[4] if len(v) > 4 else 0)   # idle + iowait
-    return sum(v) - idle, sum(v)
-
-
-def _proc_tree(root_pid):
-    """Return ({pid: (ppid, rss_kib, cpu_jiffies)}, set_of_pids_in_tree)."""
+        out = subprocess.run(["ps", "-A", "-o", "pid=,ppid=,rss=,time="],
+                             capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return {}
     info = {}
-    try:
-        pids = [int(p) for p in os.listdir("/proc") if p.isdigit()]
-    except OSError:
-        return info, set()
-    for p in pids:
+    for line in out.splitlines():
+        parts = line.split(None, 3)
+        if len(parts) != 4:
+            continue
         try:
-            with open("/proc/%d/stat" % p) as f:
-                data = f.read()
-        except OSError:
+            pid, ppid, rss = int(parts[0]), int(parts[1]), int(parts[2])
+        except ValueError:
             continue
-        # comm may contain spaces/parens; everything after the last ')' is safe.
-        end = data.rfind(")")
-        if end < 0:
-            continue
-        f_ = data[end + 2:].split()
-        try:
-            ppid = int(f_[1])
-            cpu = int(f_[11]) + int(f_[12])   # utime + stime, in jiffies
-            rss = int(f_[21]) * _PAGE_KIB
-        except (IndexError, ValueError):
-            continue
-        info[p] = (ppid, rss, cpu)
-    tree = set()
-    stack = [root_pid]
+        info[pid] = (ppid, rss, _parse_cputime(parts[3]))
+    return info
+
+
+def _tree_of(info, root_pid):
+    children = {}
+    for pid, (ppid, _, _) in info.items():
+        children.setdefault(ppid, []).append(pid)
+    tree, stack = set(), [root_pid]
     while stack:
-        pid = stack.pop()
-        if pid in tree:
+        p = stack.pop()
+        if p in tree:
             continue
-        tree.add(pid)
-        for p, (pp, _, _) in info.items():
-            if pp == pid and p not in tree:
-                stack.append(p)
-    return info, tree
+        tree.add(p)
+        stack.extend(children.get(p, ()))
+    return tree
 
 
-def _proc_tree_rss_kib(root_pid):
-    info, tree = _proc_tree(root_pid)
-    return sum(info.get(p, (0, 0))[1] for p in tree)
+def proc_tree(root_pid, info=None):
+    """Return ({pid: (ppid, rss_kib, cpu_s)}, set(pids)) for root_pid's tree."""
+    if info is None:
+        info = ps_snapshot()
+    if not info:
+        return {}, {root_pid}
+    return info, _tree_of(info, root_pid)
 
 
-def client_vram_mib(pids=None):
-    """VRAM (MiB) attributable to `pids` (all DRM clients if None)."""
-    cl = drm_clients(pids)
-    return sum(r["vram_kib"] + r["shared_vram_kib"] for r in cl.values()) / 1024.0
+def tree_rss_kib(root_pid):
+    info, tree = proc_tree(root_pid)
+    return sum(info[p][1] for p in tree if p in info)
 
 
-def client_gtt_mib(pids=None):
-    """GTT (MiB) attributable to `pids` (all DRM clients if None)."""
-    cl = drm_clients(pids)
-    return sum(r["gtt_kib"] + r["shared_gtt_kib"] for r in cl.values()) / 1024.0
+def tree_cpu_s(root_pid, info=None):
+    if info is None:
+        info = ps_snapshot()
+    _, tree = proc_tree(root_pid, info)
+    return sum((info[p][2] or 0.0) for p in tree if p in info)
+
+
+def host_cpu_s(info=None):
+    """Host-wide CPU seconds consumed by all live processes."""
+    if info is None:
+        info = ps_snapshot()
+    return sum((v[2] or 0.0) for v in info.values())
+
+
+_RE_SWAP = re.compile(r"used\s*=\s*([0-9.]+)M")
+
+
+def swap_used_mib():
+    """Host swap in use (MiB) from `sysctl vm.swapusage`, or None."""
+    try:
+        out = subprocess.run(["sysctl", "-n", "vm.swapusage"],
+                             capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    m = _RE_SWAP.search(out)
+    return None if m is None else float(m.group(1))
+
+
+_RE_VMSTAT = {}
+
+
+def _fill_vmstat_patterns():
+    if _RE_VMSTAT:
+        return
+    for key in ("Pages free", "Pages active", "Pages inactive",
+                "Pages wired down", "Pages occupied by compressor"):
+        _RE_VMSTAT[key] = re.compile(re.escape(key) + r":\s+(\d+)\.")
+
+
+def mem_used_mib():
+    """Host memory in use (MiB): active + wired + compressed.
+
+    `free` alone is misleading on macOS -- inactive and purgeable pages are
+    reclaimable, so the honest "is the machine under pressure" number is the
+    non-reclaimable set. Returns None if vm_stat is unavailable.
+    """
+    _fill_vmstat_patterns()
+    try:
+        out = subprocess.run(["vm_stat"], capture_output=True, text=True,
+                             timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    pages = {}
+    for key, rx in _RE_VMSTAT.items():
+        m = rx.search(out)
+        if not m:
+            return None
+        pages[key] = int(m.group(1))
+    used = (pages["Pages active"] + pages["Pages wired down"]
+            + pages["Pages occupied by compressor"])
+    return used * _PAGE / 1048576.0
+
+
+_RE_GPU_UTIL = re.compile(r'"Device Utilization %"=(\d+)')
+_RE_GPU_MEM = re.compile(r'"In use system memory"=(\d+)')
+
+
+def gpu_stats():
+    """Return (busy_pct, used_mib) for the busiest IOAccelerator, or (None, None).
+
+    `ioreg -c IOAccelerator` costs ~30 ms, so it is sampled once per tick and
+    shared by every consumer rather than called per metric.
+    """
+    try:
+        out = subprocess.run(["ioreg", "-r", "-d", "1", "-w", "0",
+                              "-c", "IOAccelerator"],
+                             capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None, None
+    utils = [int(x) for x in _RE_GPU_UTIL.findall(out)]
+    mems = [int(x) for x in _RE_GPU_MEM.findall(out)]
+    util = max(utils) if utils else None
+    # Sum across accelerators: one process's footprint may span them, and the
+    # old harness's bug was reading a *stale client* as a fresh baseline.
+    mem = sum(mems) / 1048576.0 if mems else None
+    return util, mem
+
+
+def settle_gpu(target_mib, timeout=60.0, slack_mib=250.0):
+    """Block until accelerator memory stops falling and is near target.
+
+    A just-exited arm releases its Metal buffers asynchronously; sampling a
+    baseline in that window makes the next arm read a phantom footprint. If
+    the reading stabilises above target the wait is extended and then returns
+    anyway -- another tenant may legitimately hold that much.
+    """
+    deadline = time.time() + timeout
+    _, v = gpu_stats()
+    while v is not None and v > target_mib + slack_mib and time.time() < deadline:
+        time.sleep(1.0)
+        _, v = gpu_stats()
+    return v
+
+
+# ------------------------------------------------------------------ monitor
 
 
 class Monitor(threading.Thread):
-    """Polls VRAM (system + per-client) and child RSS; kills on cap breach."""
+    """Polls host + tree counters once a second; SIGKILLs on a swap breach.
 
-    def __init__(self, pid, cap_mib, poll_s=POLL_S):
+    Attributes after finish(): rss_peak_kib, swap_baseline, swap_peak,
+    swap_delta, mem_peak, gpu_peak, gpu_util_peak, cpu_busy_pct, bg_cpu_pct,
+    tree_cpu_pct, violation, samples.
+    """
+
+    def __init__(self, pid, swap_cap_mib=0.0, poll_s=POLL_S):
         super().__init__(daemon=True)
         self.pid = pid
-        self.cap_mib = cap_mib
+        self.swap_cap_mib = swap_cap_mib or 0.0
         self.poll_s = poll_s
-        self.stop_flag = threading.Event()
-        self.vram_peak = 0.0
-        self.client_peak = 0.0
-        self.gtt_peak = 0.0
         self.rss_peak_kib = 0
+        self.mem_peak = None
+        self.swap_baseline = swap_used_mib()
+        self.swap_peak = self.swap_baseline
+        self.gpu_peak = None
+        self.gpu_util_peak = 0
+        self.cpu_busy_pct = 0.0
+        self.tree_cpu_pct = 0.0
+        self.bg_cpu_pct = 0.0
         self.violation = False
         self.samples = 0
-        self.killed_at = None
-        self.top_clients = {}
-        # Host CPU contention. Throughput on this box is CPU-bound whenever
-        # layers are left on the CPU, so an arm measured while the desktop is
-        # busy is not comparable to one measured while it is idle.
-        self._cpu_prev = None
-        self._cpu_busy = 0.0
-        self._cpu_total = 0.0
-        self._child_cpu0 = None
-        self._child_cpu1 = None
-        # Discrete GPU (e.g. Thunderbolt eGPU). Not covered by the sysfs counter
-        # above, which tracks only the display GPU.
-        self.nvidia_peak = 0.0
-        self.nvidia_total = None
-
-    # Ticks between the expensive /proc walks. The system-VRAM read that
-    # enforces the cap is a single sysfs file and stays on every tick; walking
-    # /proc/*/status and scanning fdinfo costs orders of magnitude more and
-    # steals CPU from the very run being measured. Client VRAM is allocated at
-    # model load and then plateaus, so 2 Hz sampling does not lose the peak.
-    PROC_EVERY = 10
+        self._stop_evt = threading.Event()
+        self._host_cpu0 = None
+        self._tree_cpu0 = None
+        self._t0 = None
 
     def run(self):
-        tick = 0
-        while not self.stop_flag.is_set():
-            cur = _cpu_stat()
-            if cur is not None:
-                if self._cpu_prev is not None:
-                    db = cur[0] - self._cpu_prev[0]
-                    dt = cur[1] - self._cpu_prev[1]
-                    if dt > 0 and db >= 0:
-                        self._cpu_busy += db
-                        self._cpu_total += dt
-                self._cpu_prev = cur
-            v = vram_used_mib()
-            nv = nvidia_vram_mib()
-            if nv is not None:
-                self.nvidia_peak = max(self.nvidia_peak, nv[0])
-                self.nvidia_total = nv[1]
-            if v is not None:
-                self.vram_peak = max(self.vram_peak, v)
-                self.samples += 1
-                if v > self.cap_mib and not self.violation:
-                    self.violation = True
-                    self.killed_at = v
-                    try:
-                        os.killpg(os.getpgid(self.pid), signal.SIGKILL)
-                    except OSError:
-                        pass
-            if tick % self.PROC_EVERY == 0:
-                info, tree = _proc_tree(self.pid)
-                rss = sum(info.get(p, (0, 0))[1] for p in tree)
-                if rss:
-                    self.rss_peak_kib = max(self.rss_peak_kib, rss)
-                child_cpu = sum(info.get(p, (0, 0, 0))[2] for p in tree)
-                if self._child_cpu0 is None:
-                    self._child_cpu0 = child_cpu
-                self._child_cpu1 = child_cpu
-                mine = drm_clients(tree)
-                csum = sum(r["vram_kib"] + r["shared_vram_kib"]
-                           for r in mine.values()) / 1024.0
-                gsum = sum(r["gtt_kib"] + r["shared_gtt_kib"]
-                           for r in mine.values()) / 1024.0
-                if csum > self.client_peak:
-                    self.client_peak = csum
-                    self.top_clients = {
-                        c: {k: r[k] / 1024.0 for k in
-                            ("vram_kib", "shared_vram_kib", "gtt_kib",
-                             "shared_gtt_kib")}
-                        for c, r in mine.items()}
-                self.gtt_peak = max(self.gtt_peak, gsum)
-            tick += 1
-            self.stop_flag.wait(self.poll_s)
+        self._t0 = time.time()
+        info = ps_snapshot()
+        self._host_cpu0 = host_cpu_s(info)
+        self._tree_cpu0 = tree_cpu_s(self.pid, info)
+        while not self._stop_evt.wait(self.poll_s):
+            self._tick()
 
-    @property
-    def cpu_busy_pct(self):
-        """Mean CPU busy % across all cores during the run (benchmark included)."""
-        if not self._cpu_total:
-            return None
-        return 100.0 * self._cpu_busy / self._cpu_total
+    def _tick(self):
+        self.samples += 1
+        info = ps_snapshot()
+        _, tree = proc_tree(self.pid, info)
+        rss = sum(info[p][1] for p in tree if p in info)
+        self.rss_peak_kib = max(self.rss_peak_kib, rss)
+        tree_cpu = sum((info[p][2] or 0.0) for p in tree if p in info)
 
-    @property
-    def bg_cpu_pct(self):
-        """Mean CPU busy % across all cores, EXCLUDING the guarded process tree.
+        if not tree:
+            # Process exited: nothing left to measure, and the remaining
+            # counters would attribute other tenants' work to this run.
+            self._stop_evt.set()
+            return
 
-        This is the contention the measurement had to fight for; it is the
-        number to quote when judging whether two arms are comparable.
-        """
-        if not self._cpu_total or self._child_cpu0 is None:
-            return None
-        child = max(0, (self._child_cpu1 or 0) - self._child_cpu0)
-        return 100.0 * max(0.0, self._cpu_busy - child) / self._cpu_total
+        mem = mem_used_mib()
+        if mem is not None:
+            self.mem_peak = mem if self.mem_peak is None else max(self.mem_peak, mem)
+
+        swap = swap_used_mib()
+        if swap is not None:
+            if self.swap_baseline is None:
+                self.swap_baseline = swap
+            self.swap_peak = swap if self.swap_peak is None else max(self.swap_peak, swap)
+            delta = self.swap_peak - self.swap_baseline
+            if self.swap_cap_mib and delta > self.swap_cap_mib:
+                self.violation = True
+                self._kill()
+
+        util, gmem = gpu_stats()
+        if util is not None:
+            self.gpu_util_peak = max(self.gpu_util_peak, util)
+        if gmem is not None:
+            self.gpu_peak = gmem if self.gpu_peak is None else max(self.gpu_peak, gmem)
+
+        wall = time.time() - self._t0
+        if wall > 0 and self._host_cpu0 is not None:
+            # CPU seconds consumed / (wall x cores) = fraction of the machine's
+            # capacity. Same normalization as the Intel harness, so numbers are
+            # comparable across the port.
+            self.cpu_busy_pct = 100.0 * (host_cpu_s(info) - self._host_cpu0) / (wall * _NCPU)
+            self.tree_cpu_pct = 100.0 * (tree_cpu - self._tree_cpu0) / (wall * _NCPU)
+            self.bg_cpu_pct = max(0.0, self.cpu_busy_pct - self.tree_cpu_pct)
+
+    def _kill(self):
+        try:
+            pgid = os.getpgid(self.pid)
+            os.killpg(pgid, signal.SIGKILL)
+        except OSError:
+            try:
+                os.kill(self.pid, signal.SIGKILL)
+            except OSError:
+                pass
+
+    def snapshot(self):
+        return {
+            "rss_peak_mib": round(self.rss_peak_kib / 1024.0, 1),
+            "mem_peak_mib": None if self.mem_peak is None else round(self.mem_peak, 1),
+            "swap_baseline_mib": None if self.swap_baseline is None else round(self.swap_baseline, 1),
+            "swap_peak_mib": None if self.swap_peak is None else round(self.swap_peak, 1),
+            "swap_delta_mib": None if (self.swap_peak is None or self.swap_baseline is None)
+                               else round(self.swap_peak - self.swap_baseline, 1),
+            "swap_violation": self.violation,
+            "gpu_mem_peak_mib": None if self.gpu_peak is None else round(self.gpu_peak, 1),
+            "gpu_busy_pct_peak": self.gpu_util_peak,
+            "cpu_busy_pct": round(self.cpu_busy_pct, 1),
+            "tree_cpu_pct": round(self.tree_cpu_pct, 1),
+            "bg_cpu_pct": round(self.bg_cpu_pct, 1),
+            "samples": self.samples,
+        }
 
     def finish(self):
-        self.stop_flag.set()
-        self.join(timeout=2.0)
+        self._stop_evt.set()
+        if self.is_alive():
+            self.join(timeout=3.0)
+        return self.snapshot()
 
 
-def run_guarded(cmd, cap_mib=DEFAULT_CAP_MIB, timeout=None, log_path=None,
-                cwd=None, env=None, stdin_text=None, quiet=False):
-    """Run cmd under the VRAM cap. Returns a result dict (JSON-serializable)."""
-    base = vram_used_mib()
+# ------------------------------------------------------------------ runner
+
+
+def run_guarded(cmd, swap_cap_mib=0.0, timeout=None, log_path=None, cwd=None,
+                env=None, quiet=False):
+    """Run `cmd` in its own process group; monitor it; return a result dict.
+
+    SIGINT/SIGTERM to this process are forwarded to the child's group, so a
+    Ctrl-C on serve.sh stops llama-server rather than orphaning it.
+    """
+    if log_path:
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+    log_f = open(log_path, "w") if log_path else subprocess.DEVNULL
     t0 = time.time()
-    out_f = open(log_path, "wb") if log_path else None
-    try:
-        p = subprocess.Popen(
-            cmd,
-            stdout=out_f or subprocess.PIPE,
-            stderr=subprocess.STDOUT if out_f else subprocess.PIPE,
-            stdin=subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL,
-            cwd=cwd,
-            env=env,
-            start_new_session=True,
-        )
-    except OSError as e:
-        if out_f:
-            out_f.close()
-        return {"cmd": cmd, "error": str(e), "exit_code": None, "wall_s": 0.0}
-
-    mon = Monitor(p.pid, cap_mib)
+    p = subprocess.Popen(cmd, stdout=log_f, stderr=subprocess.STDOUT,
+                         stdin=subprocess.DEVNULL, cwd=cwd, env=env,
+                         start_new_session=True)
+    mon = Monitor(p.pid, swap_cap_mib=swap_cap_mib)
     mon.start()
 
-    # The child runs in its own session, so a Ctrl-C / SIGTERM aimed at us never
-    # reaches it. Forward the signal to the child's process group instead, or an
-    # interrupted serve.sh would leave llama-server holding VRAM forever.
+    timed_out = False
+    forward = []
+
     def _forward(signum, _frame):
+        forward.append(signum)
         try:
             os.killpg(os.getpgid(p.pid), signum)
         except OSError:
             pass
 
-    prev_handlers = {}
-    for _sig in (signal.SIGINT, signal.SIGTERM):
+    old = {}
+    for sig in (signal.SIGINT, signal.SIGTERM):
         try:
-            prev_handlers[_sig] = signal.signal(_sig, _forward)
+            old[sig] = signal.signal(sig, _forward)
         except (ValueError, OSError):
             pass
 
-    stdout = b""
-    timed_out = False
     try:
-        if stdin_text is not None:
-            try:
-                p.stdin.write(stdin_text.encode())
-                p.stdin.close()
-            except OSError:
-                pass
-        if timeout:
-            try:
-                stdout, _ = p.communicate(timeout=timeout)
-            except subprocess.TimeoutExpired:
-                timed_out = True
-                try:
-                    os.killpg(os.getpgid(p.pid), signal.SIGKILL)
-                except OSError:
-                    pass
-                stdout, _ = p.communicate()
-        else:
-            stdout, _ = p.communicate()
-    finally:
-        for _sig, _prev in prev_handlers.items():
-            try:
-                signal.signal(_sig, _prev)
-            except (ValueError, OSError):
-                pass
-        mon.finish()
-        if out_f:
-            out_f.close()
-
-    wall = time.time() - t0
-    text = stdout.decode("utf-8", "replace") if stdout else ""
-    if out_f and log_path:
+        p.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        timed_out = True
         try:
-            with open(log_path, "r", errors="replace") as f:
-                text = f.read()
+            os.killpg(os.getpgid(p.pid), signal.SIGKILL)
         except OSError:
             pass
-    if not quiet and text and not out_f:
-        sys.stdout.write(text)
+        p.wait(timeout=30)
+    finally:
+        for sig, handler in old.items():
+            signal.signal(sig, handler)
+        snap = mon.finish()
+        if not quiet:
+            print("guard: " + json.dumps(snap, sort_keys=True), file=sys.stderr)
+        log_f.close()
 
-    return {
-        "cmd": cmd,
+    stdout = ""
+    if log_path:
+        try:
+            with open(log_path, errors="replace") as f:
+                stdout = f.read()
+        except OSError:
+            pass
+
+    res = {
         "exit_code": p.returncode,
-        "wall_s": round(wall, 3),
-        "vram_baseline_mib": None if base is None else round(base, 1),
-        "vram_peak_mib": round(mon.vram_peak, 1),
-        "vram_delta_mib": None if base is None else round(mon.vram_peak - base, 1),
-        "vram_cap_mib": cap_mib,
-        "vram_violation": mon.violation,
-        "vram_killed_at_mib": None if mon.killed_at is None else round(mon.killed_at, 1),
-        "client_vram_peak_mib": round(mon.client_peak, 1),
-        "client_gtt_peak_mib": round(mon.gtt_peak, 1),
-        "client_top": mon.top_clients,
-        "rss_peak_mib": round(mon.rss_peak_kib / 1024.0, 1),
-        "cpu_busy_pct": None if mon.cpu_busy_pct is None else round(mon.cpu_busy_pct, 1),
-        "bg_cpu_pct": None if mon.bg_cpu_pct is None else round(mon.bg_cpu_pct, 1),
-        "nvidia_vram_peak_mib": None if not mon.nvidia_total else round(mon.nvidia_peak, 1),
-        "nvidia_vram_total_mib": None if not mon.nvidia_total else round(mon.nvidia_total, 1),
+        "wall_s": round(time.time() - t0, 3),
         "timed_out": timed_out,
+        "signals": forward,
         "log": log_path,
-        "stdout": text if out_f is None else None,
+        "stdout": stdout,
     }
+    res.update(snap)
+    return res
 
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--cap-mib", type=float, default=DEFAULT_CAP_MIB)
+    ap.add_argument("--swap-cap-mib", type=float, default=0.0,
+                    help="SIGKILL the group if this much new swap appears "
+                         "(0 = never; the default, since 128 GB unified holds "
+                         "this model whole)")
     ap.add_argument("--timeout", type=float, default=None)
-    ap.add_argument("--log", default=None)
-    ap.add_argument("--out", default=None, help="append result JSON to this file")
     ap.add_argument("--label", default=None)
-    ap.add_argument("--cwd", default=None)
+    ap.add_argument("--log", default=None)
     ap.add_argument("cmd", nargs=argparse.REMAINDER)
     args = ap.parse_args(argv)
 
@@ -495,17 +431,17 @@ def main(argv=None):
     if cmd and cmd[0] == "--":
         cmd = cmd[1:]
     if not cmd:
-        ap.error("no command given")
+        ap.error("no command given (use: guard.py [opts] -- cmd args...)")
 
-    res = run_guarded(cmd, cap_mib=args.cap_mib, timeout=args.timeout,
-                      log_path=args.log, cwd=args.cwd)
-    res["label"] = args.label
-    res["timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%S")
-    if args.out:
-        with open(args.out, "a") as f:
-            f.write(json.dumps(res) + "\n")
-    sys.stderr.write(json.dumps(res, indent=2) + "\n")
-    return 0 if res.get("exit_code") == 0 and not res.get("vram_violation") else 1
+    log = args.log
+    if log and args.label:
+        root, ext = os.path.splitext(log)
+        log = "%s.%s%s" % (root, args.label, ext)
+
+    res = run_guarded(cmd, swap_cap_mib=args.swap_cap_mib, timeout=args.timeout,
+                      log_path=log, quiet=True)
+    print(json.dumps({k: v for k, v in res.items() if k != "stdout"}, sort_keys=True))
+    return 0 if res["exit_code"] == 0 and not res["swap_violation"] else 1
 
 
 if __name__ == "__main__":

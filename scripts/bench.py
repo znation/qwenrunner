@@ -1,18 +1,23 @@
 #!/usr/bin/env python3
-"""Parameterized llama-bench sweep driver with a hard VRAM cap.
+"""Parameterized llama-bench sweep driver for Apple Silicon.
 
-Every configuration runs as its own llama-bench invocation under
-scripts/guard.py, so a VRAM-cap breach kills only that configuration and is
-recorded as a violation instead of taking down the sweep.
+The Intel version of this file existed to find the largest `-ngl` that fit
+under a 5000 MiB display-GPU cap, and its ladders were VRAM ladders: rungs at
+0,2,4,... layers, a `depth` stage to make the KV term visible, and a hard stop
+on the first breach. On the M5 Max there is no cap to breach and no offload
+ladder worth climbing -- `-ngl 99` fits, so the interesting question changed
+from "how many layers fit" to "what does the last layer buy, and what is the
+KV/prefill cost at 128k". The ladders below reflect that:
 
-Results are appended to results/bench.jsonl (one row per configuration) and
-rendered to results/bench.csv + results/bench.md.
+  * `ngl`     -- the plateau: 0 vs 8..99. Shows where the CPU->GPU crossover is.
+  * `depth`   -- up to 128k, the context this branch targets.
+  * `threads` -- includes the 12 performance cores to show they cost, not pay.
+  * `batch`   -- larger ubatch is the Metal prefill lever; the Intel host was
+                 fastest at the 2048/512 default.
 
-Examples
---------
-  ./scripts/bench.py --stage ngl --reps 2 --ngl 0 --out results/bench.jsonl
-  ./scripts/bench.py --stage kv --ngl 99 --fa on --reps 3
-  ./scripts/bench.py --models a.gguf,b.gguf --stage quant
+Per-run guard fields are now memory/serialization fields, not VRAM fields: see
+scripts/guard.py. `bg_cpu_pct` and `gpu_busy_pct_peak` are what make a
+contended arm detectable.
 """
 
 import argparse
@@ -23,39 +28,37 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from guard import run_guarded, vram_used_mib  # noqa: E402
+from guard import run_guarded, gpu_stats, settle_gpu  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BENCH_BIN = os.path.join(ROOT, "build", "bin", "llama-bench")
 
-DEFAULT_MODEL = "models/Qwen3.8-27B-UD-Q4_K_M.gguf"
+DEFAULT_MODEL = "models/Qwen3.8-27B-UD-Q4_K_S.gguf"
 
-# A just-exited arm's DRM client lingers for seconds. Sampling the baseline in
-# that window makes the next stage look already over the cap, and guard.py then
-# kills every one of its arms at 0 s — observed losing an entire `threads` stage
-# to a 5117.6 MiB phantom baseline left behind by an `-ngl 12` cap breach.
-SETTLE_QUIET_S = 6.0
-SETTLE_POLL_S = 2.0
-SETTLE_SLACK_MIB = 32.0
+# A just-exited arm keeps its Metal buffers alive for a moment. Sampling a
+# baseline inside that window makes the next arm look like it started with a
+# full GPU. The old harness lost a whole `threads` stage to exactly this, so
+# the settle exists here too -- against accelerator memory instead of DRM.
+SETTLE_QUIET_S = 3.0
+SETTLE_POLL_S = 1.0
+SETTLE_SLACK_MIB = 128.0
 
 
-def settle_vram(cap_mib=None, timeout=60.0):
-    """Block until system VRAM stops falling *and* is back inside the cap.
+def settle(gpu_baseline=None, timeout=20.0):
+    """Block until accelerator memory stops falling, then return it.
 
-    Waits for a stale DRM client from a just-exited arm to be reaped. If the
-    reading stabilises at or above the cap the wait is extended to `timeout` and
-    then returns anyway with a warning — the desktop may legitimately be using
-    that much, and guard.py remains the backstop.
+    `gpu_baseline` is the idle footprint sampled before the first arm (the
+    desktop's own GPU tenant). If the reading stabilises above it, the wait is
+    extended and then returns anyway -- another app may legitimately hold it.
     """
     t0 = time.time()
     prev = None
     stable_since = None
     while time.time() - t0 < timeout:
-        v = vram_used_mib()
+        _, v = gpu_stats()
         if v is None:
-            return v
-        inside = cap_mib is None or v <= cap_mib
-        if inside and prev is not None and abs(v - prev) <= SETTLE_SLACK_MIB:
+            return None
+        if prev is not None and abs(v - prev) <= SETTLE_SLACK_MIB:
             if stable_since is None:
                 stable_since = time.time()
             if time.time() - stable_since >= SETTLE_QUIET_S:
@@ -64,13 +67,10 @@ def settle_vram(cap_mib=None, timeout=60.0):
             stable_since = None
         prev = v
         time.sleep(SETTLE_POLL_S)
-    v = vram_used_mib()
-    if cap_mib is not None and v is not None and v > cap_mib:
-        print("warning: VRAM still %.1f MiB after %.0fs settle (cap %.1f); "
-              "the desktop may be holding it" % (v, timeout, cap_mib))
-    return v
+    return prev
 
-# llama-bench JSON scalar fields we care about (see tools/llama-bench/llama-bench.cpp).
+
+# llama-bench JSON scalar fields we care about (tools/llama-bench/llama-bench.cpp).
 ROW_FIELDS = [
     "build_commit", "build_number", "cpu_info", "gpu_info", "backends",
     "model_filename", "model_type", "model_size", "model_n_params",
@@ -88,20 +88,18 @@ CSV_FIELDS = [
     "n_gpu_layers", "flash_attn", "type_k", "type_v", "n_threads",
     "n_batch", "n_ubatch", "load_mode", "no_kv_offload", "no_op_offload",
     "n_prompt", "n_gen", "n_depth", "avg_ts", "stddev_ts",
-    "vram_peak_mib", "vram_delta_mib", "client_vram_peak_mib",
-    "client_gtt_peak_mib", "vram_violation", "rss_peak_mib", "wall_s",
+    "gpu_mem_peak_mib", "gpu_mem_delta_mib", "swap_delta_mib", "swap_violation",
+    "rss_peak_mib", "mem_peak_mib", "gpu_busy_pct_peak", "cpu_busy_pct",
+    "bg_cpu_pct", "wall_s",
 ]
 
 # Per-run guard fields copied verbatim into every record (and the CSV).
-# `client_vram_peak_mib` is already the model's own footprint: the guarded tree
-# has no DRM client before it execs, so it has no baseline to subtract. The
-# system counter carries the drifting desktop, hence the separate delta.
 GUARD_FIELDS = [
-    "vram_baseline_mib", "vram_peak_mib", "vram_delta_mib", "vram_violation",
-    "client_vram_peak_mib", "client_gtt_peak_mib",
-    "rss_peak_mib",
-    "cpu_busy_pct", "bg_cpu_pct",
-    "nvidia_vram_peak_mib", "nvidia_vram_total_mib",
+    "gpu_mem_baseline_mib", "gpu_mem_peak_mib", "gpu_mem_delta_mib",
+    "gpu_busy_pct_peak",
+    "swap_baseline_mib", "swap_peak_mib", "swap_delta_mib", "swap_violation",
+    "mem_peak_mib", "rss_peak_mib",
+    "cpu_busy_pct", "tree_cpu_pct", "bg_cpu_pct",
 ]
 
 
@@ -122,23 +120,16 @@ def parse_bench_json(text):
 
 # ---------------------------------------------------------------- stage defs
 
-# Measured on this host (UD-Q4_K_M, -p 64 -n 16 -r 1, guarded):
-#   -ngl 0 -> 1063.0 MiB client VRAM, system peak 2421.9 (baseline 1358.9)
-#   -ngl 4 -> 1643.8 MiB client VRAM, system peak 3002.7
-# i.e. a ~1063 MiB Vulkan compute/scratch floor even with zero layers
-# offloaded, then ~145 MiB per offloaded layer at low -ngl (cheaper than the
-# 218.6 MiB/layer of on-disk weights, so placement shifts as -ngl rises --
-# re-measure, never extrapolate). Remaining budget at -ngl 4 was ~2000 MiB,
-# so the breach is expected in the -ngl 16..24 range. The ladder stops on the
-# first cap breach so we never probe a value that would hard-freeze the shared
-# display GPU.
-NGL_LADDER = [0, 2, 4, 6, 8, 10, 12, 14, 16, 20, 24]
+# Where does Metal stop paying? With every layer offloaded the model is purely
+# bandwidth-bound on the GPU; before that it is CPU-bound and slow. The rungs
+# bracket the crossover rather than searching for a cap that no longer exists.
+NGL_LADDER = [0, 8, 16, 32, 48, 64, 99]
 
-# Context depths for the `depth` stage. llama-bench's n_ctx is
-# n_prompt + n_gen + n_depth, so every earlier stage (which never passed -d)
-# measured a ~192-token context, i.e. a KV cache of ~12 MiB -- the KV cost was
-# invisible. This ladder is what makes the KV term real.
-DEPTH_LADDER = [0, 2048, 4096, 8192, 16384, 32768]
+# Context depths for the `depth` stage. llama-bench sets n_ctx = n_prompt +
+# n_gen + n_depth, so only this ladder makes the KV term real -- every other
+# stage runs with a ~256-token context and a KV cache of a few hundred KiB.
+# 131072 is the context this branch serves at.
+DEPTH_LADDER = [0, 4096, 16384, 32768, 65536, 131072]
 
 
 def stage_configs(stage, base, ngl_ladder=None):
@@ -146,26 +137,31 @@ def stage_configs(stage, base, ngl_ladder=None):
     if stage == "ngl":
         return [("ngl%d" % n, {"-ngl": n}) for n in (ngl_ladder or NGL_LADDER)]
     if stage == "fa":
-        return [("fa=%s" % v, {"-fa": v}) for v in ("off", "on")]
+        return [("fa=%s" % v, {"-fa": v}) for v in ("off", "on", "auto")]
     if stage == "kv":
         return [
             ("kv=f16/f16", {"-ctk": "f16", "-ctv": "f16"}),
+            ("kv=bf16/bf16", {"-ctk": "bf16", "-ctv": "bf16"}),
             ("kv=q8_0/f16", {"-ctk": "q8_0", "-ctv": "f16"}),
             ("kv=q8_0/q8_0", {"-ctk": "q8_0", "-ctv": "q8_0"}),
             ("kv=q4_0/q4_0", {"-ctk": "q4_0", "-ctv": "q4_0"}),
-            ("kv=bf16/bf16", {"-ctk": "bf16", "-ctv": "bf16"}),
         ]
     if stage == "threads":
-        return [("t%d" % n, {"-t": n}) for n in (4, 6, 8, 12, 16)]
+        # 6 = super cores; 18 = all. The Intel result (-t 16 was ~8 % worse)
+        # should reappear here with wider separation.
+        return [("t%d" % n, {"-t": n}) for n in (4, 6, 8, 12, 18)]
     if stage == "batch":
         return [
             ("b2048/ub512", {"-b": 2048, "-ub": 512}),
+            ("b4096/ub1024", {"-b": 4096, "-ub": 1024}),
+            ("b4096/ub2048", {"-b": 4096, "-ub": 2048}),
+            ("b8192/ub2048", {"-b": 8192, "-ub": 2048}),
             ("b1024/ub256", {"-b": 1024, "-ub": 256}),
-            ("b512/ub128", {"-b": 512, "-ub": 128}),
-            ("b256/ub64", {"-b": 256, "-ub": 64}),
         ]
     if stage == "load":
-        return [("lm=%s" % v, {"-lm": v}) for v in ("auto", "mmap", "none", "mlock", "dio")]
+        # `dio` is gone: O_DIRECT is a Linux-only load mode and there is no
+        # reason to want it here, since mmap is zero-copy into a Metal buffer.
+        return [("lm=%s" % v, {"-lm": v}) for v in ("auto", "mmap", "none", "mlock")]
     if stage == "nkvo":
         return [("nkvo=%d" % v, {"-nkvo": v}) for v in (0, 1)]
     if stage == "nopo":
@@ -174,14 +170,12 @@ def stage_configs(stage, base, ngl_ladder=None):
         return [
             ("pp512/tg128", {"-p": 512, "-n": 128}),
             ("pp2048/tg128", {"-p": 2048, "-n": 128}),
+            ("pp8192/tg128", {"-p": 8192, "-n": 128}),
             ("pp128/tg512", {"-p": 128, "-n": 512}),
             ("tg128", {"-p": 0, "-n": 128}),
             ("pp512", {"-p": 512, "-n": 0}),
         ]
     if stage == "depth":
-        # -d/--n-depth is the ONLY context/KV-size knob in llama-bench:
-        # llama-bench.cpp:1308 sets n_ctx = n_prompt + n_gen + n_depth.
-        # A fixed (p=128, n=128) probe at each depth isolates the KV cost.
         return [("p128/n128/d%d" % d, {"-p": 128, "-n": 128, "-d": d})
                 for d in DEPTH_LADDER]
     if stage == "quant":
@@ -197,7 +191,7 @@ def flags_to_argv(flags):
     return out
 
 
-def run_one(model, label, flags, args, stage):
+def run_one(model, label, flags, args, stage, gpu_baseline):
     cmd = [BENCH_BIN, "-m", model, "-o", "json", "-r", str(args.reps)]
     if stage != "ctx":
         cmd += ["-p", str(args.pp), "-n", str(args.tg)]
@@ -205,7 +199,7 @@ def run_one(model, label, flags, args, stage):
     log = os.path.join(ROOT, "logs", "bench", "%s-%s.log" % (stage, label.replace("/", "_")))
     os.makedirs(os.path.dirname(log), exist_ok=True)
 
-    res = run_guarded(cmd, cap_mib=args.cap_mib, timeout=args.timeout,
+    res = run_guarded(cmd, swap_cap_mib=args.swap_cap_mib, timeout=args.timeout,
                       log_path=log, cwd=ROOT, quiet=True)
     rows = parse_bench_json(res.get("stdout") or "")
     if rows is None:
@@ -226,11 +220,14 @@ def run_one(model, label, flags, args, stage):
         "wall_s": res.get("wall_s"),
         "timed_out": res.get("timed_out"),
         "log": os.path.relpath(log, ROOT),
-        "client_top": res.get("client_top"),
         "rows": [],
     }
     for k in GUARD_FIELDS:
         rec[k] = res.get(k)
+    rec["gpu_mem_baseline_mib"] = None if gpu_baseline is None else round(gpu_baseline, 1)
+    rec["gpu_mem_delta_mib"] = (
+        None if (res.get("gpu_mem_peak_mib") is None or gpu_baseline is None)
+        else round(res["gpu_mem_peak_mib"] - gpu_baseline, 1))
     for r in (rows or []):
         rec["rows"].append({k: r.get(k) for k in ROW_FIELDS if k in r})
     if rows:
@@ -258,7 +255,7 @@ def rec_to_csv_rows(rec):
                                           "wall_s")})
         r.update({k: rec.get(k) for k in GUARD_FIELDS})
         r.update({k: row.get(k) for k in CSV_FIELDS if k in row})
-        r["ok"] = rec.get("exit_code") == 0 and not rec.get("vram_violation")
+        r["ok"] = rec.get("exit_code") == 0 and not rec.get("swap_violation")
         out.append(r)
     return out
 
@@ -289,18 +286,18 @@ def write_outputs(recs, args):
             for row in rec_to_csv_rows(rec):
                 w.writerow(row)
 
-    lines = ["# llama-bench sweep", ""]
-    lines.append("| stage | label | ngl | fa | k/v | t | b/ub | lm | pp | tg | d | pp t/s | tg t/s | VRAM peak MiB | client MiB | ok |")
-    lines.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+    lines = ["# llama-bench sweep (Apple Silicon / Metal)", ""]
+    lines.append("| stage | label | ngl | fa | k/v | t | b/ub | lm | pp | tg | d | "
+                 "pp t/s | tg t/s | gpu MiB | bg cpu %% | gpu %% | ok |")
+    lines.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
     for rec in recs:
-        ok = rec.get("exit_code") == 0 and not rec.get("vram_violation")
+        ok = rec.get("exit_code") == 0 and not rec.get("swap_violation")
         if not rec["rows"]:
-            lines.append("| %s | %s | | | | | | | | | | | | %s | %s | %s |" % (
-                rec.get("stage"), rec.get("label"), rec.get("vram_peak_mib"),
-                rec.get("client_vram_peak_mib"), "NO" if not ok else "yes"))
+            lines.append("| %s | %s | | | | | | | | | | | | %s | %s | %s | %s |" % (
+                rec.get("stage"), rec.get("label"), rec.get("gpu_mem_peak_mib"),
+                rec.get("bg_cpu_pct"), rec.get("gpu_busy_pct_peak"),
+                "NO" if not ok else "yes"))
             continue
-        # One markdown row per llama-bench row so a multi-configuration record
-        # (e.g. the `depth` stage) shows each point rather than only the first.
         for row in rec["rows"]:
             ts = row.get("avg_ts")
             ts = "%.2f" % ts if isinstance(ts, (int, float)) else ""
@@ -312,13 +309,15 @@ def write_outputs(recs, args):
                 tg = ts
             elif npr:
                 pp = ts
-            lines.append("| %s | %s | %s | %s | %s/%s | %s | %s/%s | %s | %s | %s | %s | %s | %s | %s | %s | %s |" % (
+            lines.append("| %s | %s | %s | %s | %s/%s | %s | %s/%s | %s | %s | %s | %s | "
+                         "%s | %s | %s | %s | %s | %s |" % (
                 rec.get("stage"), rec.get("label"), row.get("n_gpu_layers"),
                 row.get("flash_attn"), row.get("type_k"), row.get("type_v"),
                 row.get("n_threads"), row.get("n_batch"), row.get("n_ubatch"),
                 row.get("load_mode"), npr, ngn, row.get("n_depth"),
-                pp, tg, rec.get("vram_peak_mib"),
-                rec.get("client_vram_peak_mib"), "yes" if ok else "NO"))
+                pp, tg, rec.get("gpu_mem_peak_mib"),
+                rec.get("bg_cpu_pct"), rec.get("gpu_busy_pct_peak"),
+                "yes" if ok else "NO"))
     with open(md_path, "w") as f:
         f.write("\n".join(lines) + "\n")
     return csv_path, md_path
@@ -347,8 +346,8 @@ def main(argv=None):
     ap.add_argument("--lm", default=None, help="base -lm load mode")
     ap.add_argument("--depth", default=None, type=int,
                     help="base -d/--n-depth; llama-bench ctx = pp + tg + depth")
-    ap.add_argument("--cap-mib", type=float, default=5000.0)
-    ap.add_argument("--timeout", type=float, default=1800.0)
+    ap.add_argument("--swap-cap-mib", type=float, default=0.0)
+    ap.add_argument("--timeout", type=float, default=3600.0)
     ap.add_argument("--out", default="results/bench.jsonl")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args(argv)
@@ -377,13 +376,15 @@ def main(argv=None):
     if args.ngl_ladder:
         ngl_ladder = [int(x) for x in args.ngl_ladder.split(",") if x.strip()]
 
+    gpu_baseline = None
     if not args.dry_run:
-        settle_vram(args.cap_mib)
-    print("baseline VRAM: %.1f MiB (cap %.1f)" % (vram_used_mib() or 0, args.cap_mib))
+        gpu_baseline = settle()
+    print("baseline GPU memory: %s MiB" % (
+        "n/a" if gpu_baseline is None else "%.1f" % gpu_baseline))
     recs = []
     for stage in stages:
         if not args.dry_run:
-            settle_vram(args.cap_mib)
+            settle()
         for model in (models if stage == "quant" else models[:1]):
             for label, flags in stage_configs(stage, base, ngl_ladder):
                 merged = dict(base)
@@ -395,28 +396,28 @@ def main(argv=None):
                 if args.dry_run:
                     print(" ".join(cmd))
                     continue
-                # Also settle between arms, not just between stages: a killed
-                # arm's DRM client lingers, and without this the *next* arm in
-                # the same stage reads a phantom baseline and dies at 0 s.
-                settle_vram(args.cap_mib)
+                # Settle between arms too: a just-exited arm's Metal buffers
+                # linger, and without this the next arm reads a phantom
+                # baseline (the old harness lost arms to exactly this).
+                settle()
                 t0 = time.time()
-                rec = run_one(model, label, merged, args, stage)
+                rec = run_one(model, label, merged, args, stage, gpu_baseline)
                 recs.append(rec)
-                ok = rec["exit_code"] == 0 and not rec["vram_violation"]
+                ok = rec["exit_code"] == 0 and not rec["swap_violation"]
                 rates = " ".join(
                     "n_prompt=%s n_gen=%s %.2f t/s" % (r.get("n_prompt"), r.get("n_gen"),
                                                        r.get("avg_ts") or 0)
                     for r in rec["rows"]) or "NO RESULTS"
-                print("[%s/%s] %s vram_peak=%s client=%s (+%s) exit=%s (%.0fs) %s" % (
+                print("[%s/%s] %s gpu_peak=%s (+%s) bg_cpu=%s gpu_util=%s exit=%s (%.0fs) %s" % (
                     stage, label, "OK" if ok else "FAIL",
-                    rec["vram_peak_mib"], rec.get("client_vram_peak_mib"),
-                    rec.get("vram_delta_mib"), rec["exit_code"],
-                    time.time() - t0, rates))
+                    rec["gpu_mem_peak_mib"], rec.get("gpu_mem_delta_mib"),
+                    rec.get("bg_cpu_pct"), rec.get("gpu_busy_pct_peak"),
+                    rec["exit_code"], time.time() - t0, rates))
                 sys.stdout.flush()
                 with open(args.out, "a") as f:
                     f.write(json.dumps(rec, sort_keys=True) + "\n")
                 if stage in ("ngl", "depth") and not ok:
-                    print("[%s] stopping ladder: %s breached the cap" % (stage, label))
+                    print("[%s] stopping ladder: %s failed" % (stage, label))
                     break
 
     if args.dry_run:

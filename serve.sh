@@ -1,123 +1,150 @@
 #!/usr/bin/env bash
-# serve.sh — launch llama-server for Qwen-3.8-27B under the 5000 MiB VRAM watchdog.
+# serve.sh — launch llama-server for Qwen-3.8-27B on Apple Silicon (Metal).
 #
-# One model instance, split across the GTX 1070 (CUDA) and the Vega 10
-# (Vulkan), with the layers that do not fit spilling to CPU: -dev CUDA0,Vulkan0
-# -sm layer -ts 4,1. Measured 40 layers at 8k context, 32 at 128k; the KV cache
-# competes with the weights for the same VRAM, so context length and layer count
-# trade against each other. The layer count is derived from the context below.
+# This is the M5 Max / 128 GB unified-memory entry point. The Intel build of
+# this script split one model across a GTX 1070 and a Vega 10 under a 5000 MiB
+# display cap, derived `-ngl` from the context, and refused to start without
+# the eGPU. All of that is gone:
 #
-# The eGPU is REQUIRED. The Vega 10 alone cannot hold this model at the default
-# 128k context under the display cap, so serve.sh errors out without it rather
-# than silently degrading to a configuration that the watchdog will kill.
+#   * There is no second device to split to. Metal sees one GPU with the whole
+#     machine's memory behind it, so `-ngl 99` puts *every* layer (including
+#     the draft head) on the GPU and no layer budget needs deriving.
+#   * No 5000 MiB cap and no watchdog kill — but the *swap* guard is kept: a
+#     run that spills to swap has worthless latency numbers, so `SWAPCAP` can
+#     still SIGKILL on new swap (default off, since 128 GB holds this model
+#     many times over).
+#   * `-lm dio` is gone. dio is Linux O_DIRECT; the default mmap is both the
+#     fastest path here and the reason N instances are cheap: every process
+#     maps the same weight pages, so only the KV cache and compute buffers are
+#     per-instance.
 #
-# The 5000 MiB cap protects the *display* GPU (the Vega 10), which is why the
-# watchdog can kill the whole thing. The 1070 has its own 8 GB and is reported
-# separately as nvidia_vram_peak_mib.
+# INSTANCES launches that many independent llama-server processes on
+# consecutive ports, each with its own full CTX of KV. Each is a complete
+# 128k-context server; weights are shared through the page cache.
 #
 # Overridable via env (anything unset is derived):
-#   MODEL CTX THREADS TS NGL LM BATCH UBATCH CTK CTV FA HOST PORT CAP MTP MD NGLD
+#   MODEL CTX INSTANCES PORT THREADS HOST NGL LM BATCH UBATCH CTK CTV FA MTP MD
+#   NGLD SWAPCAP
 #
-#   ./serve.sh                      # 128k context across both GPUs, MTP on
-#   MTP=0 ./serve.sh                # the same split without speculative decoding
-#   CTX=32768 ./serve.sh            # shorter context, more layers (faster)
-#   NGL=36 TS=4,1 ./serve.sh        # override the split
-# Extra args are appended verbatim to the llama-server command line.
+#   ./serve.sh                      # one server, 128k context, MTP on
+#   INSTANCES=4 ./serve.sh          # four 128k servers, ports 8080-8083
+#   MTP=0 ./serve.sh                # no speculative decoding
+#   CTK=q8_0 CTV=q8_0 ./serve.sh    # halve the KV cache per instance
+# Extra args are appended verbatim to every llama-server command line.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-export PATH="$ROOT/tools/local/usr/bin:$PATH"
-export LD_LIBRARY_PATH="$ROOT/build/bin:$ROOT/tools/local/usr/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH:-}"
+SERVER="$ROOT/build/bin/llama-server"
 
-MODEL="${MODEL:-$ROOT/models/Qwen3.8-27B-UD-Q4_K_M.gguf}"
-# 128k is the working context: an agent client needs its system prompt, tool
-# schemas and a long transcript resident at once. q4_0 KV plus flash attention
-# keep that cache at ~2.4 GB, which the layer count below pays for by offloading
-# ~8 layers to CPU. Lower CTX to buy layers back if generation speed matters
-# more than depth.
+MODEL="${MODEL:-$ROOT/models/Qwen3.8-27B-UD-Q4_K_S.gguf}"
+
+# 128k is the working context the user asked for, and on this machine it is
+# nearly free: only 16 of the 64 layers are full attention (the other 48 are
+# linear-attention / SSM and carry a constant ~10 MiB state, not a growing
+# cache), so f16 KV at 128k is ~8 GiB per instance, not the ~40 GiB a
+# same-size all-attention model would need. Per token: 16 layers x 4 kv heads
+# x 256 key/value dims x 2 (K and V) x 2 B = 64 KiB.
 CTX="${CTX:-131072}"
-THREADS="${THREADS:-8}"
 
-HOST="${HOST:-127.0.0.1}"
+# Independent servers. Memory per additional instance is its KV cache plus
+# ~2-3 GiB of Metal compute buffers: the 15.4 GB of weights are mapped once and
+# shared by every process. Budget = weights + INSTANCES x (KV + compute).
+INSTANCES="${INSTANCES:-1}"
 PORT="${PORT:-8080}"
-CAP="${CAP:-5000}"
+HOST="${HOST:-127.0.0.1}"
 
-# MTP speculation is ON by default: measured +29 % generation over this split's
-# base config at 128k (2.73 -> 3.52 t/s at depth 5246) for -18 % prompt and 6
-# layers moved to the CPU. It was the largest single lever measured on this
-# host (+97.8 % on the Vega-only path). The draft head runs on the CPU
-# (-ngld 0): the 1070 has no room for it, and the default -1 would offload the
-# 1.37 GB draft file to VRAM and breach the display cap.
-MTP="${MTP:-1}"
-MD="${MD:-$ROOT/models/mtp-Qwen3.8-27B-Q4_0.gguf}"
-NGLD="${NGLD:-0}"
+# All layers, plus the output layer and the MTP head, on the Metal device.
+NGL="${NGL:-99}"
 
-# The eGPU is required, not optional: /dev/nvidia0 exists only once the
-# proprietary driver has bound the card, so this is an instant check (no
-# nvidia-smi spawn).
-if [ ! -c /dev/nvidia0 ] || [ ! -x "$ROOT/build/bin/llama-bench" ] \
-   || ! "$ROOT/build/bin/llama-bench" --list-devices 2>/dev/null | grep -q '^  CUDA0:'; then
-    echo "serve: no CUDA eGPU: /dev/nvidia0 is missing or no CUDA0 backend is built." >&2
-    echo "serve: this configuration splits one 27B model across the GTX 1070 and the" >&2
-    echo "serve: Vega 10; the Vega 10 alone cannot hold ${CTX} tokens of context under" >&2
-    echo "serve: the ${CAP} MiB display cap. Build with GGML_CUDA=ON (see README)." >&2
-    exit 1
-fi
+# The CPU only touches the token embedding, the SSM/conv step of the
+# linear-attention layers and sampling. Measured on this machine: 4 is best for
+# prefill (758 t/s vs 716 at 6, 529 at 18), and generation is flat from 4 to 18
+# because the Metal device does that work. Anything in 4..12 is equivalent; the
+# 12 performance cores cost more in contention than they return.
+THREADS="${THREADS:-4}"
 
-DEV="CUDA0,Vulkan0"
-# -ts 4,1 keeps the Vega 10's share small enough to stay under the display
-# cap. It is NOT the documented ratio: measured layer counts land nearer 2:1,
-# because non-layer tensors go to the primary device. Tuned empirically.
-TS="${TS:-4,1}"
-# Measured: 40 layers fit at 8k context, 32 at 128k. Interpolate linearly in
-# context length between those two points; override NGL to depart from it.
-# MTP needs ~900 MiB of CUDA compute buffer that the 1070 does not have at that
-# count: at 128k `-ngl 32` aborts in `cudaMalloc` for a 901 MiB pp buffer, and
-# at 8k `-ngl 40` fails the same way. Six layers (~1.5 GB) of headroom clears it
-# at both ends — measured startable at 26 (128k) and 34 (8k), not at 32/40.
-# The reserve applies to the derived count only; an explicit NGL is honoured.
-NGL_OVERRIDE="${NGL:-}"
-NGL="${NGL:-$(( 40 - (CTX - 8192) / 15360 ))}"
-if [ "$MTP" = 1 ] && [ -z "$NGL_OVERRIDE" ]; then
-    NGL=$(( NGL - 6 ))
-fi
-[ "$NGL" -lt 8 ] && NGL=8
-
-# `-lm dio` reads the weights with O_DIRECT; measured ~12 % faster on prompt
-# than the mmap default and ~40x lighter in RSS. `-lm none` is a close second.
-LM="${LM:-dio}"
-# Measured at depth 4096: the llama-server default 2048/512 is fastest on prompt.
+# mmap is the default and the right answer: zero-copy into Metal buffers and
+# shared between instances. `-lm none` costs a full 15.4 GB read per process.
+LM="${LM:-mmap}"
 BATCH="${BATCH:-2048}"
 UBATCH="${UBATCH:-512}"
-# Measured: KV dtype is free at depth 0 and worth ~9.6 % generation at depth
-# 8192; at 128k a quantized cache is mandatory (~8.6 GB f16 vs ~2.4 GB q4_0).
-# A quantized V cache REQUIRES flash attention.
-CTK="${CTK:-q4_0}"
-CTV="${CTV:-q4_0}"
+
+# f16 KV is affordable at 128k here (see above) and is the fastest option --
+# no per-token dequantization, and Metal works natively in f16. Use q8_0/q4_0
+# to trade a little speed for a much smaller cache when running many instances.
+CTK="${CTK:-f16}"
+CTV="${CTV:-f16}"
 FA="${FA:-on}"
+
+# MTP speculation: the biggest single lever on the Intel host (+97.8 %) and it
+# is cheaper here, because the draft head is offloaded to the GPU too (-ngld
+# 99) instead of running on the CPU. Default draft file is the sidecar when it
+# is present; otherwise the main GGUF's own blk.64.nextn.* tensors are used by
+# `--spec-type draft-mtp` with no -md.
+MTP="${MTP:-1}"
+MD="${MD:-$ROOT/models/mtp-Qwen3.8-27B-Q4_0.gguf}"
+NGLD="${NGLD:-99}"
+
+SWAPCAP="${SWAPCAP:-0}"
 
 mkdir -p "$ROOT/logs"
 
-echo "serve: model=$(basename "$MODEL") ctx=$CTX threads=$THREADS"
-echo "serve: dev=$DEV -ts $TS -ngl=$NGL -lm=$LM -b $BATCH -ub $UBATCH -ctk $CTK -ctv $CTV -fa $FA"
-if [ "$MTP" = 1 ]; then
-    echo "serve: mtp=on draft=$(basename "$MD") ngld=$NGLD (-ngl reduced by 6 for the draft's CUDA compute buffer)"
-else
-    echo "serve: mtp=off"
+if [ ! -x "$SERVER" ]; then
+    echo "serve: $SERVER is missing. Build it: ./scripts/build.sh" >&2
+    exit 1
 fi
-echo "serve: cap=${CAP}MiB (display GPU)  http://$HOST:$PORT  log: $ROOT/logs/serve.log"
+if ! "$ROOT/build/bin/llama-bench" --list-devices 2>/dev/null | grep -qi 'MTL'; then
+    echo "serve: no Metal device reported by llama-bench --list-devices." >&2
+    echo "serve: rebuild with ./scripts/build.sh (GGML_METAL=ON)." >&2
+    exit 1
+fi
 
 MTP_ARGS=()
 if [ "$MTP" = 1 ]; then
-    MTP_ARGS=(--spec-type draft-mtp -md "$MD" -ngld "$NGLD")
+    if [ -f "$MD" ]; then
+        MTP_ARGS=(--spec-type draft-mtp -md "$MD" -ngld "$NGLD")
+    else
+        echo "serve: $MD not found; using the main GGUF's embedded MTP tensors" >&2
+        MTP_ARGS=(--spec-type draft-mtp -ngld "$NGLD")
+    fi
 fi
 
-exec python3 "$ROOT/scripts/guard.py" --cap-mib "$CAP" --label serve \
-    --log "$ROOT/logs/serve.log" -- \
-    "$ROOT/build/bin/llama-server" \
-    -m "$MODEL" -ngl "$NGL" -c "$CTX" -t "$THREADS" \
-    -dev "$DEV" -sm layer -ts "$TS" \
-    -lm "$LM" -b "$BATCH" -ub "$UBATCH" \
-    -ctk "$CTK" -ctv "$CTV" -fa "$FA" \
-    "${MTP_ARGS[@]}" \
-    --host "$HOST" --port "$PORT" "$@"
+# KV cache size per instance, for the memory line. 16 full-attention layers x
+# 4 kv heads x 256 dims x 2 tensors, at the dtype's bytes/element per 128k.
+kv_bytes_per_tok() {
+    case "$1" in
+        f16|bf16) echo 2 ;;
+        q8_0)     echo 1 ;;
+        q4_0)     echo 0.5 ;;
+        *)        echo 2 ;;
+    esac
+}
+BYTES=$(python3 -c "print(2*16*4*256*($(kv_bytes_per_tok "$CTK")+$(kv_bytes_per_tok "$CTV"))/2)")
+KV_MIB=$(python3 -c "print(int($CTX*$BYTES/1048576))")
+
+echo "serve: model=$(basename "$MODEL") ctx=$CTX instances=$INSTANCES threads=$THREADS"
+echo "serve: -ngl $NGL -lm $LM -b $BATCH -ub $UBATCH -ctk $CTK -ctv $CTV -fa $FA"
+if [ "$MTP" = 1 ]; then
+    echo "serve: mtp=on (draft on GPU, -ngld $NGLD) $([ -f "$MD" ] && basename "$MD" || echo 'embedded nextn tensors')"
+else
+    echo "serve: mtp=off"
+fi
+echo "serve: kv≈${KV_MIB} MiB/instance -> weights 15.4 GB shared + ${INSTANCES}x(${KV_MIB} MiB kv + ~2.5 GB compute)"
+echo "serve: swap-cap=${SWAPCAP}MiB  http://$HOST:$PORT..$((PORT + INSTANCES - 1))  logs: $ROOT/logs/serve.$PORT.log"
+
+for i in $(seq 0 $((INSTANCES - 1))); do
+    port=$((PORT + i))
+    python3 "$ROOT/scripts/guard.py" --swap-cap-mib "$SWAPCAP" \
+        --log "$ROOT/logs/serve.$port.log" -- \
+        "$SERVER" \
+        -m "$MODEL" -ngl "$NGL" -c "$CTX" -t "$THREADS" \
+        -lm "$LM" -b "$BATCH" -ub "$UBATCH" \
+        -ctk "$CTK" -ctv "$CTV" -fa "$FA" \
+        "${MTP_ARGS[@]}" \
+        --host "$HOST" --port "$port" "$@" &
+done
+
+# Ctrl-C must reach every server: kill the whole group, which lets each guard
+# forward the signal to its own child.
+trap 'kill 0' INT TERM
+wait

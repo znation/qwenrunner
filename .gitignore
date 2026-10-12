@@ -7,19 +7,10 @@ models/
 build/
 third_party/
 
-# Unpacked Debian shader tooling (glslc / libshaderc / spirv-headers).
-# Recreate per README "Prerequisites".
-tools/
-
 # Scratch
 __pycache__/
 *.pyc
 *.pyo
 
-# Raw kernel-log dump. Contains a MAC address and the interface name derived
-# from it, so it is not published; the relevant NVRM/BAR excerpts are quoted in
-# README.md and RESULTS.md instead.
-dmesg.log
-
-# this one will change on every ./serve.sh run I think?
+# Rewritten on every ./serve.sh run.
 logs/serve.log
