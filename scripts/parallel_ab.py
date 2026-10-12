@@ -72,9 +72,28 @@ class Fleet:
     def __init__(self, args, n, first_port):
         self.args = args
         self.n = n
-        self.ports = [first_port + i for i in range(n)]
+        self.mode = args.mode
+        # slots mode: one process, one weight set, N slots each with its own
+        # CTX of KV (-c is the total, so it scales with N).
+        self.ports = [first_port] if self.mode == "slots" else [first_port + i for i in range(n)]
         self.procs = []
         self.logs = []
+
+    def argv_for(self, port):
+        args = self.args
+        cmd = [SERVER, "-m", args.model, "-ngl", str(args.ngl),
+               "-t", str(args.threads), "-b", str(args.batch), "-ub", str(args.ubatch),
+               "-ctk", args.ctk, "-ctv", args.ctv, "-fa", args.fa,
+               "--host", "127.0.0.1", "--port", str(port),
+               "--seed", "42", "-lv", "1"]
+        if self.mode == "slots":
+            cmd += ["-np", str(self.n), "-c", str(args.ctx * self.n)]
+        else:
+            cmd += ["-np", "1", "-c", str(args.ctx)]
+        if args.mtp:
+            cmd += ["--spec-type", "draft-mtp", "-md", args.draft,
+                    "-ngld", "99", "--spec-draft-n-max", str(args.nmax)]
+        return cmd
 
     def start(self, timeout):
         """Start servers one at a time, waiting for each to be healthy.
@@ -97,16 +116,7 @@ class Fleet:
                 pass
             log = os.path.join(ROOT, "logs", "parallel.%d.log" % port)
             self.logs.append(log)
-            cmd = [SERVER, "-m", self.args.model, "-ngl", str(self.args.ngl),
-                   "-c", str(self.args.ctx), "-t", str(self.args.threads),
-                   "-b", str(self.args.batch), "-ub", str(self.args.ubatch),
-                   "-ctk", self.args.ctk, "-ctv", self.args.ctv,
-                   "-fa", self.args.fa,
-                   "--host", "127.0.0.1", "--port", str(port),
-                   "--seed", "42", "-np", "1", "-lv", "1"]
-            if self.args.mtp:
-                cmd += ["--spec-type", "draft-mtp", "-md", self.args.draft,
-                        "-ngld", "99"]
+            cmd = self.argv_for(port)
             out_f = open(log, "wb")
             self.procs.append((subprocess.Popen(
                 cmd, stdout=out_f, stderr=subprocess.STDOUT,
@@ -168,7 +178,8 @@ def measure(args, n):
 
     dead = [port for (p, _), port in zip(fleet.procs, fleet.ports) if p.poll() is not None]
     prompt = open(os.path.join(ROOT, args.prompt_file)).read()
-    rec = {"instances": n, "load_s": load_s, "ports": fleet.ports,
+    rec = {"instances": n, "mode": args.mode, "load_s": load_s,
+           "ports": fleet.ports,
            "dead_at_measure": dead,
            "rss_total_mib": round(rss_after_load, 1),
            "gpu_mem_mib": None if gpu_mib is None else round(gpu_mib, 1),
@@ -183,8 +194,10 @@ def measure(args, n):
     threads = []
 
     def worker(i):
-        results[i] = one_stream(fleet.ports[i], prompt, args.n_predict,
-                                args.gen_timeout)
+        # slots mode serves every request from the one port; procs mode spreads
+        # them one per server.
+        results[i] = one_stream(fleet.ports[i % len(fleet.ports)], prompt,
+                                args.n_predict, args.gen_timeout)
 
     wall0 = time.time()
     for i in range(n):
@@ -216,6 +229,10 @@ def main(argv=None):
     ap.add_argument("--draft", default="models/mtp-Qwen3.8-27B-Q4_0.gguf")
     ap.add_argument("--instances", default="1,2,4",
                     help="comma-separated instance counts to measure in order")
+    ap.add_argument("--mode", choices=("procs", "slots"), default="procs",
+                    help="procs: N llama-server processes, one request each. "
+                         "slots: ONE process with -np N slots (one weight set "
+                         "and one set of compute buffers), -c scaled to N x CTX")
     ap.add_argument("--port", type=int, default=8180)
     ap.add_argument("--ctx", type=int, default=131072)
     ap.add_argument("--ngl", type=int, default=99)
@@ -226,6 +243,8 @@ def main(argv=None):
     ap.add_argument("--ctv", default="f16")
     ap.add_argument("--fa", default="on")
     ap.add_argument("--mtp", type=int, default=1)
+    ap.add_argument("--nmax", type=int, default=6,
+                    help="--spec-draft-n-max for the MTP arms")
     ap.add_argument("--n-predict", type=int, default=128)
     ap.add_argument("--prompt-file", default="data/long_prompt.txt")
     ap.add_argument("--load-timeout", type=float, default=1800.0)
@@ -246,9 +265,9 @@ def main(argv=None):
         if rec.get("error"):
             print("    FAILED: %s" % rec["error"])
         else:
-            print("    rss=%.1f GiB gpu=%.1f GiB load=%.0fs  single=%.2f t/s  "
+            print("    mode=%s rss=%.1f GiB gpu=%.1f GiB load=%.0fs  single=%.2f t/s  "
                   "concurrent: aggregate=%.2f t/s, per-stream=%.2f t/s (wall %.1fs)"
-                  % (rec["rss_total_mib"] / 1024.0,
+                  % (rec.get("mode", "?"), rec["rss_total_mib"] / 1024.0,
                      0.0 if rec["gpu_mem_mib"] is None else rec["gpu_mem_mib"] / 1024.0,
                      rec["load_s"], rec["single"].get("predicted_per_second") or 0,
                      rec["aggregate_tps"], rec["per_stream_mean_tps"],
@@ -258,16 +277,17 @@ def main(argv=None):
             with open(os.path.join(ROOT, args.json), "a") as f:
                 f.write(json.dumps(rec, sort_keys=True) + "\n")
 
-    print("\n| instances | kv | sum(RSS) GiB | single t/s | aggregate t/s | "
+    print("\n| instances | mode | kv | sum(RSS) GiB | single t/s | aggregate t/s | "
           "per-stream t/s | streams failing |")
-    print("|---|---|---|---|---|---|---|")
+    print("|---|---|---|---|---|---|---|---|")
     for rec in recs:
         if rec.get("error"):
-            print("| %d | %s | - | - | FAILED: %s | - | - |" % (
-                rec["instances"], rec.get("ctk", "?"), rec["error"]))
+            print("| %d | %s | %s | - | - | FAILED: %s | - | - |" % (
+                rec["instances"], rec.get("mode", "?"), rec.get("ctk", "?"), rec["error"]))
             continue
-        print("| %d | %s | %.1f | %.2f | %.2f | %.2f | %d%s |" % (
-            rec["instances"], rec.get("ctk", "?"), rec["rss_total_mib"] / 1024.0,
+        print("| %d | %s | %s | %.1f | %.2f | %.2f | %.2f | %d%s |" % (
+            rec["instances"], rec.get("mode", "?"), rec.get("ctk", "?"),
+            rec["rss_total_mib"] / 1024.0,
             rec["single"].get("predicted_per_second") or 0,
             rec["aggregate_tps"], rec["per_stream_mean_tps"],
             rec.get("stream_errors", 0),

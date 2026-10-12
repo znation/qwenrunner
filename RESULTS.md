@@ -429,6 +429,60 @@ large — the single-stream figure for the *1-instance* configuration was 42.0
 t/s in one measurement and 53.5 t/s in the next, a 27 % gap with nothing
 changed — so treat these as ±25 %, and read the shape rather than the digits.
 
+## Parallel prompts — `-np` slots vs N processes
+
+Two mechanisms serve N prompts at once, and they are not equivalent.
+`results/parallel_slots.jsonl`, measured on the current defaults
+(`-b 1024 -ub 256`, `-ngl 99`, f16 KV, MTP `n_max=3`), 128 prompts each,
+128k context *per slot*:
+
+| N | mechanism | total RSS | GPU (summed) | load | single | aggregate | per-stream |
+|---|---|---|---|---|---|---|---|
+| 2 | `-np 2`, one process | 34.0 GiB | 37.9 GiB | 4 s | 53.05 | 59.53 | 29.77 |
+| 4 | `-np 4`, one process | 52.2 GiB | 58.2 GiB | 5 s | 43.78 | 52.89 | 13.22 |
+| **6** | `-np 6`, one process | **70.4 GiB** | 78.6 GiB | 11 s | 43.72 | 53.16 | 8.86 |
+| 2 | 2 processes | 49.8 GiB | 53.8 GiB | 8 s | 49.20 | 55.48 | 27.74 |
+| 4 | 4 processes | 99.7 GiB | 105.6 GiB | 13 s | 59.44 | 66.94 | 16.73 |
+| 6 | 6 processes | — | — | — | — | Metal OOM | — |
+
+**Slots are the cheap axis.** Six slots in one process run where six processes
+die: one process holds one weight mapping and one set of compute buffers, so
+each additional 128k slot costs ~9.4 GiB of resident memory (14.3 GiB weights +
+6 x 8 GiB KV + compute = 70.4 GiB measured), against ~22 GiB of summed RSS per
+extra process — and the summed *GPU* figure, which is what the Metal
+out-of-memory was actually about, stays at 78.6 GiB instead of exceeding the
+~112 GiB working-set budget. Loading is also 2-3x faster (4-11 s against
+8-13 s) because the weights are mapped once. A single process verifies this
+itself: `-np 2` logs `n_slots = 2, n_ctx_slot = 131072, kv_unified = 'false'`,
+so `-c` must be scaled to `CTX * NP` to keep every slot at full context — which
+is exactly what `serve.sh` now does.
+
+Aggregate throughput, though, is a property of the *workload*, not of the
+mechanism. On the README-continuation prompt used above — where MTP accepts
+94-99 % of drafts and a single stream already runs at 53-59 t/s — parallelism
+just divides: per-stream falls 53.0 -> 13.2 -> 8.9 as N goes 2 -> 4 -> 6 and
+aggregate sits near 53-60 t/s. Two concurrent requests on a *code* prompt with
+`NP=2` behaved differently:
+
+```
+A: tg 44.29 t/s  draft 100/146     (write a Python function to reverse a linked list)
+B: tg 46.78 t/s  draft 102/139     (write a SQL query to find duplicate emails)
+```
+
+aggregate ~91 t/s against 44-73 t/s for one stream on the same kind of prompt.
+Where the single stream is already GPU-saturated (high-acceptance structured
+continuation) concurrency costs; where it is not (lower acceptance, more
+compute per token) concurrency *adds* until the GPU saturates. Both are real,
+and which one you get depends on the traffic.
+
+**Recommendation.** `serve.sh` defaults to `NP=1` and `INSTANCES=1`, because
+each slot reserves its full KV up front (8 GiB per 128k slot) whether or not a
+client is connected — paying 32 GiB for four idle slots is the wrong default for
+one user. For N concurrent clients: `NP=N` (one port, one process, cheapest
+memory, most slots) or `INSTANCES=N` (N ports, separate processes, marginally
+better measured per-stream at N=4 but half the headroom and a hard ceiling at
+4). Pick slots for capacity, processes for isolation.
+
 ## What was discarded
 
 * **`-ngl 0` took 830 s** for one arm (2 reps of pp512 + tg128 on 18 CPU

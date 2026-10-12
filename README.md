@@ -30,7 +30,7 @@ discarded and why.
 | batch | **`-b 1024 -ub 256`** at depth, `-b 2048 -ub 512` if you only ever prefill shallow | at 98.6k depth with MTP: generation **37.45 vs 28.52 t/s (+31 %)** against 2048/512, prefill level (349 vs 340); the same pair wins both axes at 64k. Only shallow prefill prefers 2048/512 (709.6 vs 633.3). See `RESULTS.md` |
 | MTP | **on**, `--spec-type draft-mtp -md models/mtp-Qwen3.8-27B-Q4_0.gguf -ngld 99`, `NMAX=3` | draft on the GPU. **The gain is a property of the text, not the machine**: +180 % on patterned text (markdown/code/JSON, 99 % draft acceptance) and **−11 % on free-form prose** (14 %). `NMAX=6` is a further +40 % on structured/code traffic — the agent case this repo serves — but costs more on prose; `MTP=0` is the prose setting. Numbers in `RESULTS.md` |
 | context | **128k** (`-c 131072`) | 14.3 t/s generation and 176–231 t/s prefill *at* depth 131072; costs ~8 GiB of KV with f16 |
-| instances | **`INSTANCES=N`** — independent servers, weights shared | each extra 128k server costs **+8.2 GiB physical**, not 22 GiB (RSS double-counts shared pages); 4 measured working, 6 dies of a Metal `Insufficient Memory`; aggregate saturates at ~68 t/s from N=2 while per-stream falls 33.6 → 17.1 t/s |
+| parallel prompts | **`NP=N`** (slots in one server) beats **`INSTANCES=N`** (processes) | 128k per slot: `-np 6` fits in **70.4 GiB** where 6 processes die of a Metal OOM, and loads 2-3x faster; aggregate is workload-dependent — flat ~53-60 t/s where one stream was already GPU-saturated, ~91 t/s aggregate for two concurrent *code* requests. Slots buy concurrency, not throughput |
 
 **Offload is the lever that no longer exists, and context is the one that
 stopped being expensive.** On the Intel host the whole design was built around
@@ -122,37 +122,49 @@ process group and records memory/CPU/GPU statistics for every run. The one
 thing it can still enforce is swap: `SWAPCAP=<MiB>` SIGKILLs on new swap, off
 by default because nothing here should swap.
 
-### Running more than one server
+### Running more than one prompt at once
 
-Each server is a complete 128k-context instance. The weights are *shared*:
-the default `-lm mmap` maps the GGUF once, and the file-backed pages are the
-same physical pages for every process. Measured, at 128k with f16 KV:
+Two mechanisms, and they are not equivalent. `NP=N` runs N parallel slots
+inside **one** server (one port, one weight mapping, one set of compute
+buffers); `INSTANCES=N` runs N separate servers on N ports.
 
-| | host memory | file-backed pages |
-|---|---|---|
-| idle | 42.8 GiB | 35.1 GiB |
-| + 1st server | **+15.1 GiB** | 21.1 GiB |
-| + 2nd server | **+8.2 GiB** | 21.1 GiB |
+```
+NP=4 ./serve.sh                  # one server, four parallel 128k slots
+INSTANCES=4 ./serve.sh           # four servers, ports 8080-8083
+```
 
-So an extra instance costs its KV cache (8 GiB at 128k f16) and a little
-compute — not another 14.29 GiB. `INSTANCES=4` is the largest configuration
-measured to work; 6 fails with a Metal `Insufficient Memory` even though the
-host is nowhere near its 128 GB. `CTK=q8_0 CTV=q8_0` halves the KV and is the
-lever to pull if you need more instances rather than a faster stream.
+Measured, 128k context per slot, MTP on, current defaults:
 
-Throughput, measured, MTP on:
+| N | mechanism | total RSS | load | aggregate t/s | per-stream t/s |
+|---|---|---|---|---|---|
+| 2 | `-np 2` | 34.0 GiB | 4 s | 59.5 | 29.8 |
+| 4 | `-np 4` | 52.2 GiB | 5 s | 52.9 | 13.2 |
+| **6** | `-np 6` | **70.4 GiB** | 11 s | 53.2 | 8.9 |
+| 2 | 2 processes | 49.8 GiB | 8 s | 55.5 | 27.7 |
+| 4 | 4 processes | 99.7 GiB | 13 s | 66.9 | 16.7 |
+| 6 | 6 processes | — | — | Metal OOM | — |
 
-| instances | aggregate t/s | per-stream t/s |
-|---|---|---|
-| 1 | 53.5 | 53.5 |
-| 2 | 67.2 | 33.6 |
-| 4 | 68.3 | 17.1 |
+**Slots are the cheap axis: `-np 6` fits where 6 processes die of a Metal
+out-of-memory**, at 70 GiB instead of beyond the ~112 GiB working-set budget,
+and it loads 2-3x faster. `serve.sh` scales `-c` to `CTX x NP` so every slot
+keeps the full 128k — verified in the server log as
+`n_slots = 6, n_ctx_slot = 131072`.
 
-**Aggregate generation saturates at two instances.** Decode is
-bandwidth-bound — the whole weight set is streamed per token — and one GPU has
-one bandwidth budget, so N servers buy concurrency (N idle-most-of-the-time
-agent sessions), not total throughput. Spread on identical work is ±25 %, so
-read the shape rather than the digits.
+What parallelism does to speed depends on the workload, not the mechanism:
+
+* On text the draft head predicts well, a single stream is already near the
+  GPU's limit and N streams just divide it (per-stream 29.8 -> 13.2 -> 8.9 for
+  N = 2 -> 4 -> 6, aggregate flat at ~53-60 t/s).
+* On code, where acceptance is lower and each token costs more compute, two
+  concurrent requests measured **44.3 and 46.8 t/s — ~91 t/s aggregate**, above
+  any single-stream figure for the same kind of prompt. Concurrency *added*.
+
+Neither is the wrong answer: N slots buy concurrency. Use them when N clients
+each idle most of the time; do not expect N times the throughput of one.
+
+The defaults stay `NP=1`/`INSTANCES=1` because every slot reserves its full KV
+up front — 8 GiB per 128k slot whether or not anyone is connected, so four idle
+slots cost 32 GiB. Set them when you have clients.
 
 ## Harness
 
@@ -163,7 +175,7 @@ read the shape rather than the digits.
 | `scripts/guard.py` | guarded runner + measurement: RSS, swap, host/GPU utilization, `bg_cpu_pct`, `gpu_busy_pct_peak` |
 | `scripts/bench.py` | `llama-bench` sweeps: `ngl`, `fa`, `kv`, `depth`, `ctx`, `threads`, `batch`, `load`, `nkvo`, `nopo`, `quant` |
 | `scripts/mtp_ab.py` | MTP A/B over HTTP, with `--server-extra` for arbitrary flags |
-| `scripts/parallel_ab.py` | how many 128k servers fit, and what N instances does to throughput |
+| `scripts/parallel_ab.py` | `-np N` slots vs N processes: how many 128k slots fit, and what N does to throughput |
 | `scripts/quant_compare.sh` | throughput + perplexity across quants |
 | `scripts/wait_idle.py` | block until the GPU — or the host CPU — goes quiet |
 | `scripts/gguf_head.py` | read GGUF metadata from a local file or a remote URL |

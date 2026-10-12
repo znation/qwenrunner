@@ -23,13 +23,15 @@
 # 128k-context server; weights are shared through the page cache.
 #
 # Overridable via env (anything unset is derived):
-#   MODEL CTX INSTANCES PORT THREADS HOST NGL LM BATCH UBATCH CTK CTV FA MTP MD NMAX
-#   NGLD NMAX SWAPCAP
+#   MODEL CTX NP INSTANCES PORT THREADS HOST NGL LM BATCH UBATCH CTK CTV FA
+#   MTP MD NGLD NMAX SWAPCAP
 #
-#   ./serve.sh                      # one server, 128k context, MTP on
-#   INSTANCES=4 ./serve.sh          # four 128k servers, ports 8080-8083
+#   ./serve.sh                      # one server, one slot, 128k, MTP on
+#   NP=4 ./serve.sh                 # one server, four parallel 128k slots
+#   INSTANCES=4 ./serve.sh          # four servers, ports 8080-8083
+#   NMAX=6 ./serve.sh               # deeper speculation for code/agent traffic
 #   MTP=0 ./serve.sh                # no speculative decoding
-#   CTK=q8_0 CTV=q8_0 ./serve.sh    # halve the KV cache per instance
+#   CTK=q8_0 CTV=q8_0 ./serve.sh    # halve the KV cache per slot
 # Extra args are appended verbatim to every llama-server command line.
 set -euo pipefail
 
@@ -50,6 +52,15 @@ CTX="${CTX:-131072}"
 # ~2-3 GiB of Metal compute buffers: the 15.4 GB of weights are mapped once and
 # shared by every process. Budget = weights + INSTANCES x (KV + compute).
 INSTANCES="${INSTANCES:-1}"
+
+# Parallel slots *within* one server (-np). This is the cheaper way to serve N
+# concurrent prompts: one process, one weight set, one set of compute buffers,
+# one port. Measured at 128k per slot, -np 6 fits in 70 GiB where 6 *processes*
+# die of a Metal out-of-memory (they sum to >112 GiB of per-process
+# allocations) -- see RESULTS.md, "Parallel prompts". -c is the total, so it
+# scales with NP to keep every slot at full CTX.
+NP="${NP:-1}"
+TOTAL_CTX=$(( CTX * NP ))
 PORT="${PORT:-8080}"
 HOST="${HOST:-127.0.0.1}"
 
@@ -135,14 +146,14 @@ kv_bytes_per_tok() {
 BYTES=$(python3 -c "print(2*16*4*256*($(kv_bytes_per_tok "$CTK")+$(kv_bytes_per_tok "$CTV"))/2)")
 KV_MIB=$(python3 -c "print(int($CTX*$BYTES/1048576))")
 
-echo "serve: model=$(basename "$MODEL") ctx=$CTX instances=$INSTANCES threads=$THREADS"
+echo "serve: model=$(basename "$MODEL") ctx=$CTX/slot slots=$NP instances=$INSTANCES threads=$THREADS"
 echo "serve: -ngl $NGL -lm $LM -b $BATCH -ub $UBATCH -ctk $CTK -ctv $CTV -fa $FA"
 if [ "$MTP" = 1 ]; then
     echo "serve: mtp=on (draft on GPU, -ngld $NGLD) $([ -f "$MD" ] && basename "$MD" || echo 'embedded nextn tensors')"
 else
     echo "serve: mtp=off"
 fi
-echo "serve: kv≈${KV_MIB} MiB/instance -> weights 15.4 GB shared + ${INSTANCES}x(${KV_MIB} MiB kv + ~2.5 GB compute)"
+echo "serve: kv≈${KV_MIB} MiB/slot -> weights 15.4 GB shared + ${INSTANCES} server(s) x ${NP} slot(s) x (${KV_MIB} MiB kv)"
 echo "serve: swap-cap=${SWAPCAP}MiB  http://$HOST:$PORT..$((PORT + INSTANCES - 1))  logs: $ROOT/logs/serve.$PORT.log"
 
 for i in $(seq 0 $((INSTANCES - 1))); do
@@ -150,7 +161,7 @@ for i in $(seq 0 $((INSTANCES - 1))); do
     python3 "$ROOT/scripts/guard.py" --swap-cap-mib "$SWAPCAP" \
         --log "$ROOT/logs/serve.$port.log" -- \
         "$SERVER" \
-        -m "$MODEL" -ngl "$NGL" -c "$CTX" -t "$THREADS" \
+        -m "$MODEL" -ngl "$NGL" -c "$TOTAL_CTX" -np "$NP" -t "$THREADS" \
         -lm "$LM" -b "$BATCH" -ub "$UBATCH" \
         -ctk "$CTK" -ctv "$CTV" -fa "$FA" \
         "${MTP_ARGS[@]}" \
