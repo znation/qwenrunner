@@ -181,7 +181,8 @@ and two, which is what `parallel_ab.py` measures.
 | `--spec-type draft-mtp -md mtp-…Q4_0.gguf -ngld 99` | **579.71** | **40.40** | 47/48 | 27 720 | 6.1 |
 | `--spec-type draft-mtp` (no `-md`) | 484.61 | 37.90 | 47/48 | 26 434 | 3.0 |
 
-**MTP nearly doubles generation: 21.06 → 40.40 t/s (+92 %)**, and it does not
+**MTP speculation (on this prompt — see the caveat below) nearly doubles
+generation: 21.06 → 40.40 t/s (+92 %)**, and it does not
 cost prefill here (579.7 vs 507.4 — the draft head shares the same offload).
 That is a much larger win than the +29 % measured on the Intel two-GPU split,
 and for the predicted reason: there the draft head ran on the CPU (`-ngld 0`)
@@ -199,6 +200,170 @@ not assumed.
 
 Not measured: MTP at 128k *depth* (this row is at ~4k), and MTP with a
 quantized KV cache.
+
+## MTP's gain is a property of the text, not of the machine
+
+This is the most important caveat in the file. Everything above about MTP was
+measured on `data/long_prompt.txt` — the llama.cpp README, which is markdown
+with badges, tables and repeated link structure. The draft head predicts that
+kind of continuation almost perfectly, and prose it does not predict at all.
+`results/mtp_shape.jsonl` and `results/mtp_prose.jsonl`, 128k context, two reps
+each; structured = README continuation at 512 tokens, prose = a Project
+Gutenberg chapter at 256 tokens.
+
+| arm | structured t/s | acceptance | **prose t/s** | acceptance |
+|---|---|---|---|---|
+| base (`MTP=0`) | 26.9 | — | **24.6** | — |
+| MTP `--spec-draft-n-max 3` | 58.1 | 99 % | 23.8 | 26 % |
+| MTP `--spec-draft-n-max 4` | 68.0 | 98 % | 19.8 | 20 % |
+| MTP `--spec-draft-n-max 6` | **75.3** | 94 % | 21.9 | 14 % |
+
+Read the two columns together: **MTP is worth +180 % on patterned text and
+−11 % on prose**, and the draft depth that maximises one is the one that hurts
+the other. Deep speculation only pays when the draft is usually right; when
+acceptance is 14 %, six proposed tokens cost six verifications and return
+almost nothing. There is no adaptive escape: `--spec-draft-p-min 0.6` (which
+does work — it cut prose drafting from 821 tokens to 224) also cut the
+structured case from 75.3 to 57.5 t/s, because the confidence threshold that
+suppresses useless drafts on prose suppresses useful ones on code.
+
+For reference, the structured numbers are what the rest of this file uses, so
+the headline MTP figures (+92 %, +40 %) are *upper bounds for predictable text*,
+not averages. `serve.sh` defaults to `NMAX=3` — the upstream default and the
+setting that is never a regression on either workload — and `NMAX=6` is a
+documented win for code/agent traffic, which is what this repo is built to
+serve. `MTP=0` is the setting for prose.
+
+## Speculation depth — `--spec-draft-n-max`
+
+The default is `n_max = 3`. How many tokens the draft head is allowed to
+propose per step is the largest single knob left, and it is worth **+40 %**.
+`results/mtp_nmax_ab.jsonl`, five interleaved reps each, 512-token generations,
+128k context, draft on the GPU:
+
+| `--spec-draft-n-max` | generation t/s, per rep | mean |
+|---|---|---|
+| 3 (default) | 47.2 42.3 44.9 58.0 48.4 | **48.2** |
+| **6** | 67.6 58.3 86.6 63.8 61.3 | **67.5** |
+
+Every `n_max=6` run beat every `n_max=3` run — the worst 6 (58.3) exceeds the
+best 3 (58.0) — so this is a real effect and not the machine's drift.
+`results/mtp_nmax_hi.jsonl`, four more interleaved reps:
+
+| `--spec-draft-n-max` | t/s, per rep | mean | draft acceptance |
+|---|---|---|---|
+| 6 | 54.1 52.6 52.1 58.7 | **54.4** | 461/434 |
+| 9 | 52.0 47.5 34.2 49.4 | 45.8 | 510/454 |
+
+Going deeper than 6 loses: acceptance drops from ~97 % to ~89 % and the extra
+draft work is no longer repaid. `serve.sh` therefore ships
+`--spec-draft-n-max 6` (`NMAX=<n>` to override).
+
+Two measurement facts worth keeping:
+
+* **Acceptance is deterministic, timing is not.** All five `n_max=3` runs
+  accepted exactly 382 of 385 drafts, and all five `n_max=6` runs exactly 434 of
+  461 — temperature is 0 and the prompt is fixed — while throughput ranged
+  42.3–58.0 t/s. The scatter is the machine (other tenants, thermals), not the
+  measurement. It is why every comparison in this file is interleaved and why
+  the absolute level moves: the *same* `n_max=6` configuration measured 67.5
+  mean in one sweep and 54.4 in the next, 20 % apart, with nothing changed.
+  Compare within a sweep, never across sweeps.
+
+## Quant size — a smaller quant is *not* the lever it was
+
+`results/quant_m5.jsonl` (shallow, no MTP, `reps 2`) and
+`results/quant_mtp_m5.jsonl` (128k context, MTP, `--spec-draft-n-max 6`, two
+interleaved reps).
+
+| quant | weights | shallow pp512 / tg128 | 128k+MTP tg t/s, per rep | mean |
+|---|---|---|---|---|
+| **UD-Q4_K_S** | 14.29 GiB | 746.5 / 24.37 | 71.2, 93.2 | 82.2 |
+| UD-Q3_K_XL | 13.15 GB | 627.7 / 25.52 | 76.5, 97.8 | 87.2 |
+| UD-Q2_K_XL | 9.83 GB | 753.3 / 26.08 | 93.6, 97.4 | 95.5 |
+
+A 36 % smaller weight file buys **7 %** generation at shallow depth and at most
+**16 %** at the 128k operating point — and the two Q4 reps bracket the Q2 mean
+(93.2 vs 95.5), so the high end is inside the noise. That is a completely
+different result from the Intel host, where a smaller quant was worth +52 %
+generation, and the difference is the *mechanism*: there, a smaller quant fit
+more layers into 5 GB of VRAM, so it changed what ran on the GPU at all. Here
+nothing is left on the CPU to move, and decode at `-ngl 99` is not purely
+bandwidth-limited:
+
+* implied bandwidth at Q4_K_S shallow = 14.29 GiB x 24.37 t/s = **374 GB/s**,
+  roughly 70 % of the M5 Max's peak, so there is headroom left.
+* Q2_K_XL achieves only 256 GB/s at the same point — fewer bits per weight
+  means *more* dequantization work per byte, and the kernels get less efficient
+  as the format gets smaller.
+
+So `serve.sh` keeps Q4_K_S: the speed is nearly flat across quants and the
+quality is not. `scripts/dl_smaller.sh` fetches the others if you want to
+trade.
+
+## Batch and threads at 64k depth
+
+`results/batch_depth.jsonl`, `results/threads_depth.jsonl`; `-ngl 99 -fa on`,
+f16 KV, `-d 65536 -p 2048 -n 128`, one rep each, `bg_cpu_pct` 15–25 %.
+
+| `-b`/`-ub` | pp2048 t/s at depth | tg128 t/s at depth | (shallow pp / tg) |
+|---|---|---|---|
+| 2048/512 (default) | 289.17 | 17.76 | 709.56 / 25.54 |
+| 4096/1024 | 284.86 | 16.21 | 667.68 / 24.89 |
+| 4096/2048 | 259.99 | 16.12 | 583.03 / 28.34 |
+| 8192/2048 | 267.77 | 18.79 | 621.65 / 28.21 |
+| **1024/256** | **345.01** | **21.64** | 633.32 / 28.76 |
+
+At depth the small-batch configuration wins **both** axes (+19 % prefill and
++22 % generation over the default), which is the opposite of the shallow
+result, where `-b 2048 -ub 512` was the best prefill setting and `-b 1024 -ub
+256` the best generation one. The likely mechanism is attention working set:
+prefill at 65k depth is dominated by attention over the whole cache, and a
+smaller ubatch keeps that kernel's working set inside the GPU's caches.
+
+Threads at the same 64k depth disagree with the shallow sweep:
+
+| `-t` | pp2048 t/s at depth | tg128 t/s at depth | (shallow pp) |
+|---|---|---|---|
+| 4 | 271.64 | 18.37 | **758.00** |
+| 6 | 294.62 | 18.29 | 715.70 |
+| 8 | 286.74 | 16.57 | 693.03 |
+| 12 | **323.81** | 17.58 | 685.73 |
+| 18 | 317.91 | 20.27 | 528.66 |
+
+`-t 4` is the *worst* prefill setting at depth and the best at 0; `-t 18` is
+the worst shallow and near-best at depth. Both spreads are ~15 %, against 15–25 %
+background CPU load, so the honest reading is that **4–12 threads are
+indistinguishable at depth and only `-t 18` is clearly bad at shallow depth**.
+`serve.sh` keeps `-t 4`. Resolving this properly needs interleaved reps at 128k,
+which was not run.
+
+The same caveat applies to the batch table: it is one rep per arm at 64k depth.
+The section below re-measures the two interesting configurations at ~98k depth,
+which is what made `-b 1024 -ub 256` the default.
+
+### The same pair at the real operating point
+
+`results/batch128k_ab.jsonl`. A 98 591-token prompt (verified with
+`llama-tokenize`) against a 131 072-token server, MTP on with
+`--spec-draft-n-max 6`, `-t 4`, one rep each, back to back.
+
+| `-b`/`-ub` | prefill t/s | **generation t/s** | GPU peak MiB |
+|---|---|---|---|
+| 2048/512 | 339.96 | 28.52 | 30 266 |
+| **1024/256** | **349.01** | **37.45** | 29 706 |
+
+**+31 % generation at depth**, prefill level, for a slightly smaller footprint.
+That is the operating point `serve.sh` serves, so `-b 1024 -ub 256` is now its
+default; the shallow-prefill preference for 2048/512 (−11 %) is the cost, and a
+128k-context server spends its life generating rather than prefilling. The
+mechanism proposed above — a smaller ubatch keeping the long-context attention
+working set out of the GPU's cache thrash — is consistent with the win being
+larger at deeper context and absent at shallow.
+
+Caveat: one rep per arm. The direction is supported by both depth points (64k
+and 98k) and by the generation axis at shallow depth; the prefill-at-128k number
+specifically is a single measurement.
 
 ## Parallel instances
 

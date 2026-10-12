@@ -23,8 +23,8 @@
 # 128k-context server; weights are shared through the page cache.
 #
 # Overridable via env (anything unset is derived):
-#   MODEL CTX INSTANCES PORT THREADS HOST NGL LM BATCH UBATCH CTK CTV FA MTP MD
-#   NGLD SWAPCAP
+#   MODEL CTX INSTANCES PORT THREADS HOST NGL LM BATCH UBATCH CTK CTV FA MTP MD NMAX
+#   NGLD NMAX SWAPCAP
 #
 #   ./serve.sh                      # one server, 128k context, MTP on
 #   INSTANCES=4 ./serve.sh          # four 128k servers, ports 8080-8083
@@ -66,8 +66,13 @@ THREADS="${THREADS:-4}"
 # mmap is the default and the right answer: zero-copy into Metal buffers and
 # shared between instances. `-lm none` costs a full 15.4 GB read per process.
 LM="${LM:-mmap}"
-BATCH="${BATCH:-2048}"
-UBATCH="${UBATCH:-512}"
+# Measured at 98.6k depth with MTP on (the operating point this serves):
+# -b 1024 -ub 256 generates 37.45 t/s against 28.52 for -b 2048 -ub 512, a
+# +31 % win, with prefill level (349.0 vs 340.0). The same pair wins both axes
+# at 64k depth. Only *shallow* prefill prefers 2048/512 (709.6 vs 633.3), and a
+# server holding 128k contexts spends its time generating, not prefilling.
+BATCH="${BATCH:-1024}"
+UBATCH="${UBATCH:-256}"
 
 # f16 KV is affordable at 128k here (see above) and is the fastest option --
 # no per-token dequantization, and Metal works natively in f16. Use q8_0/q4_0
@@ -84,6 +89,14 @@ FA="${FA:-on}"
 MTP="${MTP:-1}"
 MD="${MD:-$ROOT/models/mtp-Qwen3.8-27B-Q4_0.gguf}"
 NGLD="${NGLD:-99}"
+# Depth of speculation. The default is 3, and it stays 3 here because MTP's
+# gain depends on the *text*, not the machine: measured at 128k context, MTP is
+# +180 % on patterned text (markdown/code/JSON, 99 % draft acceptance) and
+# -11 % on free-form prose (14 % acceptance), and the draft depth that
+# maximises one hurts the other. See RESULTS.md, "MTP's gain is a property of
+# the text". NMAX=6 is a further +40 % over 3 on structured/code traffic (the
+# agent case this repo serves); MTP=0 is the setting for prose.
+NMAX="${NMAX:-3}"
 
 SWAPCAP="${SWAPCAP:-0}"
 
@@ -102,10 +115,10 @@ fi
 MTP_ARGS=()
 if [ "$MTP" = 1 ]; then
     if [ -f "$MD" ]; then
-        MTP_ARGS=(--spec-type draft-mtp -md "$MD" -ngld "$NGLD")
+        MTP_ARGS=(--spec-type draft-mtp -md "$MD" -ngld "$NGLD" --spec-draft-n-max "$NMAX")
     else
         echo "serve: $MD not found; using the main GGUF's embedded MTP tensors" >&2
-        MTP_ARGS=(--spec-type draft-mtp -ngld "$NGLD")
+        MTP_ARGS=(--spec-type draft-mtp -ngld "$NGLD" --spec-draft-n-max "$NMAX")
     fi
 fi
 

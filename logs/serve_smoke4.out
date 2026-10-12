@@ -1,3 +1,0 @@
-serve: model=Qwen3.8-27B-UD-Q4_K_M.gguf ctx=8192 threads=8
-serve: dev=CUDA0,Vulkan0 -ts 4,1 -ngl=40 -lm=dio -b 2048 -ub 512 -ctk q4_0 -ctv q4_0 -fa on
-serve: cap=5000MiB (display GPU)  http://127.0.0.1:8085  log: /home/zach/qwenrunner/logs/serve.log

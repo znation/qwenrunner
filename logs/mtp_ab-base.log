@@ -1,17 +1,17 @@
-0.00.051.352 W srv  llama_server: security: no API key is set and CORS allows all origins (see https://github.com/ggml-org/llama.cpp/pull/25655)
-0.03.184.195 W model has unused tensor blk.64.attn_norm.weight (size = 20480 bytes) -- ignoring
-0.03.184.200 W model has unused tensor blk.64.post_attention_norm.weight (size = 20480 bytes) -- ignoring
-0.03.184.206 W model has unused tensor blk.64.attn_q.weight (size = 51609600 bytes) -- ignoring
-0.03.184.209 W model has unused tensor blk.64.attn_k.weight (size = 5570560 bytes) -- ignoring
-0.03.184.211 W model has unused tensor blk.64.attn_v.weight (size = 5570560 bytes) -- ignoring
-0.03.184.219 W model has unused tensor blk.64.attn_output.weight (size = 25804800 bytes) -- ignoring
-0.03.184.221 W model has unused tensor blk.64.attn_q_norm.weight (size = 1024 bytes) -- ignoring
-0.03.184.223 W model has unused tensor blk.64.attn_k_norm.weight (size = 1024 bytes) -- ignoring
-0.03.184.225 W model has unused tensor blk.64.ffn_gate.weight (size = 73113600 bytes) -- ignoring
-0.03.184.228 W model has unused tensor blk.64.ffn_down.weight (size = 73113600 bytes) -- ignoring
-0.03.184.230 W model has unused tensor blk.64.ffn_up.weight (size = 73113600 bytes) -- ignoring
-0.03.184.233 W model has unused tensor blk.64.nextn.eh_proj.weight (size = 43008000 bytes) -- ignoring
-0.03.184.236 W model has unused tensor blk.64.nextn.enorm.weight (size = 20480 bytes) -- ignoring
-0.03.184.238 W model has unused tensor blk.64.nextn.hnorm.weight (size = 20480 bytes) -- ignoring
-0.03.184.246 W model has unused tensor blk.64.nextn.shared_head_norm.weight (size = 20480 bytes) -- ignoring
-0.06.718.534 W srv          init: chat template supports preserving reasoning, it is enabled by default (may use more tokens, disable via --no-reasoning-preserve)
+0.00.035.884 W srv  llama_server: security: no API key is set and CORS allows all origins (see https://github.com/ggml-org/llama.cpp/pull/25655)
+0.00.487.470 W model has unused tensor blk.64.attn_norm.weight (size = 20480 bytes) -- ignoring
+0.00.487.477 W model has unused tensor blk.64.post_attention_norm.weight (size = 20480 bytes) -- ignoring
+0.00.487.485 W model has unused tensor blk.64.attn_q.weight (size = 51609600 bytes) -- ignoring
+0.00.487.487 W model has unused tensor blk.64.attn_k.weight (size = 5570560 bytes) -- ignoring
+0.00.487.489 W model has unused tensor blk.64.attn_v.weight (size = 5570560 bytes) -- ignoring
+0.00.487.497 W model has unused tensor blk.64.attn_output.weight (size = 25804800 bytes) -- ignoring
+0.00.487.501 W model has unused tensor blk.64.attn_q_norm.weight (size = 1024 bytes) -- ignoring
+0.00.487.503 W model has unused tensor blk.64.attn_k_norm.weight (size = 1024 bytes) -- ignoring
+0.00.487.505 W model has unused tensor blk.64.ffn_gate.weight (size = 73113600 bytes) -- ignoring
+0.00.487.507 W model has unused tensor blk.64.ffn_down.weight (size = 73113600 bytes) -- ignoring
+0.00.487.509 W model has unused tensor blk.64.ffn_up.weight (size = 73113600 bytes) -- ignoring
+0.00.487.512 W model has unused tensor blk.64.nextn.eh_proj.weight (size = 43008000 bytes) -- ignoring
+0.00.487.515 W model has unused tensor blk.64.nextn.enorm.weight (size = 20480 bytes) -- ignoring
+0.00.487.517 W model has unused tensor blk.64.nextn.hnorm.weight (size = 20480 bytes) -- ignoring
+0.00.487.524 W model has unused tensor blk.64.nextn.shared_head_norm.weight (size = 20480 bytes) -- ignoring
+0.01.740.105 W srv          init: chat template supports preserving reasoning, it is enabled by default (may use more tokens, disable via --no-reasoning-preserve)

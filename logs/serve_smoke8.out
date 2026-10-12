@@ -1,6 +1,0 @@
-serve: model=Qwen3.8-27B-UD-Q4_K_S.gguf ctx=131072 instances=1 threads=4
-serve: -ngl 99 -lm mmap -b 2048 -ub 512 -ctk f16 -ctv f16 -fa on
-serve: mtp=on (draft on GPU, -ngld 99) mtp-Qwen3.8-27B-Q4_0.gguf
-serve: kv≈8192 MiB/instance -> weights 15.4 GB shared + 1x(8192 MiB kv + ~2.5 GB compute)
-serve: swap-cap=0MiB  http://127.0.0.1:8080..8080  logs: /Users/zach/qwenrunner/logs/serve.8080.log
-{"bg_cpu_pct": 12.1, "cpu_busy_pct": 14.3, "exit_code": 0, "gpu_busy_pct_peak": 89, "gpu_mem_peak_mib": 29350.2, "log": "/Users/zach/qwenrunner/logs/serve.8080.log", "mem_peak_mib": 56261.3, "rss_peak_mib": 27348.4, "samples": 8, "signals": [15, 15, 15], "swap_baseline_mib": 14203.6, "swap_delta_mib": 0.0, "swap_peak_mib": 14203.6, "swap_violation": false, "timed_out": false, "tree_cpu_pct": 2.2, "wall_s": 8.832}

@@ -22,13 +22,13 @@ discarded and why.
 | lever | setting | evidence |
 |---|---|---|
 | runtime | llama.cpp @ `aa5e0092`, **Metal** + Accelerate/BLAS | one Metal device (`MTLGPUFamilyMetal4`, `has tensor = true`); no Vulkan/CUDA path exists here |
-| model | `models/Qwen3.8-27B-UD-Q4_K_S.gguf`, 14.29 GiB, 27.32 B params | measured 24.8 t/s generation, and the whole model fits *plus* 128k of KV |
+| model | `models/Qwen3.8-27B-UD-Q4_K_S.gguf`, 14.29 GiB, 27.32 B params | whole model fits *plus* 128k of KV. **Smaller quants are not faster here**: Q2_K_XL (9.83 GB, 36 % less weight traffic) buys just +7 % shallow and ≤+16 % at 128k, inside the run-to-run spread — decode at `-ngl 99` is not purely bandwidth-bound, so keep the quality |
 | `-ngl` | **99 — every layer, including `lm_head` and the MTP head** | pp512 680 t/s vs 416 at 64, 58 at 32, 21 at 0; tg 24.8 vs 17.1 at 64, 1.32 at 0. The last 3 layers are the two biggest matmuls in the model (vocab 248320 embedding/lm_head), worth +63 % prefill on their own |
 | `-fa` | **`on`** | pp512 705 vs 466 off (**+51 %**); generation equal at shallow depth (24.4 vs 23.0) |
 | KV cache | **`f16/f16` for a single 128k server**, `q8_0/q8_0` when running several | at 128k, f16 generates **14.3 t/s vs 12.9** for q8_0 and prefills faster (231 vs 222 t/s) but costs 4 GiB more per instance |
 | threads | **`-t 4`** | pp 758 vs 716 (t6), 693 (t8), 686 (t12), 529 (t18); generation flat from 4–18. The 12 performance cores cost more in contention than they return |
-| batch | **`-b 2048 -ub 512`** for prefill, `-b 1024 -ub 256` for generation | pp512 710 vs 583 at `-b 4096 -ub 2048`; but tg 28.8 vs 25.5. See "batch" in `RESULTS.md` — this is the one lever that trades the two axes against each other |
-| MTP | **on**, `--spec-type draft-mtp -md models/mtp-Qwen3.8-27B-Q4_0.gguf -ngld 99` | **+92 % generation: 21.06 → 40.40 t/s** at ~4k depth (47/48 drafts accepted), and prefill *rises* 507 → 580 t/s. On the Intel host the draft had to run on the CPU; here it fits on the GPU and the win is 3x larger |
+| batch | **`-b 1024 -ub 256`** at depth, `-b 2048 -ub 512` if you only ever prefill shallow | at 98.6k depth with MTP: generation **37.45 vs 28.52 t/s (+31 %)** against 2048/512, prefill level (349 vs 340); the same pair wins both axes at 64k. Only shallow prefill prefers 2048/512 (709.6 vs 633.3). See `RESULTS.md` |
+| MTP | **on**, `--spec-type draft-mtp -md models/mtp-Qwen3.8-27B-Q4_0.gguf -ngld 99`, `NMAX=3` | draft on the GPU. **The gain is a property of the text, not the machine**: +180 % on patterned text (markdown/code/JSON, 99 % draft acceptance) and **−11 % on free-form prose** (14 %). `NMAX=6` is a further +40 % on structured/code traffic — the agent case this repo serves — but costs more on prose; `MTP=0` is the prose setting. Numbers in `RESULTS.md` |
 | context | **128k** (`-c 131072`) | 14.3 t/s generation and 176–231 t/s prefill *at* depth 131072; costs ~8 GiB of KV with f16 |
 | instances | **`INSTANCES=N`** — independent servers, weights shared | each extra 128k server costs **+8.2 GiB physical**, not 22 GiB (RSS double-counts shared pages); 4 measured working, 6 dies of a Metal `Insufficient Memory`; aggregate saturates at ~68 t/s from N=2 while per-stream falls 33.6 → 17.1 t/s |
 
@@ -39,8 +39,10 @@ generation improvement over the CPU-only path and there is nothing left to
 offload. 128k of context, which cost a 73-minute prefill there, runs at 14.3
 t/s generation and 176–231 t/s prefill because only 16 of this model's 64
 blocks keep a growing cache. MTP speculation, the largest single win on the
-Intel host, is *bigger* still here (+92 % vs +29 %) because the draft head fits
-on the same GPU.
+Intel host, is larger still here — up to +180 % on patterned text, where the
+draft head's acceptance is 99 %, because the draft fits on the same GPU — but
+it is *harmful* on prose, which is why its knob is documented as a workload
+choice rather than a constant.
 
 Because 128 GB of unified memory holds this model many times over, the
 interesting questions moved from "what fits" to "how many servers can run and
