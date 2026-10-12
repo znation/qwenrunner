@@ -229,10 +229,12 @@ suppresses useless drafts on prose suppresses useful ones on code.
 
 For reference, the structured numbers are what the rest of this file uses, so
 the headline MTP figures (+92 %, +40 %) are *upper bounds for predictable text*,
-not averages. `serve.sh` defaults to `NMAX=3` — the upstream default and the
-setting that is never a regression on either workload — and `NMAX=6` is a
-documented win for code/agent traffic, which is what this repo is built to
-serve. `MTP=0` is the setting for prose.
+not averages. **`serve.sh` ships `NMAX=6`**, the setting that wins on the
+structured column, because that column is the workload this repo exists for: an
+agent client with tool schemas and a long transcript, emitting code and JSON.
+The prose regression is real and is the price of that choice — `NMAX=3` (the
+upstream default, never a regression either way) or `MTP=0` are the settings
+for free-form prose, one env var away.
 
 ## Speculation depth — `--spec-draft-n-max`
 
@@ -475,13 +477,15 @@ continuation) concurrency costs; where it is not (lower acceptance, more
 compute per token) concurrency *adds* until the GPU saturates. Both are real,
 and which one you get depends on the traffic.
 
-**Recommendation.** `serve.sh` defaults to `NP=1` and `INSTANCES=1`, because
-each slot reserves its full KV up front (8 GiB per 128k slot) whether or not a
-client is connected — paying 32 GiB for four idle slots is the wrong default for
-one user. For N concurrent clients: `NP=N` (one port, one process, cheapest
-memory, most slots) or `INSTANCES=N` (N ports, separate processes, marginally
-better measured per-stream at N=4 but half the headroom and a hard ceiling at
-4). Pick slots for capacity, processes for isolation.
+**Recommendation.** `serve.sh` defaults to `NP=4` and `INSTANCES=1`: the repo
+exists to serve a handful of concurrent agent sessions, and slots are the cheap
+way to do it. Each slot reserves its full KV up front — 8 GiB per 128k slot, so
+32 GiB for four whether or not a client is connected — which is the price of
+that default; `NP=1 CRAM=8192 ./serve.sh` is the single-session configuration.
+For N concurrent clients: `NP=N` (one port, one process, cheapest memory, most
+slots) or `INSTANCES=N` (N ports, separate processes, marginally better measured
+per-stream at N=4 but half the headroom and a hard ceiling at 4). Pick slots for
+capacity, processes for isolation.
 
 ### The N=4 gap is real but small, and it is confounded
 
@@ -527,7 +531,7 @@ Measured with ~30 000-token prompts, `NP=1`:
 | A, then A + 19 tokens | **the agent turn** (append and re-send) | **19** | **0.41 s** |
 | A, B, A (default 8192) | eviction + restore by the RAM cache | 3rd = **4** | 0.58 s |
 | A, B, A (`--cache-ram 2048`) | the budget too small to hold both | 3rd = **29 772** | **57.1 s** |
-| A, B, A (`--cache-ram 32768`, in `serve.sh`) | the shipped default | 3rd = **4** | 0.50 s |
+| A, B, A (`--cache-ram 65536`, in `serve.sh`) | the shipped default | 3rd = **4** | 0.50 s |
 
 **A growing transcript costs its delta.** The second row is the whole agentic
 case: 19 new tokens, 0.41 s, against 62.9 s to prefill the same context cold —
@@ -539,10 +543,64 @@ entry costs the context's KV, 64 KiB/token at f16, so a 128k conversation is
 mode: with two 30k conversations and a 2 GiB budget, the third request
 re-prefilled all 29 772 tokens and nothing in the response says so — a cache
 miss and a first turn look identical from outside. `serve.sh` therefore ships
-`CRAM=32768` (four 128k conversations, or eight with `CTK=q8_0`), sized by
-`conversations x context-KV`. It is host RAM, which is the resource this machine
-has most of; the cache only fills as conversations arrive, and `CRAM=0` disables
-it.
+`CRAM=65536`, sized by `conversations x context-KV`: eight 128k f16
+conversations, i.e. four live slots plus headroom for a conversation displaced
+by a one-off request. It is host RAM, which is the resource this machine has
+most of; the cache only fills as conversations arrive, and `CRAM=0` disables it.
+
+**It is also a ceiling, and the default configuration commits to it.** Measured
+with the shipped defaults and four idle slots: 39.2 -> 89.4 GiB of host memory
+on load (54.0 GiB process RSS, 59.5 GiB summed GPU), swap unchanged. A full
+64 GiB of cache on top of that is 153 GiB, which this machine does not have —
+so `NP=4 CRAM=65536` is safe only while the cache stays under ~35 GiB, i.e.
+about four cached 128k conversations. `NP=4 CRAM=32768` (max ~121 GiB) is the
+configuration to use if the cache is expected to fill, and `CTK=q8_0 CTV=q8_0`
+halves both the slot KV and every cache entry.
+
+## Concurrency and interference — the caveat behind the 4-slot default
+
+Measured with warm caches (so `prompt_n` is 4-123, i.e. no prefilling at all),
+4k-token prompts, `NMAX=6`, decode-only:
+
+| | per-stream | aggregate |
+|---|---|---|
+| 1 stream | 92.2 | 92.2 |
+| 4 concurrent (4 slots) | 26.9, 26.9, 26.9, 25.9 | **106.6** |
+
+**Concurrency added 16 % on code-like text.** That is the good case, and it is
+the opposite of the README-continuation measurement earlier (where a single
+stream was already GPU-saturated and 4 streams merely divided it). Which one you
+get is a property of the workload, as with MTP.
+
+The bad case is mixing a cold prefill with other slots' decode, and it is worse
+than "shared bandwidth":
+
+| N=2, one slot prefilling 30 000 tokens while the other decodes 128 | decode t/s |
+|---|---|
+| decode alone (no other traffic) | 93.6 |
+| **sibling slot prefilling, same process (`-np 2`)** | **3.5** |
+| sibling *process* prefilling (`INSTANCES=2`, measured solo 83.4) | 22.3 |
+
+**A slot that prefills starves every other slot in the same process: 93.6 ->
+3.5 t/s, 27x.** The mechanism is continuous batching — all slots' tokens go into
+one batch per step, so a 30 000-token prefill makes every decode step cost a
+prefill step. Separate processes share the GPU but not the batch, so the same
+event costs 3.7x instead of 27x.
+
+This is why `INSTANCES` is not only about fault isolation and per-port config:
+**if N agent sessions send *cold* transcripts at overlapping times, processes
+degrade far more gracefully than slots.** Two things soften it in practice:
+
+* An agent turn that appends to its transcript prefills only the delta (19
+  tokens measured), so the starvation window only opens on a cache *miss* —
+  i.e. when `CRAM` is too small for the number of live conversations, or on the
+  first turn of each session. The cache budget and this effect compound.
+* The starving prefill is itself fast (30 000 tokens in ~60 s at ~490 t/s).
+
+The defaults stay `NP=4` for the common agentic case (N similar sessions,
+transcripts cached, decode-dominated turns) and `INSTANCES` is the answer when
+prefills overlap: `INSTANCES=2 NP=2` is the middle ground — two batches, four
+conversations, half the memory of four processes.
 
 ## What was discarded
 

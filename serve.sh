@@ -26,8 +26,8 @@
 #   MODEL CTX NP INSTANCES PORT THREADS HOST NGL LM BATCH UBATCH CTK CTV FA
 #   MTP MD NGLD NMAX CRAM SWAPCAP
 #
-#   ./serve.sh                      # one server, one slot, 128k, MTP on
-#   NP=4 ./serve.sh                 # one server, four parallel 128k slots
+#   ./serve.sh                      # 4 agent slots, 64 GiB prompt cache, NMAX=6
+#   NP=1 CRAM=8192 ./serve.sh       # single session, minimal footprint
 #   INSTANCES=4 ./serve.sh          # four servers, ports 8080-8083
 #   NMAX=6 ./serve.sh               # deeper speculation for code/agent traffic
 #   CRAM=65536 NP=8 ./serve.sh      # bigger prefill cache, more agent sessions
@@ -60,7 +60,12 @@ INSTANCES="${INSTANCES:-1}"
 # die of a Metal out-of-memory (they sum to >112 GiB of per-process
 # allocations) -- see RESULTS.md, "Parallel prompts". -c is the total, so it
 # scales with NP to keep every slot at full CTX.
-NP="${NP:-1}"
+#
+# Default 4: one slot per concurrent agent session, which is what this repo is
+# for. Each slot reserves its full KV up front -- 8 GiB at 128k f16, so 32 GiB
+# for four whether or not anyone is connected. Use NP=1 if you only ever run one
+# session and want the RAM back.
+NP="${NP:-4}"
 TOTAL_CTX=$(( CTX * NP ))
 PORT="${PORT:-8080}"
 HOST="${HOST:-127.0.0.1}"
@@ -101,14 +106,14 @@ FA="${FA:-on}"
 MTP="${MTP:-1}"
 MD="${MD:-$ROOT/models/mtp-Qwen3.8-27B-Q4_0.gguf}"
 NGLD="${NGLD:-99}"
-# Depth of speculation. The default is 3, and it stays 3 here because MTP's
-# gain depends on the *text*, not the machine: measured at 128k context, MTP is
-# +180 % on patterned text (markdown/code/JSON, 99 % draft acceptance) and
-# -11 % on free-form prose (14 % acceptance), and the draft depth that
-# maximises one hurts the other. See RESULTS.md, "MTP's gain is a property of
-# the text". NMAX=6 is a further +40 % over 3 on structured/code traffic (the
-# agent case this repo serves); MTP=0 is the setting for prose.
-NMAX="${NMAX:-3}"
+# Depth of speculation. 6, because this repo serves agent/code traffic and that
+# is where deeper drafting pays (+40 % over the upstream default of 3 on
+# structured text). MTP's gain is a property of the *text*, not the machine:
+# measured at 128k context it is +180 % on patterned text (markdown/code/JSON,
+# 99 % draft acceptance) and -11 % on free-form prose (14 % acceptance), and the
+# depth that maximises one hurts the other. Prose traffic wants NMAX=3 or
+# MTP=0. See RESULTS.md, "MTP's gain is a property of the text".
+NMAX="${NMAX:-6}"
 
 SWAPCAP="${SWAPCAP:-0}"
 
@@ -122,13 +127,15 @@ SWAPCAP="${SWAPCAP:-0}"
 # come back after another one displaced it -- measured A B A at 0.58 s vs 57 s
 # when it cannot; (3) --slot-save-path persists states to disk (not used here).
 #
-# The default is 8192 MiB = ONE 128k conversation in f16 (64 KiB/token). With
-# two conversations and the default budget the second evicts the first and every
-# turn re-prefills the whole transcript -- silently, because a cache miss looks
-# exactly like a first turn. Size it as (concurrent conversations) x (context
-# KV): 32768 holds ~4 at 128k f16, ~8 at q8_0. Lower it (or 0) to give the RAM
-# back; the cache only fills as conversations arrive.
-CRAM="${CRAM:-32768}"
+# The upstream default is 8192 MiB = ONE 128k conversation in f16 (64 KiB per
+# token). With two conversations the second evicts the first and every turn
+# re-prefills the whole transcript -- silently, because a cache miss looks
+# exactly like a first turn. Size it as (concurrent conversations) x
+# (context KV): 65536 holds eight 128k f16 conversations, i.e. four live slots
+# plus headroom for a conversation displaced by a one-off request. The cache
+# only fills as conversations arrive, so the limit costs nothing until used;
+# CRAM=0 disables it and CRAM=32768 holds four.
+CRAM="${CRAM:-65536}"
 
 mkdir -p "$ROOT/logs"
 

@@ -28,9 +28,9 @@ discarded and why.
 | KV cache | **`f16/f16` for a single 128k server**, `q8_0/q8_0` when running several | at 128k, f16 generates **14.3 t/s vs 12.9** for q8_0 and prefills faster (231 vs 222 t/s) but costs 4 GiB more per instance |
 | threads | **`-t 4`** | pp 758 vs 716 (t6), 693 (t8), 686 (t12), 529 (t18); generation flat from 4–18. The 12 performance cores cost more in contention than they return |
 | batch | **`-b 1024 -ub 256`** at depth, `-b 2048 -ub 512` if you only ever prefill shallow | at 98.6k depth with MTP: generation **37.45 vs 28.52 t/s (+31 %)** against 2048/512, prefill level (349 vs 340); the same pair wins both axes at 64k. Only shallow prefill prefers 2048/512 (709.6 vs 633.3). See `RESULTS.md` |
-| MTP | **on**, `--spec-type draft-mtp -md models/mtp-Qwen3.8-27B-Q4_0.gguf -ngld 99`, `NMAX=3` | draft on the GPU. **The gain is a property of the text, not the machine**: +180 % on patterned text (markdown/code/JSON, 99 % draft acceptance) and **−11 % on free-form prose** (14 %). `NMAX=6` is a further +40 % on structured/code traffic — the agent case this repo serves — but costs more on prose; `MTP=0` is the prose setting. Numbers in `RESULTS.md` |
+| MTP | **on**, `--spec-type draft-mtp -md models/mtp-Qwen3.8-27B-Q4_0.gguf -ngld 99 --spec-draft-n-max 6` | draft on the GPU. **The gain is a property of the text, not the machine**: +180 % on patterned text (markdown/code/JSON, 99 % draft acceptance) and **−11 % on free-form prose** (14 %). The default draft depth is 6 because this repo serves agent/code traffic, where it is worth +40 % over upstream's 3; **if your traffic is prose, set `NMAX=3` or `MTP=0`**. Numbers in `RESULTS.md` |
 | context | **128k** (`-c 131072`) | 14.3 t/s generation and 176–231 t/s prefill *at* depth 131072; costs ~8 GiB of KV with f16 |
-| prefill cache | **`--cache-ram 32768`** (host RAM) | for agentic use this is the biggest lever there is. A growing transcript re-sent each turn prefills **only the delta**: 19 new tokens cost 0.41 s against 62.9 s cold. The default budget (8 GiB) holds exactly *one* 128k f16 conversation — with two, the second evicts the first and every turn silently re-prefills 29 772 tokens (measured: 57.1 s). Sized as conversations × context-KV |
+| prefill cache | **`--cache-ram 65536`** (host RAM) | for agentic use this is the biggest lever there is. A growing transcript re-sent each turn prefills **only the delta**: 19 new tokens cost 0.41 s against 62.9 s cold. Upstream's 8 GiB budget holds exactly *one* 128k f16 conversation — with two, the second evicts the first and every turn silently re-prefills 29 772 tokens (measured: 57.1 s). Sized as conversations × context-KV; see the memory ceiling below |
 | parallel prompts | **`NP=N`** (slots in one server) beats **`INSTANCES=N`** (processes) | 128k per slot: `-np 6` fits in **70.4 GiB** where 6 processes die of a Metal OOM, and loads 2-3x faster; aggregate is workload-dependent — flat ~53-60 t/s where one stream was already GPU-saturated, ~91 t/s aggregate for two concurrent *code* requests. Slots buy concurrency, not throughput |
 
 **Offload is the lever that no longer exists, and context is the one that
@@ -106,17 +106,24 @@ minute.
 ## Run
 
 ```
-./serve.sh                       # one server, 128k context, MTP on
-INSTANCES=4 ./serve.sh           # four 128k servers on ports 8080-8083
-INSTANCES=4 CTK=q8_0 CTV=q8_0 ./serve.sh   # halve the per-instance KV
-MTP=0 ./serve.sh                 # no speculative decoding
+./serve.sh                       # the agentic default: 4 slots, 64 GiB cache, NMAX 6
+NP=1 CRAM=8192 ./serve.sh        # one session, minimal footprint
+MTP=0 NMAX=3 ./serve.sh          # prose: speculation does not pay
+INSTANCES=4 ./serve.sh           # four servers instead, ports 8080-8083
+INSTANCES=4 CTK=q8_0 CTV=q8_0 ./serve.sh   # halve the per-server KV
 ```
 
-`serve.sh` defaults: `-ngl 99 -c 131072 -t 4 -b 2048 -ub 512 -ctk f16 -ctv f16
--fa on`, plus `--spec-type draft-mtp -md models/mtp-Qwen3.8-27B-Q4_0.gguf
--ngld 99`. Every knob is an env var (`MODEL CTX INSTANCES PORT THREADS NGL LM
-BATCH UBATCH CTK CTV FA MTP MD NGLD SWAPCAP`), and extra arguments are appended
-verbatim to each server.
+`serve.sh` defaults: `-ngl 99 -np 4 -c 524288 (4 slots x 128k) -t 4 -b 1024 -ub
+256 -ctk f16 -ctv f16 -fa on --cache-ram 65536`, plus `--spec-type draft-mtp -md
+models/mtp-Qwen3.8-27B-Q4_0.gguf -ngld 99 --spec-draft-n-max 6`. Every knob is
+an env var (`MODEL CTX NP INSTANCES PORT THREADS NGL LM BATCH UBATCH CTK CTV FA
+MTP MD NGLD NMAX CRAM SWAPCAP`), and extra arguments are appended verbatim to
+each server.
+
+**The default is sized for agentic coding and it is not free**: four slots
+reserve 32 GiB of KV up front and the four-slot server measures 89.4 GiB of host
+memory on load. See the ceiling note in `RESULTS.md` if you plan to fill the
+prompt cache.
 
 Servers run under `scripts/guard.py`, which forwards Ctrl-C to the whole
 process group and records memory/CPU/GPU statistics for every run. The one
@@ -163,9 +170,11 @@ What parallelism does to speed depends on the workload, not the mechanism:
 Neither is the wrong answer: N slots buy concurrency. Use them when N clients
 each idle most of the time; do not expect N times the throughput of one.
 
-The defaults stay `NP=1`/`INSTANCES=1` because every slot reserves its full KV
-up front — 8 GiB per 128k slot whether or not anyone is connected, so four idle
-slots cost 32 GiB. Set them when you have clients.
+`serve.sh` defaults to `NP=4`/`INSTANCES=1` because that is the shape of the
+workload it exists for. Each slot reserves its full KV up front — 8 GiB per 128k
+slot, so 32 GiB for four whether or not anyone is connected — which is the price
+of that default; `NP=1 CRAM=8192 ./serve.sh` is the single-session
+configuration and costs about a third of that.
 
 #### For agentic coding
 
@@ -173,24 +182,37 @@ The workload is a transcript that grows every turn, so the config that matters
 is the one that keeps prefill near zero and gives each concurrent session its
 own cached conversation:
 
-```
-NP=4 CRAM=65536 NMAX=6 ./serve.sh
-```
+`./serve.sh` with no arguments *is* this configuration — `NP=4 CRAM=65536
+NMAX=6` are the defaults. What each one buys:
 
 * `NMAX=6` — code and tool output are patterned, and that is where deep
-  drafting pays (+40 % over the default on structured text; a live code prompt
+  drafting pays (+40 % over upstream's 3 on structured text; a live code prompt
   measured 92.8 t/s against 30.5 with `MTP=0`).
 * `NP=4` — one slot per concurrent agent session; slots are much cheaper than
   processes (52 GiB against 100 GiB at four).
 * `CRAM=65536` — the prompt cache is sized to the *number of live
-  conversations*. At 128k f16 each costs ~8 GiB (`-cram` 32768 holds four),
-  and a cache that is one entry short does not degrade — it silently
-  re-prefills a 128k transcript on every turn. `CTK=q8_0 CTV=q8_0` halves it to
-  4 GiB each.
+  conversations*. At 128k f16 each costs ~8 GiB, and a cache that is one entry
+  short does not degrade — it silently re-prefills a 128k transcript on every
+  turn. `CTK=q8_0 CTV=q8_0` halves it to 4 GiB each, and `CRAM=32768` is the
+  safer pairing if the cache is expected to fill on a machine that is also
+  doing something else.
 
 Send requests with `"cache_prompt": true` (the default for the OpenAI-compatible
 endpoints) so the server can match the prefix; `scripts/agent_cache_probe.py`
 measures whether it actually did.
+
+Two things to know about this default:
+
+* **It is not free.** Four slots reserve 32 GiB of KV up front and the server
+  measures 89.4 GiB of host memory on load. The cache cap is a ceiling on top of
+  that — see the note in `RESULTS.md`; `NP=1 CRAM=8192 ./serve.sh` is the
+  minimal-footprint configuration.
+* **Overlapping cold prefills hurt.** Slots share one batch, so while one
+  session prefills an uncached transcript the others' generation falls to ~3.5
+  t/s (from 93.6). Cached turns prefill only their delta and are unaffected, so
+  in practice this bites when `CRAM` is too small for the number of live
+  conversations — the two settings compound. Use `INSTANCES=2 NP=2` if sessions
+  routinely start cold at the same time.
 
 #### Which one to use
 
@@ -206,6 +228,7 @@ measures whether it actually did.
 | restart / upgrade one worker | no | **yes** |
 | per-port configuration | no | **yes** (see below) |
 | CPU threads | one `-t` pool shared by all slots | each process gets its own `-t` pool |
+| one session prefilling a cold transcript | **starves the others: 93.6 -> 3.5 t/s** (27x) | degrades: 83.4 -> 22.3 t/s (3.7x) |
 | ports | one | N |
 
 **Use `NP=N`** when you just want N concurrent clients against one endpoint and
@@ -214,8 +237,11 @@ and 4, and it starts in a third of the time.
 
 **Use `INSTANCES=N`** when you need any of the things one process cannot give
 you: fault isolation (an OOM in one worker does not kill the rest), the ability
-to restart or upgrade one port while the others serve, separate logs — or
-**different settings per port**, which is the case worth knowing about. With one
+to restart or upgrade one port while the others serve, separate logs,
+**different settings per port** (see below) — or **overlapping cold prefills**.
+Slots share one batch, so a slot prefilling a 30k-token transcript drops its
+neighbours' decode from 93.6 to 3.5 t/s; separate processes share only the GPU
+and degrade to 22.3 instead. `INSTANCES=2 NP=2` is the middle ground. With one
 `serve.sh` every server gets the same flags, but nothing stops you running two:
 
 ```
@@ -237,7 +263,7 @@ back, `THREADS=8` is the untested knob.
 | script | purpose |
 |---|---|
 | `scripts/build.sh` | configure + build llama.cpp with Metal, pinned revision |
-| `serve.sh` | launch N `llama-server` instances under the guard |
+| `serve.sh` | launch the server(s) under the guard: `NP` slots in one process, `INSTANCES` processes |
 | `scripts/guard.py` | guarded runner + measurement: RSS, swap, host/GPU utilization, `bg_cpu_pct`, `gpu_busy_pct_peak` |
 | `scripts/bench.py` | `llama-bench` sweeps: `ngl`, `fa`, `kv`, `depth`, `ctx`, `threads`, `batch`, `load`, `nkvo`, `nopo`, `quant` |
 | `scripts/mtp_ab.py` | MTP A/B over HTTP, with `--server-extra` for arbitrary flags |
