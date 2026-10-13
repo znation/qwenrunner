@@ -123,6 +123,27 @@ def nvidia_vram_mib():
         return None
 
 
+def nvidia_util_pct():
+    """GPU utilization % for NVIDIA device 0, or None. Cheap NVML query."""
+    global _NVML, _NVML_TRIED
+    if not _NVML_TRIED:
+        nvidia_vram_mib()
+    if _NVML is None:
+        return None
+    try:
+        h = ctypes.c_void_p()
+        if _NVML.nvmlDeviceGetHandleByIndex_v2(0, ctypes.byref(h)) != 0:
+            return None
+        class _Util(ctypes.Structure):
+            _fields_ = [("gpu", ctypes.c_uint), ("memory", ctypes.c_uint)]
+        u = _Util()
+        if _NVML.nvmlDeviceGetUtilizationRates(h, ctypes.byref(u)) != 0:
+            return None
+        return u.gpu
+    except Exception:
+        return None
+
+
 def drm_clients(pids=None):
     """Per-DRM-client VRAM/GTT usage in KiB, deduped by drm-client-id.
 

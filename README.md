@@ -42,6 +42,19 @@ confidence, and 6 with a 0.5 confidence floor is +18 % where drafts land. The
 binding constraint is that **only 8–12 of 64 layers fit in VRAM**, so the model
 stays CPU-bound and desktop CPU load directly sets throughput.
 
+**A second, exhaustive pass confirmed the shipped configuration is the
+fastest measured on this host** — see RESULTS.md "A second pass". The step time
+is ~900 ms of target verification plus a cheap ~27 ms draft; the verification
+scales with the verified batch but *not* with CPU frequency (forcing the CPU's
+EPP to `performance` raised the generation-phase clock 3.64 → 4.10 GHz with
+flat throughput), so the CPU is memory/latency-bound, not clock-bound. That
+rules out the privileged levers (RAPL PL1 raise, EPP) as well as every draft
+variant tried (Q2_K/Q4_0 outputs, moving the draft to the 1070, longer chains
+at `-ngl 24`) — each lost to the shipped q3_K-output draft on the Vega. The
+Vega runs pinned at its 852 MHz base clock during inference (bursty load never
+ramps it); forcing `power_dpm_force_performance_level = high` is a small,
+privileged, optional gain.
+
 Two serving-path results are worth knowing before tuning anything else. **The
 desktop is a first-class tunable** — it currently holds ~1.4 GiB of the Vega
 (plasmashell 487, firefox 331, claude-desktop 254, ghostty 250 MiB), and the

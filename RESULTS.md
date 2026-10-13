@@ -1392,6 +1392,119 @@ and `wait_idle.py --system` gates on total host CPU, but neither can fix a busy
 machine. Results taken under load are recorded with their `bg_cpu_pct` so they
 can be discarded.
 
+# Second pass (see "A second pass: where the shipped step time actually goes"):
+#   - CPU frequency: powerprofilesctl set performance|balanced, then run the
+#     shipped config under scripts/freqwatch.py (CPU freq + package temp +
+#     per-device clocks every 0.5 s) and compare gen-phase (last 15 s) t/s.
+#   - Draft cost: `-lv 6` and grep the server log for
+#     "statistics.*draft-mtp.*dur(" — the per-step draft ms.
+#   - Draft variants: split_fit --draft models/... and --draft-dev CUDA0.
+#     The Q2_K and Q4_0-output drafts were made with
+#     llama-quantize --allow-requantize --output-tensor-type <q2_K|q4_0>.
+#   - scripts/instrument_run.py <port> <out.jsonl> <pid> samples per-thread CPU,
+#     GPU util (NVML, cheap) and freq during one live completion.
+
+## A second pass: where the shipped step time actually goes **[clean]**
+
+A follow-up sweep aimed the remaining levers at the shipped config and failed
+to beat it; the value is in what the measurements rule out. All runs are the
+shipped shape (`-c 131072 -ngl 26 -ts 6,1 -np 1`, MTP with the draft on the
+Vega, `-lm dio`, `data/long_prompt.txt`, 64 tokens out), idle host.
+
+### Generation is CPU-frequency-independent
+
+`powerprofilesctl` (no root) switches the CPU's HWP EPP between
+`balance_performance` and `performance`. Interleaved A/B at the shipped config,
+generation-phase CPU frequency sampled at 2 Hz (`scripts/freqwatch.py`):
+
+| EPP | gen-phase freq | generation t/s | `bg_cpu_pct` |
+|---|---|---|---|
+| `balance_performance` | 3640 MHz | **6.351** | 1.9 |
+| `performance` | 4100 MHz | 6.282 | 7.0 |
+
+**+12.6 % CPU frequency, flat throughput.** The 9900K is not clock-bound during
+generation; the verify cost does not scale with the CPU's ALU rate. This also
+rules out the obvious privileged lever — raising the 100 W RAPL PL1
+(`constraint_0_power_limit_uw` reads 100 W against a 125 W PL2) — since a
+higher PL1 would only buy the same +frequency that EPP already bought for
+nothing. EPP=`performance` additionally holds all 16 threads at 4.8 GHz idle,
+wasting power under the same 100 W cap; `balance_performance` is the correct
+setting. The gen-phase average at balance is ~3.6 GHz, i.e. right at the 100 W
+all-core AVX2 wall, package temp 60–80 °C — power-capped, not thermal.
+
+### The step is draft-cheap and verify-heavy
+
+llama.cpp's speculative driver logs per-impl `dur(begin, draft, accept)` at
+trace level. At the shipped config (`-lv 6`, 8k-char mid-document prompt,
+32 tokens out):
+
+```
+statistics draft-mtp: #calls(b,g,a) = 1 11 7, #gen tokens = 29, #acc tokens = 19,
+dur(b,g,a) = 0.006, 300.642, 0.013 ms
+```
+
+The draft costs **27 ms per step** (10.4 ms per draft token), not the hundreds
+of milliseconds the step budget implied. The remaining ~900 ms is the target
+verification pass. Its cost scales with the verified batch (a batch-6 step costs
+~2x a batch-1 step at the same context) but not with CPU frequency — which is
+why neither clock nor thread tuning moves it, and why the batch-side levers in
+"Prefill-side levers that are dead ends" also fail to.
+
+### Draft-model levers tried and rejected
+
+The draft's 248k×5120 `output.weight` is q3_K (521 MiB) and is read once per
+draft token; at ~10 GB/s effective on the Vega it was the candidate bottleneck.
+It is not — every way of shrinking or moving it lost:
+
+| variant | generation t/s | draft accepted | why it lost |
+|---|---|---|---|
+| shipped (q3_K output, on the Vega) | **6.34** | 53/55 | — |
+| Q2_K output + nextn (`--output-tensor-type q2_K`) | 4.12 | 48/61 | acceptance 96→79 % |
+| Q4_0 output (`--output-tensor-type q4_0`) | 5.68 | — | +161 MiB of bytes, no acceptance gain |
+| draft on the 1070 (`-devd CUDA0`), `-ngl 24` | — | — | does not load: MTP pp compute buffer |
+| draft on the 1070, `-ngl 22` | 5.45 | — | 4 fewer trunk layers cost more than CUDA's batch-1 kernels gained |
+| `-ngl 24 --spec-draft-n-max 10` (longer chain) | 5.93 | 57/56 | 2 lost layers > longer chain |
+| `-ngl 24 --spec-draft-n-max 12` | — | — | health timeout at load |
+
+The q3_K output with 96 % acceptance is the sweet spot: smaller quants break
+acceptance (which costs real verify passes), bigger quants add bytes for
+nothing, and the 1070 cannot hold the draft without giving up trunk layers it
+needs more. The draft-chain-at-128k question from the earlier "Still open" is
+now answered: at `-ngl 24` the longer chain drafted more per step (6.3 vs 5.0)
+but the two lost layers dominate.
+
+### `--poll` / threadpool spin **[clean]**
+
+`--poll 100 --poll-batch 100 --spec-draft-poll 1` vs the default 50: 6.37 vs
+6.34 t/s — +0.6 %, noise. The threadpool spin level is not a lever (the earlier
+"Still open" entry is now closed).
+
+### `-nkvo 1` (KV on CPU) is a wash at the depths that matter
+
+The 16 KV layers sit at trunk layers 3, 7, …, 63 (every fourth), so of the 26
+offloaded layers six hold KV (~880 MiB on the GPUs at 128k q4_0). `-nkvo 1`
+moves those to host RAM and frees ~880 MiB — enough for ~3 more trunk layers —
+but it also moves those six layers' attention to the CPU (with flash attention,
+KV placement decides where the op runs). At depth 5.2k the freed layers win
+(~3 %); at 64k+ the added CPU attention costs more than the weights saved. Not
+a clean win at any depth the workload actually runs.
+
+### The Vega is pinned at its base clock during inference
+
+`pp_dpm_sclk` shows the Vega at **852 MHz (level 0) for the entire generation**
+— it boosts (to 1145 MHz) only under sustained load, and every model workload
+is bursty (draft decodes ~10 ms, its 3 trunk layers, the display).
+`power_dpm_force_performance_level = high` is a privileged change; the draft is
+only ~27 ms/step so the ceiling is small, but the Vega's own 3 trunk layers
+would run ~1.9x faster.
+
+### Net
+
+The shipped configuration is the fastest measured on this host. The one large
+lever remaining is offload itself (`-ngl`, gated by VRAM and the display cap),
+which is already at its 128k ceiling; at a light desktop baseline
+(≤ ~1540 MiB) `NGL=28` remains the +7 % opt-in.
+
 ## Still open
 
 * **`-lm mlock`** — blocked on `RLIMIT_MEMLOCK` (8 MiB, needs a privileged
@@ -1419,23 +1532,19 @@ can be discarded.
 * **`-t` at other contexts.** Verified at the shipped 128k split (8 beats 12, 6
   and 4); the 32k/8k splits were not swept, though the CPU work there is
   smaller still.
-* **The draft chain at the shipped 128k/28.** `-n-max` was swept at `-c 32768
-  -ngl 32`, because the desktop was holding ~1.6-1.8 GiB of the Vega and left
-  the shipped config ~16 MiB of cap margin. The transfer is expected to hold or
-  improve — the shipped config leaves more CPU work per target step, so a draft
-  step is relatively cheaper — but it is an inference. `serve.sh`'s `DNMAX=`
-  makes it a one-flag re-measure on a light desktop.
 * **`--spec-draft-n-max` above 14.** The marginal cost of a draft step (76 ms
   for ~0.96 accepted tokens) was still below the arm's running rate at 14, so
-  the high-acceptance optimum has not been found — only bounded from below.
+  the high-acceptance optimum has not been found — only bounded from below. At
+  the shipped 128k context, `-n-max` above 6 is unaffordable on the 1070
+  (`n_outputs_max` scales with the chain) and trading `-ngl` down to buy it back
+  loses more than the longer chain gains — see "Draft-model levers tried and
+  rejected".
 * **A short n-gram draft.** `--spec-ngram-simple-size-m` defaults to 48 and it
   is the *length* of the drafts that made `ngram-simple` lose (8.6 accepted
   tokens per step at 1.9 s/step against MTP's 2.8 at 0.56 s). A much shorter
   `size_m` was not tried.
-* **`--poll` / `-bs`.** The threadpool spin level (default 50) and backend
-  sampling are the last untested CPU-side flags; a sweep was written and then
-  dropped to shorten the critical path, so they are untested rather than
-  negative.
+* **`-bs` (backend sampling).** `--poll` was swept (50 → 100, +0.6 % noise —
+  see "A second pass"); backend sampling remains untested and experimental.
 * **Compaction at 130k.** The checkpoint bound is measured at 6.6k and 12.2k
   depth; the 130k case follows from the `-cms` spacing rather than from depth,
   but a 73-minute prefill is what it would take to confirm.
