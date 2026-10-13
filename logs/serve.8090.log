@@ -1,11 +1,36 @@
-0.00.080.864 I srv  llama_server: initializing ...
-0.00.080.871 I cmn  common_param: common_params_print_info: verbosity = 3 (adjust with the `-lv N` CLI arg)
-0.00.081.041 W srv  llama_server: security: no API key is set and CORS allows all origins (see https://github.com/ggml-org/llama.cpp/pull/25655)
-0.00.082.530 I srv    load_model: loading model '/Users/zach/qwenrunner/models/Qwen3.8-27B-UD-Q4_K_S.gguf'
-0.03.922.209 I cmn          init: llama threadpool init, n_threads = 4
-0.04.013.223 I common_speculative_init_result: loading draft model '/Users/zach/qwenrunner/models/mtp-Qwen3.8-27B-Q4_0.gguf'
-0.04.677.002 I srv    load_model: initializing, n_slots = 4, n_ctx_slot = 131072, kv_unified = 'false'
-0.04.762.089 W srv          init: chat template supports preserving reasoning, it is enabled by default (may use more tokens, disable via --no-reasoning-preserve)
-0.04.762.107 I srv  llama_server: model loaded
-0.04.762.109 I srv  llama_server: listening on http://127.0.0.1:8090
-0.07.098.015 I srv    operator(): operator(): cleaning up before exit...
+0.00.039.181 I srv  llama_server: initializing ...
+0.00.039.185 I cmn  common_param: common_params_print_info: verbosity = 3 (adjust with the `-lv N` CLI arg)
+0.00.039.325 W srv  llama_server: security: no API key is set and CORS allows all origins (see https://github.com/ggml-org/llama.cpp/pull/25655)
+0.00.040.686 I srv    load_model: loading model '/Users/zach/qwenrunner/models/Qwen3.8-27B-UD-Q4_K_S.gguf'
+0.02.212.459 I cmn          init: llama threadpool init, n_threads = 4
+0.02.289.692 I common_speculative_init_result: loading draft model '/Users/zach/qwenrunner/models/mtp-Qwen3.8-27B-Q4_0.gguf'
+0.02.655.014 I srv    load_model: initializing, n_slots = 4, n_ctx_slot = 131072, kv_unified = 'false'
+0.02.725.963 W srv          init: chat template supports preserving reasoning, it is enabled by default (may use more tokens, disable via --no-reasoning-preserve)
+0.02.725.978 I srv  llama_server: model loaded
+0.02.725.981 I srv  llama_server: listening on http://127.0.0.1:8090
+5.13.838.034 I slot get_availabl: id  3 | task -1 | selected slot by LRU, t_last = -1
+5.13.838.068 I slot launch_slot_: id  3 | task 0 | processing task, is_child = 0
+5.14.477.405 I slot get_availabl: id  2 | task -1 | selected slot by LRU, t_last = -1
+5.14.477.729 I slot launch_slot_: id  2 | task 2 | processing task, is_child = 0
+5.18.938.243 I slot print_timing: id  2 | task 2 | prompt processing, n_tokens =   3072, progress = 0.42, t =   4.07 s / 755.65 tokens per second
+5.20.467.553 I slot print_timing: id  2 | task 2 | prompt processing, n_tokens =   4096, progress = 0.56, t =   5.59 s / 732.75 tokens per second
+5.22.019.251 I slot print_timing: id  2 | task 2 | prompt processing, n_tokens =   5120, progress = 0.69, t =   7.13 s / 717.70 tokens per second
+5.23.645.174 I slot print_timing: id  2 | task 2 | prompt processing, n_tokens =   6144, progress = 0.83, t =   8.75 s / 702.17 tokens per second
+5.25.532.267 I slot print_timing: id  2 | task 2 | prompt processing, n_tokens =   7110, progress = 0.96, t =  10.66 s / 666.69 tokens per second
+5.25.551.825 I slot print_timing: id  3 | task 0 | prompt processing, n_tokens =    308, progress = 0.60, t =  11.30 s / 27.25 tokens per second
+5.26.334.060 I slot print_timing: id  2 | task 2 | prompt processing, n_tokens =   7309, progress = 0.99, t =  11.74 s / 622.34 tokens per second
+5.26.357.911 I slot print_timing: id  3 | task 0 | prompt processing, n_tokens =    495, progress = 0.97, t =  12.38 s / 39.97 tokens per second
+5.26.782.447 I slot print_timing: id  2 | task 2 | prompt processing, n_tokens =   7366, progress = 1.00, t =  12.10 s / 608.66 tokens per second
+5.26.805.191 I slot print_timing: id  3 | task 0 | prompt processing, n_tokens =    506, progress = 0.99, t =  12.74 s / 39.71 tokens per second
+5.27.270.313 I slot print_timing: id  3 | task 0 | prompt eval time =   13048.61 ms /   510 tokens (   25.59 ms per token,    39.08 tokens per second)
+5.27.270.316 I slot print_timing: id  3 | task 0 |        eval time =     383.49 ms /    16 tokens (   25.57 ms per token,    39.11 tokens per second)
+5.27.270.317 I slot print_timing: id  3 | task 0 |       total time =   13432.10 ms /   526 tokens
+5.27.270.317 I slot print_timing: id  3 | task 0 |    graphs reused =          2
+5.27.270.321 I slot print_timing: id  3 | task 0 | draft acceptance = 0.66667 (   12 accepted /    18 generated), mean len =  5.00
+5.27.270.357 I slot      release: id  3 | task 0 | stop processing: n_tokens = 525, truncated = 0
+5.27.580.386 I slot print_timing: id  2 | task 2 | prompt eval time =   12408.74 ms /  7370 tokens (    1.68 ms per token,   593.94 tokens per second)
+5.27.580.391 I slot print_timing: id  2 | task 2 |        eval time =     693.61 ms /    31 tokens (   23.12 ms per token,    43.25 tokens per second)
+5.27.580.391 I slot print_timing: id  2 | task 2 |       total time =   13102.35 ms /  7401 tokens
+5.27.580.392 I slot print_timing: id  2 | task 2 |    graphs reused =          5
+5.27.580.396 I slot print_timing: id  2 | task 2 | draft acceptance = 0.54762 (   23 accepted /    42 generated), mean len =  4.29
+5.27.580.665 I slot      release: id  2 | task 2 | stop processing: n_tokens = 7400, truncated = 0

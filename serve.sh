@@ -30,7 +30,7 @@
 #   NP=2 ./serve.sh                     # +9 GiB of free RAM, two sessions
 #   CTK=f16 CTV=f16 CRAM=8192 ./serve.sh # +20 t/s at depth, at -12 GiB of free RAM
 #   NP=1 CRAM=8192 ./serve.sh           # single session, minimal footprint
-#   INSTANCES=4 ./serve.sh              # four servers, ports 8080-8083
+#   INSTANCES=4 ./serve.sh              # four servers, ports 8090-8093
 #   MTP=0 ./serve.sh                    # no speculative decoding
 # Extra args are appended verbatim to every llama-server command line.
 set -euo pipefail
@@ -70,7 +70,16 @@ INSTANCES="${INSTANCES:-1}"
 # concurrency.
 NP="${NP:-4}"
 TOTAL_CTX=$(( CTX * NP ))
-PORT="${PORT:-8080}"
+# 8090, not llama-server's 8080. On this machine Rancher Desktop's Lima port
+# forwarder holds a *wildcard* *:8080 on the host, so a request to
+# 127.0.0.1:8080 while this server is down is answered by the forwarder -- a
+# bare Go "404 page not found" -- instead of being refused. That is a silent
+# wrong-listener failure (and it made a liveness probe read "starting" for 240 s
+# while the log showed the server up in 3 s). The specific 127.0.0.1 bind wins
+# while the server runs, so requests still reach it; the port is moved so the
+# failure mode is honest. Any port the local cluster does not publish will do;
+# 8090-8099 are outside the forwarded set today.
+PORT="${PORT:-8090}"
 HOST="${HOST:-127.0.0.1}"
 
 # All layers, plus the output layer and the MTP head, on the Metal device.
@@ -166,9 +175,9 @@ ALIAS="${ALIAS:-qwen3.8-27b}"
 # (seconds) instead of re-prefilling its transcript (a 128k prefill is ~4.5 min
 # at ~490 t/s). The server is driven by its own API, not by a flag:
 #
-#   curl -X POST "http://127.0.0.1:8080/slots/0?action=save" \
+#   curl -X POST "http://127.0.0.1:8090/slots/0?action=save" \
 #        -H 'Content-Type: application/json' -d '{"filename":"conv-a.bin"}'
-#   curl -X POST "http://127.0.0.1:8080/slots/0?action=restore" \
+#   curl -X POST "http://127.0.0.1:8090/slots/0?action=restore" \
 #        -H 'Content-Type: application/json' -d '{"filename":"conv-a.bin"}' 
 #
 # Save the slot that currently holds the conversation, restore it before the

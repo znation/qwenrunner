@@ -111,7 +111,7 @@ NP=2 ./serve.sh                  # +9 GiB of free RAM, two sessions
 CTK=f16 CTV=f16 CRAM=8192 ./serve.sh  # +20 t/s decode at depth, -12 GiB of free RAM
 NP=1 CRAM=8192 ./serve.sh        # one session, minimal footprint
 MTP=0 NMAX=3 ./serve.sh          # prose: speculation does not pay
-INSTANCES=4 ./serve.sh           # four servers, ports 8080-8083
+INSTANCES=4 ./serve.sh           # four servers, ports 8090-8093
 ```
 
 Never mix `CTK` and `CTV`: every mixed-dtype run hung past a 1800 s request
@@ -143,7 +143,7 @@ buffers); `INSTANCES=N` runs N separate servers on N ports.
 
 ```
 NP=4 ./serve.sh                  # one server, four parallel 128k slots
-INSTANCES=4 ./serve.sh           # four servers, ports 8080-8083
+INSTANCES=4 ./serve.sh           # four servers, ports 8090-8093
 ```
 
 Measured, 128k context per slot, MTP on, current defaults:
@@ -269,8 +269,8 @@ and degrade to 22.3 instead. `INSTANCES=2 NP=2` is the middle ground. With one
 `serve.sh` every server gets the same flags, but nothing stops you running two:
 
 ```
-PORT=8080 NMAX=6 ./serve.sh &        # code/agent traffic: deeper speculation
-PORT=8081 MTP=0   ./serve.sh &        # prose: speculation does not pay
+PORT=8090 NMAX=6 ./serve.sh &        # code/agent traffic: deeper speculation
+PORT=8091 MTP=0   ./serve.sh &        # prose: speculation does not pay
 ```
 
 That is not expressible with `-np`, and it follows directly from the MTP
@@ -289,8 +289,19 @@ overridable with `ALIAS`). Without an alias the server reports the GGUF's own
 name, which changes with the file, so every client would have to track it — the
 three configs below all name this string.
 
-The API is OpenAI-compatible at `http://127.0.0.1:8080/v1`; the API key is a
+The API is OpenAI-compatible at `http://127.0.0.1:8090/v1`; the API key is a
 placeholder that llama-server ignores.
+
+The port is **8090, not llama-server's 8080**. Rancher Desktop's Lima port
+forwarder holds a wildcard `*:8080` on this host, so a request that arrives
+while the server is down is answered by the forwarder — a bare Go
+`404 page not found` — instead of being refused: the failure names the wrong
+service, and a liveness probe on that port cannot tell "up" from "forwarded".
+While the server runs, its specific `127.0.0.1` bind wins and requests reach it,
+so nothing was broken by 8080; the move makes the down case honest. Any port the
+local cluster does not publish works — `PORT` overrides it, and the two
+catalogs below must move with it (tumwater's entry names no URL: it routes
+through pi's `models.json`).
 
 | client | file | entry |
 |---|---|---|
