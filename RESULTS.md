@@ -675,8 +675,8 @@ does not fit.
 
 128k context, `data/long_prompt.txt` (5246-token prompt), one `/completion` of 64
 tokens, `-lm dio -b 2048 -ub 512 -ctk q4_0 -ctv q4_0 -fa on -np 1`, idle host
-(`bg_cpu_pct` 1.4–1.8 %). `results/opt_ab_long.jsonl`,
-`results/opt_ab_confirm.jsonl`, `results/opt_ngld.jsonl`. The last four rows are
+(`bg_cpu_pct` 1.4–1.8 %). `results/opt_ab_long.json`,
+`results/opt_ab_confirm.json`, `results/opt_ngld.json`. The last four rows are
 two interleaved reps each; spread < 1 %.
 
 | arm | `-ts` | `-ngl` | prompt t/s | generation t/s | client MiB | NVIDIA peak MiB |
