@@ -53,7 +53,11 @@ variant tried (Q2_K/Q4_0 outputs, moving the draft to the 1070, longer chains
 at `-ngl 24`) — each lost to the shipped q3_K-output draft on the Vega. The
 Vega runs pinned at its 852 MHz base clock during inference (bursty load never
 ramps it); forcing `power_dpm_force_performance_level = high` is a small,
-privileged, optional gain.
+privileged, optional gain. A smaller trunk quant (Q2_K_XL) at the split buys a
+large prefill win (pp 59 vs 34 t/s) but *loses* generation (4.96 vs 6.38 t/s):
+the CPU's Q2_K verify kernel costs more per layer than the byte savings gain.
+The verification pass is the whole story — it scales with the verified batch
+and nothing else moves it.
 
 Two serving-path results are worth knowing before tuning anything else. **The
 desktop is a first-class tunable** — it currently holds ~1.4 GiB of the Vega

@@ -1473,6 +1473,26 @@ needs more. The draft-chain-at-128k question from the earlier "Still open" is
 now answered: at `-ngl 24` the longer chain drafted more per step (6.3 vs 5.0)
 but the two lost layers dominate.
 
+### Smaller trunk quants do not help generation at the split
+
+The quant comparison above was measured on the Vega-only path, where offload
+was capped at 12-20 layers. At the split, a smaller quant's smaller layers
+should buy more offload — and they do, for prefill — but generation is
+*slower*. Measured at the shipped shape with `UD-Q2_K_XL` (`-ngl` 34/38, MTP on
+the Vega, 128k):
+
+| trunk | `-ngl` | pp t/s | gen t/s | draft accepted |
+|---|---|---|---|---|
+| UD-Q4_K_M (shipped) | 26 | 33.63 | **6.38** | 53/55 |
+| UD-Q2_K_XL | 34 | 54.55 | 4.39 | 52/57 |
+| UD-Q2_K_XL | 38 | 59.31 | 4.96 | 52/57 |
+
+Acceptance is unchanged (91 %), so this is a kernel-cost effect: the CPU's Q2_K
+verify at batch 6 costs more per layer than the byte savings gain. Combined
+with the frequency result above, the verify is bound by the CPU's per-layer
+latency at the verified batch, which neither clock, quant, nor offload count
+moves except through `-ngl` itself.
+
 ### `--poll` / threadpool spin **[clean]**
 
 `--poll 100 --poll-batch 100 --spec-draft-poll 1` vs the default 50: 6.37 vs
