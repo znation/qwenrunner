@@ -26,13 +26,12 @@
 #   MODEL CTX NP INSTANCES PORT THREADS HOST NGL LM BATCH UBATCH CTK CTV FA
 #   MTP MD NGLD NMAX CRAM SLOT_SAVE ALIAS SWAPCAP
 #
-#   ./serve.sh                      # 4 agent slots, 64 GiB prompt cache, NMAX=6
-#   NP=1 CRAM=8192 ./serve.sh       # single session, minimal footprint
-#   INSTANCES=4 ./serve.sh          # four servers, ports 8080-8083
-#   NMAX=6 ./serve.sh               # deeper speculation for code/agent traffic
-#   CRAM=65536 NP=8 ./serve.sh      # bigger prefill cache, more agent sessions
-#   MTP=0 ./serve.sh                # no speculative decoding
-#   CTK=q8_0 CTV=q8_0 ./serve.sh    # halve the KV cache per slot
+#   ./serve.sh                          # 4 agent slots at q4_0, 4 GiB cache, NMAX=6
+#   NP=2 ./serve.sh                     # +9 GiB of free RAM, two sessions
+#   CTK=f16 CTV=f16 CRAM=8192 ./serve.sh # +20 t/s at depth, at -12 GiB of free RAM
+#   NP=1 CRAM=8192 ./serve.sh           # single session, minimal footprint
+#   INSTANCES=4 ./serve.sh              # four servers, ports 8080-8083
+#   MTP=0 ./serve.sh                    # no speculative decoding
 # Extra args are appended verbatim to every llama-server command line.
 set -euo pipefail
 
@@ -62,9 +61,13 @@ INSTANCES="${INSTANCES:-1}"
 # scales with NP to keep every slot at full CTX.
 #
 # Default 4: one slot per concurrent agent session, which is what this repo is
-# for. Each slot reserves its full KV up front -- 8 GiB at 128k f16, so 32 GiB
-# for four whether or not anyone is connected. Use NP=1 if you only ever run one
-# session and want the RAM back.
+# for. With the q4_0 KV default the *cache* side is nearly free -- 2 GiB of KV
+# per 128k slot -- but a slot also carries its own Metal compute and draft
+# buffers, and the measured all-in cost is ~5 GiB per extra slot, not 2. Paired
+# in one session, CRAM=4096: NP=2 32.4 GiB free, NP=3 28.1, NP=4 22.6. So four
+# slots still leave more headroom than the f16 configuration did (21.5), for
+# four slots instead of two; NP=2 buys another 9 GiB back at half the
+# concurrency.
 NP="${NP:-4}"
 TOTAL_CTX=$(( CTX * NP ))
 PORT="${PORT:-8080}"
@@ -84,23 +87,52 @@ THREADS="${THREADS:-4}"
 # shared between instances. `-lm none` costs a full 15.4 GB read per process.
 LM="${LM:-mmap}"
 # Measured at 98.6k depth with MTP on (the operating point this serves):
-# -b 1024 -ub 256 generates 37.45 t/s against 28.52 for -b 2048 -ub 512, a
-# +31 % win, with prefill level (349.0 vs 340.0). The same pair wins both axes
-# at 64k depth. Only *shallow* prefill prefers 2048/512 (709.6 vs 633.3), and a
-# server holding 128k contexts spends its time generating, not prefilling.
+# -b 1024 -ub 256 generated 37.45 t/s against 28.52 for -b 2048 -ub 512 in a
+# single-rep-per-arm run. That depth result did NOT reproduce under two
+# interleaved reps per arm (mean 30.2 against 29.8, with +/-20 % scatter inside
+# a single config -- RESULTS.md, "Batch and threads at the operating point"),
+# and the prefill half of it points the other way: at depth the larger ubatch
+# wins (-ub 128 costs 18 %; -ub 512 measured best). The pair is kept because
+# shallow depth is where the small ubatch is measured to win generation
+# (28.76 against 25.54, and 21.64 against 17.76 at 64k), while only *shallow*
+# prefill prefers 2048/512 (709.6 against 633.3). Treat the depth generation
+# claim as unproven rather than as the reason for this default.
 BATCH="${BATCH:-1024}"
 UBATCH="${UBATCH:-256}"
 
-# q8_0 KV, chosen for *capacity* rather than raw speed. It halves both the slot
-# KV (4 GiB per 128k slot instead of 8) and every prompt-cache entry, which is
-# what lets this configuration cover every simultaneous conversation at once --
-# measured server footprint is 35.7 GiB against 50.3 for f16, and a cached 128k
-# conversation costs 4 GiB against 8. The price is measured and small: -10 %
-# generation at 128k depth (12.89 vs 14.34 t/s, no MTP) and -4 % prefill.
+# q4_0 KV is the default: this machine shares its 128 GB with other workloads
+# (the user runs local Kubernetes clusters on it), so the cache is sized by what
+# has to be *left over*, not by what the model could use. q4_0 is 2 GiB per 128k
+# slot against 8 (f16) and 4 (q8_0), and the paired measurement is **+12 GiB of
+# free memory for the same configuration**: NP=2/128k/CRAM=4096 served at
+# 33.4 GiB free with q4_0 against 21.5-21.9 with f16 (both pairs, same session,
+# byte-identical output on the probe prompt).
+#
+# It is the *slowest* of the three at depth, and that price is real: at 98.6k
+# with MTP on, 26.2 t/s against 30.5 (q8_0) and 47.2 (f16). f16 is 80 % faster
+# and costs 12 GiB more; q8_0 sits between. The mechanism is the one that makes
+# q8_0 slow in the first place -- the speculative verify batch is 7 query rows
+# and the Metal FA kernel dequantizes a quantized cache once per row, so a
+# smaller format does not cut that work proportionally. RESULTS.md, "KV dtype".
+#
+#   CTK=q8_0 CTV=q8_0 ./serve.sh          # +4 t/s at depth, -4 GiB free
+#   CTK=f16 CTV=f16 CRAM=8192 ./serve.sh  # +20 t/s at depth, -12 GiB free
+#   NP=2 ./serve.sh                       # +9 GiB free, two sessions
+#   CTX=65536 ./serve.sh                  # -4 GiB free, faster at depth
+#
+# Quality was the open question, and it measured clean: perplexity on this
+# model at 65 536 tokens of context is 3.3946 +/- 0.0357 at q4_0 against
+# 3.3809 +/- 0.0355 at f16 and 3.3809 at q8_0 -- +0.4 %, inside one standard
+# error, and 16k of context gave the same answer (1.9793 against 1.9780). That
+# is a perplexity gate on prose, not a long-context recall test; move to q8_0
+# (identical ppl, 4 GiB more, +4 t/s at depth) if output quality is the larger
+# concern. RESULTS.md, "KV dtype".
+#
 # A quantized V cache REQUIRES flash attention; -fa on below satisfies that.
-# CTK=f16 CTV=f16 restores the faster, hungrier configuration.
-CTK="${CTK:-q8_0}"
-CTV="${CTV:-q8_0}"
+# Never mix CTK and CTV: all four mixed-dtype runs loaded normally and then blew
+# a 1800 s request timeout (RESULTS.md, same section).
+CTK="${CTK:-q4_0}"
+CTV="${CTV:-q4_0}"
 FA="${FA:-on}"
 
 # MTP speculation: the biggest single lever on the Intel host (+97.8 %) and it
@@ -141,7 +173,8 @@ ALIAS="${ALIAS:-qwen3.8-27b}"
 #
 # Save the slot that currently holds the conversation, restore it before the
 # request that would otherwise re-prefill. Files are written where SLOT_SAVE
-# points, and a 128k q8_0 state is ~4 GiB each -- size the disk accordingly.
+# points, and a 128k state is ~2 GiB at the default q4_0 KV (~4 GiB at q8_0) --
+# size the disk accordingly.
 #
 # NOT ENABLED BY DEFAULT, and the round trip was measured to NOT pay off yet
 # (RESULTS.md, "Disk-backed slot states"): save and restore both work and are
@@ -169,20 +202,20 @@ SLOT_SAVE="${SLOT_SAVE:-}"
 # first turn. Size it as (conversations to keep warm) x (context KV), and note
 # this is a *ceiling* that the rest of the budget has to absorb:
 #
-#   server footprint (measured, no traffic) = idle-others 39.3 + this server
-#     NP=4 q8_0: 35.7 GiB   + CRAM 32 GiB  = ~107 GiB total   <- the default
-#     NP=4 f16 : 50.3 GiB   + CRAM 64 GiB  = ~153 GiB         <- does not fit
+#   host memory measured here, in one session, CRAM=4096, q4_0 KV:
+#     NP=2 (32.4 GiB free) / NP=3 (28.1) / NP=4 (22.6, the default)
+#     NP=2 f16 for reference: 21.5-21.9 GiB free
 #
-# Default 24576 = SIX 128k conversations: the four live slots plus two
-# displaced, which is the coverage this configuration is sized for. A q8_0
-# 128k conversation costs ~4.3 GiB (64 KiB/token halved, plus the 1-in-16
-# scale block), so six entries need ~26 GiB; entries are cut to the
-# conversation's actual length, so shorter sessions fit more than six.
-#
-# Worst case with the shipped defaults: 39.3 GiB idle-others + 39.1 GiB server
-# + 24 GiB cache = ~102 GiB, leaving ~25 GiB of headroom on a 128 GB machine.
-# Raise it only against that ceiling; CRAM=0 disables the cache.
-CRAM="${CRAM:-24576}"
+# Default 4096, deliberately small: this machine hosts other workloads, and the
+# cache is the one part of the footprint that grows without bound. At q4_0 a
+# 128k conversation costs ~2.1 GiB, so 4096 holds one full 128k entry or about
+# ten 30k ones -- entries are cut to the conversation's actual length. Note the
+# cache is empty until it is needed, so it is *not* where the free-RAM problem
+# is; shrinking it buys nothing today and costs a silent full re-prefill (85 s
+# at 30k, ~4.5 min at 128k) the day a displaced conversation returns. Size it to
+# the conversations you keep warm, not below: CRAM=12288 covers six 128k entries
+# at q4_0 for 12 GiB of ceiling.
+CRAM="${CRAM:-4096}"
 
 mkdir -p "$ROOT/logs"
 

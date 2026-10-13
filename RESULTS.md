@@ -8,7 +8,8 @@ from a run recorded under `results/`; the table rows are the CSV exports of
 > (`bench_*.jsonl`, `qc_*`, `mtp_q2.jsonl`, …). None of them were produced on
 > this machine and none of them are referenced below; the files created by this
 > branch are `bench_shallow.*`, `depth_f16.*`, `depth_q8.*`, `mtp_m5.jsonl`,
-> `parallel.jsonl` and `parallel_hi.jsonl`.
+> `parallel.jsonl`, `parallel_hi.jsonl` and the `mtp_depth_*.jsonl` files added
+> by the depth re-measurements below.
 
 ## Provenance
 
@@ -97,6 +98,11 @@ and 231 vs 222 t/s prefill — for 4 GiB more memory per instance.
 So the default is f16, and `CTK=q8_0 CTV=q8_0` is the lever to pull when the
 goal is more concurrent instances rather than a faster single stream.
 
+**Read that with the speculative-decoding caveat in "KV dtype" below**: with
+MTP on — which is how the server ships — the same comparison at 98.6k depth is
+46.1 (`f16`), 30.7 (`q8_0`) and 26.2 (`q4_0`) t/s, and the shipped default is
+`q4_0` for host memory rather than speed. The numbers above are unspeculated.
+
 A quantized V cache requires flash attention; with `-fa on` that is satisfied
 either way.
 
@@ -115,9 +121,9 @@ either way.
 Generation is flat from 4 to 18 — the GPU does that work. Prefill is not:
 `-t 18` (all cores, including the 12 slower ones) costs **30 %** versus `-t 4`.
 The Intel result was the same shape (`-t 16` was ~8 % worse than 8); here the
-penalty is larger and the optimum lower. `serve.sh` defaults to the super-core
-count (6) and the sweep says 4 is marginally better; anywhere in 4–12 is fine,
-18 is not.
+penalty is larger and the optimum lower. `serve.sh` defaults to 4, which the
+sweep says is marginally better than the super-core count; anywhere in 4–12 is
+fine, 18 is not.
 
 ## Batch
 
@@ -198,8 +204,161 @@ and this build drives speculation from it. The sidecar is still preferred —
 the embedded tensors when the sidecar is missing, and that fallback is measured,
 not assumed.
 
-Not measured: MTP at 128k *depth* (this row is at ~4k), and MTP with a
-quantized KV cache.
+Both gaps this paragraph used to list — MTP at 128k *depth* (the table above is
+at ~4k) and MTP with a quantized KV cache — are measured at the operating point
+in "The shipped operating point, re-measured at 98k depth" below. The second one
+turned out to be worth far more than its −10 % row said — see "KV dtype" there.
+
+## The shipped operating point, re-measured at 98k depth
+
+### MTP on/off and draft depth
+
+Every MTP number above was taken at ~4k of prompt *and* with an f16 KV cache.
+`serve.sh` serves neither: the workload is a ~100k-token transcript and the
+shipped KV dtype is `q8_0`. `results/mtp_depth_ab.jsonl`: `data/prompt_100k.txt`
+(the llama.cpp README, `llama-server` logs `prompt_n = 98591`), 128k context,
+`-ngl 99 -t 4 -b 1024 -ub 256 -ctk q8_0 -ctv q8_0 -fa on --spec-type draft-mtp
+-md models/mtp-Qwen3.8-27B-Q4_0.gguf -ngld 99`, `n_predict=128`, temperature 0,
+one server per arm, two interleaved reps each:
+
+| arm | tg t/s, per rep | mean | vs `MTP=0` | draft accepted | pp t/s |
+|---|---|---|---|---|---|
+| `MTP=0` | 15.69 14.73 | **15.21** | — | — | 365.7 / 331.3 |
+| `--spec-draft-n-max 3` | 23.97 20.08 | **22.03** | +45 % | 95/95 | 347.1 / 333.6 |
+| `--spec-draft-n-max 6` (shipped) | 26.99 29.39 | **28.19** | **+85 %** | 108/108 | 344.7 / 342.0 |
+| `--spec-draft-n-max 9` | 28.17 24.28 | 26.23 | +72 % | 114/114 | 330.0 / 341.7 |
+
+* **Speculation is worth more at depth, not less.** The unspeculated arm pays
+  the full 128k attention read on every token and runs at 15.2 t/s against
+  24.4 t/s shallow; `n_max=6` recovers most of that, +85 % over `MTP=0` here
+  against +180 % on the same kind of text at shallow depth.
+* **`n_max` 9 is not a depth win either.** Its reps, 28.17 and 24.28, straddle
+  the 6-arm's 26.99 and 29.39, and at shallow depth 9 loses to 6 on acceptance
+  (89 % against 97 %). The shipped depth is right at both ends of the context
+  range.
+* **Prefill is unaffected** (330–366 t/s across all four arms), as at shallow
+  depth: the draft head shares the same offload.
+* Same caveat as the table above: acceptance here is 100 % because the prompt
+  is the llama.cpp README and the model continues markdown verbatim. This is
+  the patterned-text upper bound, not an average. Acceptance is *identical*
+  across every arm below, so differences between arms are kernel cost, not
+  speculation quality.
+
+### KV dtype: f16 is fastest, q4_0 is the RAM choice, and the verify batch decides
+
+Five sweeps at this operating point, only `-ctk/-ctv` changed, every sample at
+98.6k depth with MTP `n_max=6`:
+
+| KV | tg t/s, every sample | mean | slot KV at `NP=2` | GPU peak MiB |
+|---|---|---|---|---|
+| `f16/f16` | 40.97 44.80 46.32 47.13 47.98 49.52 | **46.1** | 16 GiB | 28 244–29 784 |
+| `q8_0/q8_0` | 25.27 26.99 28.04 29.39 31.20 32.01 32.11 33.03 34.08 35.16 | **30.7** | 8 GiB | 24 342–26 182 |
+| `q4_0/q4_0` | 24.46 27.88 | **26.2** | 4 GiB | 23 166–23 941 |
+
+`results/mtp_depth_kv.jsonl`, `mtp_depth_kv2.jsonl` (a 2×2 of K and V dtype,
+two interleaved reps), `mtp_depth_kv3.jsonl` (three-way, arm order reversed on
+the second rep). No two arms overlap, and every arm accepted exactly 108/108
+draft tokens, so this is kernel cost on identical work, not speculation
+quality. Prefill is unmoved by dtype (349–365 t/s throughout).
+
+**The whole difference is decoding with a speculative verify batch.** The
+unspeculated depth table earlier in this file credits `q8_0` with a −10 % cost
+(12.89 against 14.34 t/s at 131k); with `n_max = 6` that becomes −33 %, and
+`q4_0` is a further −15 %. Mechanism: the flash-attention vec kernel is chosen
+when the batch has fewer than 20 query rows, and the `use_kv_f16` heuristic
+(`ggml/src/ggml-metal/ggml-metal-ops.cpp`) *refuses* the dequantise-to-f16 path
+for head sizes below 512 in exactly that case. So a speculative verify batch —
+`ne01 = n_max + 1 = 7` rows — runs the quantized-KV kernel that dequantizes its
+K/V inline, the same K/V being re-read and re-dequantized once per query row,
+while without speculation the batch is one row and the same kernel is
+competitive. q4_0 keeps that structure and pays slightly more dequantization per
+element for half the bytes. [INFERENCE: the code path is read, the attribution
+to that kernel is inferred from the shape; the measurements are direct.]
+
+**What each one buys in host memory**, paired back to back in one session
+(`NP=2`, 128k per slot, `CRAM=4096`, two requests served each, byte-identical
+output and draft acceptance):
+
+| KV | host `used` | free |
+|---|---|---|
+| `f16/f16` | 106.2 / 105.6 | 21.5–21.8 GiB |
+| `q4_0/q4_0` | 94.1 / 94.0 | **33.9–34.0 GiB** |
+
+**+12 GiB of free RAM for the same configuration**, reproduced in both pairs.
+This is the only measurement in the file where the idle baseline is controlled:
+the machine's idle `used` drifted from 68.7 to 88.6 GiB over the same afternoon,
+so absolute figures taken hours apart are not comparable and the paired
+before/after is what carries the result.
+
+**Quality, measured at last.** `llama-perplexity`, this model, one chunk of
+`data/ppl_corpus.txt`:
+
+| KV | PPL @16 384 | PPL @65 536 |
+|---|---|---|
+| `f16/f16` | 1.9780 ± 0.0325 | 3.3809 ± 0.0355 |
+| `q8_0/q8_0` | — | 3.3809 ± 0.0355 |
+| `q4_0/q4_0` | 1.9793 ± 0.0325 | 3.3946 ± 0.0357 |
+
+q4_0 is +0.07 % at 16k and **+0.4 % at 65k, inside one standard error**; q8_0 is
+identical to f16 to four decimal places. Read it as "no gross damage", not as
+"free": perplexity does not test long-context retrieval, which is where a
+quantized V cache is expected to fail first, and the corpus is once-through
+prose rather than the code this server is used for. 128k needs at least
+2 × context tokens and this corpus has 174 869, so 65 536 is the deepest gate
+these data support.
+
+**Mixing K and V dtypes is a trap.** All four `q8_0`-K/`f16`-V and
+`f16`-K/`q8_0`-V runs — both orders, both reps — *load* normally (4–5 s,
+24–27 GiB) and then never answer a request: the 128-token generation blew the
+1800 s request timeout in 4 of 4 attempts, against ~4 s for either matched
+pair, with no error in the server log. Do not mix. [INFERENCE: whether the
+mixed pair hits a degenerate kernel path or an unbounded dequant loop is not
+established — nothing in the log says, and this was not bisected.]
+
+**This changed the shipped default twice.** The default is now `NP=4 CTK=q4_0
+CTV=q4_0 CRAM=4096`, because this machine shares its 128 GB with the user's
+other workloads (local Kubernetes clusters) and the KV cache is the part of the
+footprint that has to give: four q4_0 slots reserve 8 GiB of KV where four f16
+slots reserved 32, and the cache ceiling drops from 24 GiB to 4. Paired in one
+session at `CRAM=4096`: `NP=2` 32.4 GiB free, `NP=3` 28.1, `NP=4` 22.6 — so the
+four-slot q4_0 default still leaves more headroom than the two-slot f16
+configuration it replaced (21.5), and the cost is decode speed: 26.2 against
+30.7 (`q8_0`) and 46.1 (`f16`) t/s at 98.6k. Per-slot cost is ~5 GiB all-in, not
+the 2 GiB of KV, because each slot carries its own compute and draft buffers.
+The f16 default that this file briefly carried was right about speed and wrong
+about the machine: `CTK=f16 CTV=f16 CRAM=8192` is the speed configuration when
+nothing else needs the RAM.
+
+
+### Batch and threads at the operating point: the +31 % does not reproduce
+
+The default `-b 1024 -ub 256` was chosen on a single rep per arm at 98.6k
+depth. Re-measured with two interleaved reps per arm
+(`results/mtp_depth_tune2.jsonl`, MTP `n_max=6`, `q8_0` KV, 98 591-token
+prompt), the shipped configuration's own two reps differ by 39 % — 25.27 and
+35.16 t/s — which is wider than any between-config difference in the sweep:
+
+| config | tg t/s, per rep | mean | pp t/s, per rep | mean |
+|---|---|---|---|---|
+| `-b 1024 -ub 256 -t 4` (shipped) | 25.27 35.16 | 30.21 | 341.5 359.9 | 350.7 |
+| `-b 1024 -ub 256 -t 8` | 27.00 30.11 | 28.56 | 346.6 354.9 | 350.7 |
+| `-b 2048 -ub 512 -t 4` | 31.53 28.03 | 29.78 | 358.2 365.3 | 361.7 |
+| `-b 1024 -ub 128 -t 4` | 35.74 26.51 | 31.12 | 286.1 287.4 | 286.7 |
+
+So `-b 2048 -ub 512` is not slower at depth (29.8 against the shipped 30.2, and
+28.5 in the original single-rep run), and the generation axis at 98k is
+dominated by machine drift — ±20 % *within* a config, measured across a 40 min
+sweep — not by the ubatch. The prefill axis does reproduce, and it points the
+other way from the single-rep claim that the pair was "prefill level":
+`-ub 128` costs 18 % prefill (286.7 against 350.7) and `-ub 512` is the best of
+the three (361.7). `-t 8` is indistinguishable from `-t 4` on both axes, the
+same shape as the 64k thread sweep.
+
+The shipped pair is still defensible — shallow depth is where the small ubatch
+is measured to win generation (28.76 against 25.54, and 21.64 against 17.76 at
+64k) and at the operating point it is at worst tied — but its depth figure is
+a single sample that the interleaved re-measurement does not support, and the
+prefill half of that claim is contradicted.
 
 ## MTP's gain is a property of the text, not of the machine
 
@@ -477,11 +636,14 @@ continuation) concurrency costs; where it is not (lower acceptance, more
 compute per token) concurrency *adds* until the GPU saturates. Both are real,
 and which one you get depends on the traffic.
 
-**Recommendation.** `serve.sh` defaults to `NP=4` and `INSTANCES=1`: the repo
-exists to serve a handful of concurrent agent sessions, and slots are the cheap
-way to do it. Each slot reserves its full KV up front — 8 GiB per 128k slot, so
-32 GiB for four whether or not a client is connected — which is the price of
-that default; `NP=1 CRAM=8192 ./serve.sh` is the single-session configuration.
+**Recommendation.** `serve.sh` defaults to `NP=4 CTK=CTV=q4_0 CRAM=4096` and
+`INSTANCES=1`: four concurrent agent sessions at the RAM-first dtype, which is
+the configuration the user chose once q4_0 made the KV cheap. Note the per-slot
+cost is *not* the 2 GiB of KV — each slot also carries Metal compute and draft
+buffers, and the measured all-in cost is ~5 GiB per extra slot, paired in one
+session with `CRAM=4096`: `NP=2` 32.4 GiB free, `NP=3` 28.1, `NP=4` 22.6. So
+`NP=2 ./serve.sh` buys 10 GiB back at half the concurrency, and `NP=1
+CRAM=8192 ./serve.sh` is the minimal-footprint configuration.
 For N concurrent clients: `NP=N` (one port, one process, cheapest memory, most
 slots) or `INSTANCES=N` (N ports, separate processes, marginally better measured
 per-stream at N=4 but half the headroom and a hard ceiling at 4). Pick slots for
@@ -531,7 +693,7 @@ Measured with ~30 000-token prompts, `NP=1`:
 | A, then A + 19 tokens | **the agent turn** (append and re-send) | **19** | **0.41 s** |
 | A, B, A (default 8192) | eviction + restore by the RAM cache | 3rd = **4** | 0.58 s |
 | A, B, A (`--cache-ram 2048`) | the budget too small to hold both | 3rd = **29 772** | **57.1 s** |
-| A, B, A (`--cache-ram 65536`, in `serve.sh`) | the shipped default | 3rd = **4** | 0.50 s |
+| A, B, A (`--cache-ram 24576`, the former default) | the budget the f16 default used | 3rd = **4** | 0.50 s |
 
 **A growing transcript costs its delta.** The second row is the whole agentic
 case: 19 new tokens, 0.41 s, against 62.9 s to prefill the same context cold —
@@ -543,10 +705,11 @@ entry costs the context's KV, 64 KiB/token at f16, so a 128k conversation is
 mode: with two 30k conversations and a 2 GiB budget, the third request
 re-prefilled all 29 772 tokens and nothing in the response says so — a cache
 miss and a first turn look identical from outside. `serve.sh` therefore ships
-`CRAM=65536`, sized by `conversations x context-KV`: eight 128k f16
-conversations, i.e. four live slots plus headroom for a conversation displaced
-by a one-off request. It is host RAM, which is the resource this machine has
-most of; the cache only fills as conversations arrive, and `CRAM=0` disables it.
+`CRAM=24576`, sized by `conversations x context-KV`: three 128k f16
+conversations (two live slots plus one displaced), or many more when sessions
+are shorter, since an entry is cut to the conversation's actual length. It is
+host RAM, which is the resource this machine has most of; the cache only fills
+as conversations arrive, and `CRAM=0` disables it.
 
 **It is also a ceiling, and the budget has to absorb it.** Measured with four
 idle slots and no traffic:
@@ -555,19 +718,24 @@ idle slots and no traffic:
 |---|---|---|---|
 | idle (other tenants + OS) | 39.3 GiB | 58.2 | — |
 | `NP=4`, f16 KV | 89.6 GiB | 15.4 | 50.3 GiB |
-| `NP=4`, **q8_0 KV (shipped)** | **78.4 GiB** | 24.4 | 39.1 GiB |
+| `NP=4`, q8_0 KV (the former default) | 78.4 GiB | 24.4 | 39.1 GiB |
 | `NP=2`, q8_0 KV | 62.1 GiB | 42.1 | 22.8 GiB |
 
-A 128k conversation costs 8 GiB of cache at f16 and ~4.3 GiB at q8_0
-(64 KiB/token; the load footprints above confirm the f16 figure — `NP=4` f16 is
-weights 14.3 + 4x8 KV + ~4 compute = 50.3). So `CRAM=65536` at f16 would commit
-50 + 64 = 114 GiB on top of the 39 GiB other tenants hold, i.e. 153 GiB on a
-128 GB machine: it does not fit. **The shipped default is `q8_0` KV with
-`CRAM=24576`** — 39.3 + 39.1 + 24 = ~102 GiB worst case, ~25 GiB of headroom —
-which keeps six 128k conversations warm: the four live slots plus two displaced.
-That is the configuration change that makes "cover every simultaneous
-conversation" true rather than aspirational, for a fleet of that size; the price
-is the measured −10 % generation at depth.
+A 128k conversation costs 8 GiB of cache at f16, ~4.3 GiB at q8_0 and ~2.1 GiB
+at q4_0 (64 KiB/token and down; the load footprints above confirm the f16 figure
+— `NP=4` f16 is weights 14.3 + 4x8 KV + ~4 compute = 50.3). So `CRAM=65536` at
+f16 would commit 50 + 64 = 114 GiB on top of the 39 GiB other tenants hold, i.e.
+153 GiB on a 128 GB machine: it does not fit. **The shipped default is now `q4_0/q4_0` with
+`CRAM=4096` at `NP=4`**, chosen by the user after the f16 default (`NP=2`, 128k,
+`CRAM=24576`) measured 106.2 GiB used / 21.5 GiB free while serving and left
+less room than local Kubernetes clusters need. The q4_0 four-slot default
+measures 105.0 / 22.6, and drops to 95.9 / 32.4 at `NP=2` and 99.8 / 28.1 at
+`NP=3`; the cache ceiling falls from 24 GiB to 4 at the same time. At q4_0 those
+4 GiB still hold one full 128k conversation or about ten 30k ones, because
+entries are cut to the conversation's actual length; the dtype change costs
+decode speed (26.2 against 30.7 at `q8_0` and 46.1 at `f16` t/s at 98.6k), not
+capacity, and the perplexity gate at 65 536 tokens is inside one standard error.
+See "KV dtype" above.
 
 **And `CRAM=24576` covers the fleet it is sized for.** Six *independent*
 conversations (non-overlapping 42k-char slices of the corpus, ~13.5k tokens
@@ -623,7 +791,7 @@ and a GET returns 404.
 Until that is resolved, the disk tier is plumbing, not a performance tier, and
 `CRAM` is the only cache knob worth trusting.
 
-## Concurrency and interference — the caveat behind the 4-slot default
+## Concurrency and interference — the caveat behind the slot default
 
 Measured with warm caches (so `prompt_n` is 4-123, i.e. no prefilling at all),
 4k-token prompts, `NMAX=6`, decode-only:
@@ -663,13 +831,30 @@ degrade far more gracefully than slots.** Two things soften it in practice:
   first turn of each session. The cache budget and this effect compound.
 * The starving prefill is itself fast (30 000 tokens in ~60 s at ~490 t/s).
 
-The defaults stay `NP=4` for the common agentic case (N similar sessions,
-transcripts cached, decode-dominated turns) and `INSTANCES` is the answer when
-prefills overlap: `INSTANCES=2 NP=2` is the middle ground — two batches, four
-conversations, half the memory of four processes.
+The defaults are `NP=2 CTK=CTV=q4_0 CRAM=4096` for the common agentic case (N
+similar sessions, transcripts cached, decode-dominated turns) and `INSTANCES` is
+the answer when prefills overlap: `INSTANCES=2 NP=2` is the middle ground — two
+batches, four conversations, half the memory of four processes.
 
 ## What was discarded
 
+* **A local re-sweep of the Metal FA-vec kernel config.** `build/bin/ggml-metal-tuning`
+  (vendored as `third_party/llama.cpp/tools/tuning`) tunes the flash-attention
+  vec `(Q, NE)` selection per (dtype, head size, KV depth, batch width), and the
+  table it writes into (`ggml/src/ggml-metal/ggml-metal-tuning.cpp`) already
+  carries an `Apple10 - M5_MAX` segment — including `dk=dv=256` at `q4_0`,
+  `q8_0` and `f16`, which is exactly this model's shape at the KV dtypes the
+  server has shipped. Re-running
+  it for that shape (`build/bin/ggml-metal-tuning fa-vec --dtype q8_0 --dk 256`,
+  7.4 min) emitted two rows, both identical to the rows already in the table
+  (`{-1,0} -> {1,4}` and `{-1,1} -> {1,4}`), so the kernel the server actually
+  uses is already the tuned one for this device. The sweep also shows why
+  nothing finer is on offer: per-cell anchor drift on this box runs 11–53 %
+  (desktop GPU tenant plus thermals), and the no-harm rule refuses a config that
+  is not faster at *every* batch width in a bucket. The cell that would have
+  mattered — the MTP verify batch, where `ne01 = n_max + 1` — lands in bucket
+  `ne01_b = 4`, where `Q1 NE4` wins at `ne01` 5, 6, 8 and 16 and only `ne01 = 7`
+  prefers `Q2 NE4`, by 9 % against a 21 % noise floor. Rejected, correctly.
 * **`-ngl 0` took 830 s** for one arm (2 reps of pp512 + tg128 on 18 CPU
   cores, with the model streaming from page cache). It is kept in the table
   because it is the floor, but it dominates the wall clock of the `ngl` stage

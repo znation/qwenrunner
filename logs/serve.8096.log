@@ -1,0 +1,11 @@
+0.00.145.695 I srv  llama_server: initializing ...
+0.00.145.702 I cmn  common_param: common_params_print_info: verbosity = 3 (adjust with the `-lv N` CLI arg)
+0.00.145.867 W srv  llama_server: security: no API key is set and CORS allows all origins (see https://github.com/ggml-org/llama.cpp/pull/25655)
+0.00.148.057 I srv    load_model: loading model '/Users/zach/qwenrunner/models/Qwen3.8-27B-UD-Q4_K_S.gguf'
+0.11.525.595 I cmn          init: llama threadpool init, n_threads = 4
+0.12.429.596 I common_speculative_init_result: loading draft model '/Users/zach/qwenrunner/models/mtp-Qwen3.8-27B-Q4_0.gguf'
+0.14.370.354 I srv    load_model: initializing, n_slots = 4, n_ctx_slot = 131072, kv_unified = 'false'
+0.14.740.428 W srv          init: chat template supports preserving reasoning, it is enabled by default (may use more tokens, disable via --no-reasoning-preserve)
+0.14.740.442 I srv  llama_server: model loaded
+0.14.740.444 I srv  llama_server: listening on http://127.0.0.1:8096
+0.17.290.760 I srv    operator(): operator(): cleaning up before exit...
