@@ -1,26 +1,24 @@
 #!/usr/bin/env bash
 # serve.sh — launch llama-server for the local agent stack.
 #
-# DEFAULT (./serve.sh): two instances, one per GPU, no split, no MTP:
-#   * Qwen3.5-9B Q4_K_M on the GTX 1070 eGPU (CUDA, :8080) — the main agent
-#   * Qwen3.5-4B Q4_K_M on the Vega 10 display GPU (Vulkan, :8081) — a parallel
-#     secondary for subagents, under the 5000 MiB watchdog so the desktop
-#     cannot be taken down
-# Both run llama.cpp's own --fit with a per-GPU --fit-target, always — no
-# hand-derived layer count: the 1070 instance leaves 256 MiB free, the Vega
-# instance leaves (vram_total - CAP) free, so the fit holds the display cap
-# regardless of desktop drift; at the default context both land fully resident
-# (the 9B's hybrid DeltaNet keeps the KV cache to 8 of 32 layers, ~1.1 GiB at
-# the 131072 pool). Fully resident means generation is memory-bandwidth-bound —
-# ~30-40 t/s on the 1070 for the 9B and ~50-90 t/s on the Vega for the 4B,
-# versus the 2-6 t/s the old 27B split managed. Extra args are appended to the
-# eGPU instance's command.
+# DEFAULT (./serve.sh): one fully-resident instance on the Vega 10 display GPU
+# only — no eGPU involved:
+#   * Qwen3.5-4B Q4_K_M on Vulkan0 (:8080), under the 5000 MiB watchdog
+# The 9B cannot fit under the display cap (its Q4_K_M weights alone exceed
+# 5000 MiB), so the 4B is the default model. --fit always, target
+# (vram_total - CAP) free, so the fit holds the cap regardless of desktop
+# drift; at a quiet desktop the 4B is fully resident and generation is
+# memory-bandwidth-bound (~50-90 t/s on the Vega, vs the 2-6 t/s the old 27B
+# split managed).
 #
 # Overridable via env:
-#   MAIN_MODEL MAIN_ALIAS MAIN_CTX MAIN_NP MAIN_PORT MAIN_FITT   (eGPU)
-#   VEGA_MODEL VEGA_ALIAS VEGA_CTX VEGA_NP VEGA_PORT VEGA_CAP VEGA_FITT
-#   THREADS HOST
-#   LEGACY=1  — the old single Qwen3.8-27B split across both GPUs (its own env:
+#   MODEL ALIAS CTX NP PORT CAP THREADS HOST FITT
+#   EGPU=1   — two fully-resident instances: Qwen3.5-9B on the GTX 1070 eGPU
+#              (:8080) + Qwen3.5-4B on the Vega (:8081); its own env:
+#              MAIN_MODEL MAIN_ALIAS MAIN_CTX MAIN_NP MAIN_PORT MAIN_FITT
+#              VEGA_MODEL VEGA_ALIAS VEGA_CTX VEGA_NP VEGA_PORT VEGA_CAP VEGA_FITT
+#   LEGACY=1 — the old single Qwen3.8-27B split across both GPUs (requires the
+#              eGPU; its own env:
 #               MODEL ALIAS CTX TS NGL LM BATCH UBATCH CTK CTV FA HOST PORT
 #               CAP NP MTP MD DEVD NGLD DCTK DCTV DNMAX DPMIN FIT FITT_CUDA),
 #               e.g. LEGACY=1 ./serve.sh  or  LEGACY=1 MTP=0 ./serve.sh.
@@ -30,9 +28,10 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export PATH="$ROOT/tools/local/usr/bin:$PATH"
 export LD_LIBRARY_PATH="$ROOT/build/bin:$ROOT/tools/local/usr/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH:-}"
 
+EGPU="${EGPU:-0}"
 LEGACY="${LEGACY:-0}"
-if [ "$LEGACY" = 0 ]; then
-    # ---- default: two fully-resident instances, one per GPU ----
+if [ "$EGPU" = 1 ]; then
+    # ---- eGPU mode (EGPU=1): two fully-resident instances, one per GPU ----
 
     # eGPU (GTX 1070) main agent. 131072 with -np 2 is 65536 per slot — the
     # same per-slot context the clients already expect (pi contextWindow
@@ -125,6 +124,48 @@ if [ "$LEGACY" = 0 ]; then
     rc=0
     wait -n "$MAIN_PID" "$VEGA_PID" || rc=$?
     exit "$rc"
+fi
+
+if [ "$LEGACY" = 0 ]; then
+    # ---- default: one fully-resident instance on the Vega 10 (display GPU),
+    # no eGPU involved. The 9B cannot fit under the display cap (its Q4_K_M
+    # weights alone exceed 5000 MiB), so the default model is the 4B; EGPU=1
+    # restores the two-GPU mode. --fit always, leaving (vram_total - CAP) free
+    # so the fit holds the cap regardless of desktop drift (it sees the
+    # desktop in `free`); no -ngl/-ts anywhere (the fit aborts if either is
+    # set). O_DIRECT is unsupported on the Vega (measured: dio falls back to
+    # buffered IO with a warning), so -lm none.
+    MODEL="${MODEL:-$ROOT/models/Qwen3.5-4B-Q4_K_M.gguf}"
+    ALIAS="${ALIAS:-Qwen3.5-4B}"
+    CTX="${CTX:-65536}"
+    NP="${NP:-1}"
+    PORT="${PORT:-8080}"
+    CAP="${CAP:-5000}"
+    HOST="${HOST:-127.0.0.1}"
+    THREADS="${THREADS:-8}"
+    FITT="${FITT:-$(python3 -c "import sys; sys.path.insert(0, '$ROOT/scripts'); import guard; print(int(guard.vram_total_mib() - $CAP))" 2>/dev/null || true)}"
+    if [ -z "${FITT:-}" ] || [ "$FITT" -lt 256 ]; then
+        echo "serve: WARNING could not derive the --fit target (vram_total - cap); using 256 MiB" >&2
+        FITT=256
+    fi
+    if ! "$ROOT/build/bin/llama-bench" --list-devices 2>/dev/null | grep -q '^  Vulkan0:'; then
+        echo "serve: no Vulkan0 backend (the Vega 10 display GPU) is built." >&2
+        exit 1
+    fi
+    if [ ! -f "$MODEL" ]; then
+        echo "serve: missing $MODEL" >&2
+        echo "serve: run ./scripts/dl_dual.sh to fetch the Qwen3.5-9B + Qwen3.5-4B pair" >&2
+        exit 1
+    fi
+    mkdir -p "$ROOT/logs"
+    echo "serve: model=$(basename "$MODEL") alias=$ALIAS dev=Vulkan0 ctx=$CTX ($(( CTX / NP ))/slot x $NP) --fit-target ${FITT}MiB cap=${CAP}MiB  http://$HOST:$PORT"
+    exec python3 "$ROOT/scripts/guard.py" --cap-mib "$CAP" --label serve \
+        --log "$ROOT/logs/serve.log" -- \
+        "$ROOT/build/bin/llama-server" \
+        -m "$MODEL" -a "$ALIAS" -c "$CTX" -t "$THREADS" -np "$NP" \
+        -dev Vulkan0 --fit on -fitt "$FITT" -lm none -b 2048 -ub 512 \
+        -ctk q4_0 -ctv q4_0 -fa on \
+        --host "$HOST" --port "$PORT" "$@"
 fi
 # ---- legacy (LEGACY=1): one Qwen3.8-27B split across both GPUs ----
 

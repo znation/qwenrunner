@@ -2,24 +2,26 @@ qwenrunner
 
 A local LLM inference stack for agentic coding on a 2019 Intel iMac (8-core /
 16-thread Core i9, AMD Vega 10 / Radeon Pro Vega 48 with 8 GB — the display
-GPU) plus a Thunderbolt GTX 1070 eGPU.
+GPU).
 
 Usage of the display GPU should never, ever exceed 5 GB since that is also the
 desktop.
 
-The default (`./serve.sh`) runs two fully-resident instances, one per GPU, both
-fitted by llama.cpp's own `--fit` with a per-GPU `--fit-target` — no
-hand-derived layer counts:
+The default (`./serve.sh`) runs one fully-resident instance on the Vega 10
+only — no eGPU involved — fitted by llama.cpp's own `--fit` with a
+`--fit-target` of `vram_total - cap`, so the display cap holds regardless of
+desktop drift:
 
-* **Qwen3.5-9B Q4_K_M** on the GTX 1070 eGPU (`:8080`) — the main agent
-* **Qwen3.5-4B Q4_K_M** on the Vega 10 (`:8081`) — a parallel secondary for
-  subagents, under the 5000 MiB watchdog
+* **Qwen3.5-4B Q4_K_M** on the Vega 10 (`:8080`), under the 5000 MiB watchdog
 
-Two fully-resident models are memory-bandwidth-bound: ~30-40 t/s generation on
-the 1070 for the 9B and ~50-90 t/s on the Vega for the 4B. The previous
-default — one Qwen3.8-27B split across both GPUs, most layers on CPU — ran at
-2-6 t/s; everything below is that config's measurement history, and it survives
-as `LEGACY=1 ./serve.sh`.
+The 9B cannot fit under the display cap (its Q4_K_M weights alone exceed 5000
+MiB), so the 4B is the default model. Fully resident and memory-bandwidth-bound:
+~29 t/s generation on the Vega. With the eGPU attached, `EGPU=1 ./serve.sh`
+adds a **Qwen3.5-9B** main agent on the GTX 1070 (`:8080`) and moves the 4B to
+`:8081` as a parallel secondary (~15.8 t/s / ~35.9 t/s). The previous default —
+one Qwen3.8-27B split across both GPUs, most layers on CPU — ran at 2-6 t/s;
+everything below is that config's measurement history, and it survives as
+`LEGACY=1 ./serve.sh`.
 
 ## Result
 
@@ -161,27 +163,25 @@ present. Both backends end up in one binary and `-dev` selects between them.
 ## Run
 
 ```
-./serve.sh                       # Qwen3.5-9B on the eGPU (:8080) + Qwen3.5-4B on the Vega (:8081)
-MAIN_CTX=65536 ./serve.sh        # smaller eGPU pool (2 x 32k slots)
-VEGA_CTX=65536 ./serve.sh        # bigger Vega pool (2 x 32k) — still under the cap
+./serve.sh                       # Qwen3.5-4B on the Vega 10 (:8080) — no eGPU needed
+CTX=32768 NP=2 ./serve.sh        # two 16k slots instead of one 64k (parallel subagents)
+EGPU=1 ./serve.sh                # with the eGPU: Qwen3.5-9B on the 1070 (:8080) + 4B on the Vega (:8081)
 LEGACY=1 ./serve.sh              # the old Qwen3.8-27B split across both GPUs
 ```
 
-Both instances always run llama.cpp's own `--fit on` with a per-GPU
-`--fit-target` (`-fitt`) — the layer count is derived from live free VRAM, never
-by hand. The eGPU instance leaves 256 MiB free (`MAIN_FITT`); the Vega instance
-leaves `vram_total - CAP` free (`VEGA_FITT`, 3176 MiB here), which — because
-the fit sees the desktop's usage in `free` — holds the display cap regardless
-of desktop drift. At the default contexts both models land fully resident, so
-there is no CPU inference path and no MTP (pointless at memory-bandwidth
-speeds). The Vega instance runs under `scripts/guard.py` as the backstop.
+The server always runs llama.cpp's own `--fit on` with a `--fit-target`
+(`-fitt`) — the layer count is derived from live free VRAM, never by hand. The
+Vega instance leaves `vram_total - CAP` free (`FITT`, 3176 MiB here), which —
+because the fit sees the desktop's usage in `free` — holds the display cap
+regardless of desktop drift. At the default context the 4B is fully resident,
+so there is no CPU inference path and no MTP (pointless at memory-bandwidth
+speeds). `scripts/guard.py` is the backstop.
 
-Each instance's `-c` is its own **shared pool**, divided by its `-np`. The main
-agent defaults to `MAIN_CTX=131072` with `-np 2` → **65536 per slot** — the same
-per-slot context the clients already expect. The Vega secondary defaults to
-`VEGA_CTX=32768` with `-np 2` → 16k per slot; it is meant for subagents and
-parallel requests, and its 4B footprint (~3.3 GiB at that pool) leaves ~1.7 GiB
-of display-cap headroom at a typical desktop baseline.
+The default is `CTX=65536` with `-np 1` → **one 65536-slot** — the same per-slot
+context the clients already expect (pi `contextWindow` 59392), at a ~3.3 GiB
+model footprint that leaves ~1.7 GiB of display-cap headroom at a typical
+desktop baseline. `NP=2` halves the pool per slot but buys fairness for
+concurrent agents.
 
 The local model's entry in both clients is set to **58k of that 64k slot**,
 leaving room for tool-call output: pi in `~/.pi/agent/models.json`
@@ -201,9 +201,18 @@ request's `model` field, so a client still sending an older id works. The Vega
 secondary on `:8081` is a second, fully parallel server — point a subagent
 fleet at it for a second lane of work that never contends with the main agent.
 
-`serve.sh` requires the eGPU (the default's main agent lives on it) and prints
-the configuration it picked. It errors out if `/dev/nvidia0` is absent or the
-binary was built without CUDA.
+`serve.sh` prints the configuration it picked. The default needs no eGPU at
+all — it can be powered off; `EGPU=1` and `LEGACY=1` require it and error out
+if `/dev/nvidia0` is absent or the binary was built without CUDA.
+
+### EGPU=1 — the two-GPU mode
+
+`EGPU=1 ./serve.sh` runs Qwen3.5-9B on the GTX 1070 (`:8080`, `MAIN_*` env) and
+Qwen3.5-4B on the Vega (`:8081`, `VEGA_*` env), both fully resident, each
+fitted by `--fit` with its own `--fit-target` (256 MiB on the eGPU, vram_total
+− cap on the display GPU). The 9B's hybrid DeltaNet keeps its KV cache to 8 of
+32 layers (~1.1 GiB at the 131072 pool). Measured: ~15.8 t/s on the 1070 and
+~35.9 t/s on the Vega.
 
 ### LEGACY=1 — the Qwen3.8-27B split (the previous default)
 
@@ -256,10 +265,11 @@ draft on the Vega, **+3.6 %** on Q2_K_XL at `-ngl 16` where the target is fast
 enough that the draft becomes the bottleneck, and **+9 %** on a mid-document
 continuation where only 26 % of drafts are accepted. `MTP=0` turns it off.
 
-## Thunderbolt eGPU
+## Thunderbolt eGPU (optional)
 
-Required for the default: the main agent (Qwen3.5-9B) runs on it. Three steps
-were needed, in order.
+Needed only for the `EGPU=1` and `LEGACY=1` modes; the default runs on the
+Vega 10 alone, so the eGPU can stay powered off. Three steps were needed, in
+order.
 
 **1. Driver + CUDA** (root):
 
