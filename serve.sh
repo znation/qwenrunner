@@ -44,10 +44,11 @@ if [ "$EGPU" = 1 ]; then
     MAIN_NP="${MAIN_NP:-2}"
     MAIN_PORT="${MAIN_PORT:-8080}"
 
-    # Display GPU (Vega 10) secondary. ~3.3 GiB at the 32768 pool (weights 2.6
-    # + q4_0 KV 0.3 + compute 0.4) leaves ~1.7 GiB of the 5000 MiB cap for the
-    # desktop at a typical baseline; guard.py still kills before any breach.
-    VEGA_MODEL="${VEGA_MODEL:-$ROOT/models/Qwen3.5-4B-Q4_K_M.gguf}"
+    # Display GPU (Vega 10) secondary. Q4_K_S is the measured best 4B quant on
+    # this Vega (see the default block below); ~3.3 GiB at the 32768 pool
+    # leaves ~1.7 GiB of the 5000 MiB cap for the desktop at a typical
+    # baseline; guard.py still kills before any breach.
+    VEGA_MODEL="${VEGA_MODEL:-$ROOT/models/Qwen3.5-4B-Q4_K_S.gguf}"
     VEGA_ALIAS="${VEGA_ALIAS:-Qwen3.5-4B}"
     VEGA_CTX="${VEGA_CTX:-32768}"
     VEGA_NP="${VEGA_NP:-2}"
@@ -135,7 +136,11 @@ if [ "$LEGACY" = 0 ]; then
     # desktop in `free`); no -ngl/-ts anywhere (the fit aborts if either is
     # set). O_DIRECT is unsupported on the Vega (measured: dio falls back to
     # buffered IO with a warning), so -lm none.
-    MODEL="${MODEL:-$ROOT/models/Qwen3.5-4B-Q4_K_M.gguf}"
+    # Q4_K_S, not Q4_K_M: measured on this Vega (results/amd4b_*.md) it is
+    # +2.6 % generation / +4-5 % prompt at statistically identical perplexity
+    # (8.54 vs 8.47 on ppl_corpus.txt), and ~140 MiB lighter under the cap.
+    # Q4_0 is faster still (+6.5 %) but costs a real quality hit (8.72).
+    MODEL="${MODEL:-$ROOT/models/Qwen3.5-4B-Q4_K_S.gguf}"
     ALIAS="${ALIAS:-Qwen3.5-4B}"
     CTX="${CTX:-65536}"
     NP="${NP:-1}"

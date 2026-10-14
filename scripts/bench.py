@@ -345,6 +345,8 @@ def main(argv=None):
     ap.add_argument("--batch", default=None)
     ap.add_argument("--ubatch", default=None)
     ap.add_argument("--lm", default=None, help="base -lm load mode")
+    ap.add_argument("--dev", default=None,
+                    help="base -dev device list, e.g. Vulkan0 (default: llama-bench auto)")
     ap.add_argument("--depth", default=None, type=int,
                     help="base -d/--n-depth; llama-bench ctx = pp + tg + depth")
     ap.add_argument("--cap-mib", type=float, default=5000.0)
@@ -361,7 +363,8 @@ def main(argv=None):
     base = {}
     for key, flag in (("ngl", "-ngl"), ("fa", "-fa"), ("ctk", "-ctk"),
                       ("ctv", "-ctv"), ("threads", "-t"), ("batch", "-b"),
-                      ("ubatch", "-ub"), ("lm", "-lm"), ("depth", "-d")):
+                      ("ubatch", "-ub"), ("lm", "-lm"), ("depth", "-d"),
+                      ("dev", "-dev")):
         val = getattr(args, key)
         if val is not None:
             base[flag] = val

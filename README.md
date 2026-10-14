@@ -12,13 +12,15 @@ only — no eGPU involved — fitted by llama.cpp's own `--fit` with a
 `--fit-target` of `vram_total - cap`, so the display cap holds regardless of
 desktop drift:
 
-* **Qwen3.5-4B Q4_K_M** on the Vega 10 (`:8080`), under the 5000 MiB watchdog
+* **Qwen3.5-4B Q4_K_S** on the Vega 10 (`:8080`), under the 5000 MiB watchdog
 
 The 9B cannot fit under the display cap (its Q4_K_M weights alone exceed 5000
 MiB), so the 4B is the default model. Fully resident and memory-bandwidth-bound:
-~29 t/s generation on the Vega. With the eGPU attached, `EGPU=1 ./serve.sh`
-adds a **Qwen3.5-9B** main agent on the GTX 1070 (`:8080`) and moves the 4B to
-`:8081` as a parallel secondary (~15.8 t/s / ~35.9 t/s). The previous default —
+~53 t/s generation on the Vega (Q4_K_S is the measured best quant — see
+`RESULTS.md` "AMD-only Vega optimization"). With the eGPU attached,
+`EGPU=1 ./serve.sh` adds a **Qwen3.5-9B** main agent on the GTX 1070 (`:8080`)
+and moves the 4B to `:8081` as a parallel secondary (~15.8 t/s / ~37 t/s). The
+previous default —
 one Qwen3.8-27B split across both GPUs, most layers on CPU — ran at 2-6 t/s;
 everything below is that config's measurement history, and it survives as
 `LEGACY=1 ./serve.sh`.
@@ -178,10 +180,10 @@ so there is no CPU inference path and no MTP (pointless at memory-bandwidth
 speeds). `scripts/guard.py` is the backstop.
 
 The default is `CTX=65536` with `-np 1` → **one 65536-slot** — the same per-slot
-context the clients already expect (pi `contextWindow` 59392), at a ~3.3 GiB
-model footprint that leaves ~1.7 GiB of display-cap headroom at a typical
-desktop baseline. `NP=2` halves the pool per slot but buys fairness for
-concurrent agents.
+context the clients already expect (pi `contextWindow` 59392). Measured live:
+~52.7 t/s generation, ~91.5 t/s prompt, 4465-4477 MiB of the Vega under the
+5000 MiB cap (≈520 MiB headroom at a ~1230 MiB desktop baseline). `NP=2` halves
+the pool per slot but buys fairness for concurrent agents.
 
 The local model's entry in both clients is set to **58k of that 64k slot**,
 leaving room for tool-call output: pi in `~/.pi/agent/models.json`

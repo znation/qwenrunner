@@ -1,0 +1,11 @@
+timestamp,stage,label,ok,model_filename,build_commit,n_gpu_layers,flash_attn,type_k,type_v,n_threads,n_batch,n_ubatch,load_mode,no_kv_offload,no_op_offload,n_prompt,n_gen,n_depth,avg_ts,stddev_ts,vram_peak_mib,vram_delta_mib,client_vram_peak_mib,client_gtt_peak_mib,vram_violation,rss_peak_mib,wall_s
+2026-10-14T04:58:24,threads,t4,True,models/Qwen3.5-4B-Q4_K_S.gguf,aa5e009,999,1,q4_0,q4_0,4,2048,512,none,False,0,512,0,4096,427.694464,2.607563,4383.8,3150.8,3063.9,527.3,False,385.5,22.373
+2026-10-14T04:58:24,threads,t4,True,models/Qwen3.5-4B-Q4_K_S.gguf,aa5e009,999,1,q4_0,q4_0,4,2048,512,none,False,0,0,128,4096,48.563269,0.136077,4383.8,3150.8,3063.9,527.3,False,385.5,22.373
+2026-10-14T04:58:56,threads,t6,True,models/Qwen3.5-4B-Q4_K_S.gguf,aa5e009,999,1,q4_0,q4_0,6,2048,512,none,False,0,512,0,4096,427.419754,1.504371,4383.8,3150.8,3063.9,527.3,False,385.5,22.362
+2026-10-14T04:58:56,threads,t6,True,models/Qwen3.5-4B-Q4_K_S.gguf,aa5e009,999,1,q4_0,q4_0,6,2048,512,none,False,0,0,128,4096,48.384454,0.18395,4383.8,3150.8,3063.9,527.3,False,385.5,22.362
+2026-10-14T04:59:29,threads,t8,True,models/Qwen3.5-4B-Q4_K_S.gguf,aa5e009,999,1,q4_0,q4_0,8,2048,512,none,False,0,512,0,4096,426.618431,3.797008,4893.4,3660.3,3063.9,527.3,False,383.9,22.412
+2026-10-14T04:59:29,threads,t8,True,models/Qwen3.5-4B-Q4_K_S.gguf,aa5e009,999,1,q4_0,q4_0,8,2048,512,none,False,0,0,128,4096,48.533293,0.463752,4893.4,3660.3,3063.9,527.3,False,383.9,22.412
+2026-10-14T05:00:01,threads,t12,True,models/Qwen3.5-4B-Q4_K_S.gguf,aa5e009,999,1,q4_0,q4_0,12,2048,512,none,False,0,512,0,4096,425.96128,0.32,4297.0,3063.9,3063.9,527.3,False,384.2,22.367
+2026-10-14T05:00:01,threads,t12,True,models/Qwen3.5-4B-Q4_K_S.gguf,aa5e009,999,1,q4_0,q4_0,12,2048,512,none,False,0,0,128,4096,48.096698,0.298383,4297.0,3063.9,3063.9,527.3,False,384.2,22.367
+2026-10-14T05:00:34,threads,t16,True,models/Qwen3.5-4B-Q4_K_S.gguf,aa5e009,999,1,q4_0,q4_0,16,2048,512,none,False,0,512,0,4096,427.899496,3.928654,4383.8,3150.8,3063.9,527.3,False,384.0,22.457
+2026-10-14T05:00:34,threads,t16,True,models/Qwen3.5-4B-Q4_K_S.gguf,aa5e009,999,1,q4_0,q4_0,16,2048,512,none,False,0,0,128,4096,48.571496,0.44923,4383.8,3150.8,3063.9,527.3,False,384.0,22.457

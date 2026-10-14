@@ -1578,3 +1578,48 @@ which is already at its 128k ceiling; at a light desktop baseline
   at ~1.8 GiB the shipped 128k/28 config peaks ~5.3 GiB and is killed by the
   watchdog; `FIT=1` would give up layers to hold the cap, and the resulting
   throughput on a *heavy* desktop has not been measured.
+
+## AMD-only Vega optimization (Qwen3.5-4B)
+
+The Vega-10-only default (Qwen3.5-4B, fully resident, no eGPU) was swept for
+throughput. Measured with `scripts/bench.py --dev Vulkan0` (llama-bench, 3
+reps, guarded), shallow and at depth 4096; quality by llama-perplexity on
+`data/ppl_corpus.txt` (~180k tokens). Every number on this machine after a
+reboot; the pre-reboot live reading of ~29 t/s was contaminated (loaded
+desktop, cold shader cache) and is superseded.
+
+| quant | gen t/s shallow | gen t/s d4096 | pp512 t/s | PPL (180k tok) | client MiB |
+|---|---|---|---|---|---|
+| Q4_K_M | 50.8 | 49.1 | 508 | 8.4735 ± 0.067 | 3208 |
+| **Q4_K_S** | **55.0** | **50.4** | **531** | **8.5360 ± 0.068** | 3064 |
+| IQ4_XS | 55.9 | 50.6 | 564 | 8.6345 ± 0.069 | 2956 |
+| Q4_0 | 56.1 | 52.3 | 577 | 8.7235 ± 0.070 | 3057 |
+| Q3_K_M | 48.4 | 45.0 | 494 | — | 2781 |
+| Q5_K_M | 46.7 | 40.9 | 509 | — | 3592 |
+
+**Winner: Q4_K_S** — +2.6 % generation and +4-5 % prompt over Q4_K_M at
+statistically identical perplexity (8.54 vs 8.47, within 1σ), ~140 MiB lighter
+under the cap. Q4_0 is fastest (+6.5 %) but measurably worse quality (8.72,
+~3.6σ); IQ4_XS splits the difference on speed but still loses quality (8.63,
+~2.3σ). **Q3_K_M is slower than Q4_K_M despite being smaller** — its heavier
+K-quant kernels cost more than the byte savings on this GCN (no int-dot, no
+tensor cores) — same shape as the 27B finding.
+
+The remaining knobs are settled, not swept further:
+- **Threads: a wash** — 48.1-48.6 t/s generation across `-t` 4-16 (prompt
+  426-428). Ship `-t 8`.
+- **Batch: keep 2048/512** — b512/ub128 gains +4 % generation (48.2 → 50.1)
+  but loses −12 % prompt (429 → 379); agent transcripts re-prefill often, so
+  prompt wins. Smaller batches do buy VRAM (3064 → 2683 MiB at b512) if the
+  cap is ever tight.
+
+Shipped live at 64k: **~52.7 t/s generation, ~91.5 t/s prompt**, 4465-4477 MiB
+of the Vega (≈520 MiB under the 5000 cap at a ~1230 MiB desktop baseline), and
+valid OpenAI-format tool calls. The 9B's Q4_K_M on the eGPU was not re-swept
+(the eGPU is powered off).
+
+**Operational lesson: never let a benchmark be force-killed mid-GPU-operation.**
+Two `llama-bench` runs SIGKILLed by a command deadline wedged the AMDGPU/TTM
+path (`uvm_va_space_destroy`, D-state, uncancellable) and the GPU needed a
+reboot. `scripts/bench.py` runs its arms under `scripts/guard.py` (clean child
+cleanup) — use it, and give it generous deadlines.
