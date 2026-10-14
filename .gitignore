@@ -21,8 +21,10 @@ __pycache__/
 # README.md and RESULTS.md instead.
 dmesg.log
 
-# this one will change on every ./serve.sh run I think?
+# these change on every ./serve.sh run
 logs/serve.log
+logs/serve-main.log
+logs/serve-vega.log
 
 # Raw 0.5 s sampling telemetry from scripts/freqwatch.py and
 # scripts/instrument_run.py — high-frequency streams, regenerated on every

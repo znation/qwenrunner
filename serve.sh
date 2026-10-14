@@ -1,54 +1,132 @@
 #!/usr/bin/env bash
-# serve.sh — launch llama-server for Qwen-3.8-27B under the 5000 MiB VRAM watchdog.
+# serve.sh — launch llama-server for the local agent stack.
 #
-# One model instance, split across the GTX 1070 (CUDA) and the Vega 10
-# (Vulkan), with the layers that do not fit spilling to CPU: -dev CUDA0,Vulkan0
-# -sm layer. Measured 40 layers at 8k context, 32 at 128k without speculation;
-# the KV cache competes with the weights for the same VRAM, so context length
-# and layer count trade against each other. The layer count is derived from the
-# context by the measured formula below; FIT=1 instead lets llama.cpp's own
-# --fit derive it from live free VRAM, and an unset FIT falls back to it
-# automatically when the live display baseline is too high for a fixed -ngl
-# (see the layer-budget block).
+# DEFAULT (./serve.sh): two instances, one per GPU, no split, no MTP:
+#   * Qwen3.5-9B Q4_K_M on the GTX 1070 eGPU (CUDA, :8080) — the main agent
+#   * Qwen3.5-4B Q4_K_M on the Vega 10 display GPU (Vulkan, :8081) — a parallel
+#     secondary for subagents, under the 5000 MiB watchdog so the desktop
+#     cannot be taken down
+# Both run llama.cpp's own --fit with a per-GPU --fit-target, always — no
+# hand-derived layer count: the 1070 instance leaves 256 MiB free, the Vega
+# instance leaves (vram_total - CAP) free, so the fit holds the display cap
+# regardless of desktop drift; at the default context both land fully resident
+# (the 9B's hybrid DeltaNet keeps the KV cache to 8 of 32 layers, ~1.1 GiB at
+# the 131072 pool). Fully resident means generation is memory-bandwidth-bound —
+# ~30-40 t/s on the 1070 for the 9B and ~50-90 t/s on the Vega for the 4B,
+# versus the 2-6 t/s the old 27B split managed. Extra args are appended to the
+# eGPU instance's command.
 #
-# With MTP on (the default) the draft head runs on the *Vega 10*, not the CPU:
-# the MTP block's forward pass is serial with the target's, so once 26+ trunk
-# layers are offloaded it is the bottleneck, and the Vega has headroom the 1070
-# does not. Measured +38 % generation over the previous CPU-draft default at
-# 128k (6.224 vs 4.509 t/s) and +6 % prompt, for ~1.5 GB of the display GPU's
-# budget -- which is why the tensor split becomes 6,1 rather than 4,1 (the
-# draft's weights would otherwise sit on top of six trunk layers and breach).
-#
-# The eGPU is REQUIRED. The Vega 10 alone cannot hold this model at the default
-# 128k context under the display cap, so serve.sh errors out without it rather
-# than silently degrading to a configuration that the watchdog will kill.
-#
-# Two slots by default (-np 2), so a second agent makes progress instead of
-# queueing. -c is the *shared* pool: 131072 with -np 2 is 65536 per slot, and the
-# client must be configured for that (pi's models.json says contextWindow
-# 65536). Slots buy fairness, not throughput -- see the -np block below.
-#
-# The 5000 MiB cap protects the *display* GPU (the Vega 10), which is why the
-# watchdog can kill the whole thing. The 1070 has its own 8 GB and is reported
-# separately as nvidia_vram_peak_mib.
-#
-# Overridable via env (anything unset is derived):
-#   MODEL ALIAS CTX THREADS TS NGL LM BATCH UBATCH CTK CTV FA HOST PORT CAP NP
-#   MTP MD DEVD NGLD DCTK DCTV DNMAX DPMIN FIT FITT_CUDA
-#
-#   ./serve.sh                      # 2 slots x 64k, both GPUs, MTP on
-#   NP=1 ./serve.sh                 # one slot, the whole 128k pool for one agent
-#   MTP=0 ./serve.sh                # the same split without speculative decoding
-#   CTX=65536 ./serve.sh            # shorter pool: 32k/slot, more layers (faster)
-#   NGL=36 TS=4,1 ./serve.sh        # override the split (turns --fit off)
-#   FIT=1 ./serve.sh                # let --fit derive -ngl from live free VRAM
-#   FIT=0 ./serve.sh                # keep the formula even on a heavy desktop
-# Extra args are appended verbatim to the llama-server command line.
+# Overridable via env:
+#   MAIN_MODEL MAIN_ALIAS MAIN_CTX MAIN_NP MAIN_PORT MAIN_FITT   (eGPU)
+#   VEGA_MODEL VEGA_ALIAS VEGA_CTX VEGA_NP VEGA_PORT VEGA_CAP VEGA_FITT
+#   THREADS HOST
+#   LEGACY=1  — the old single Qwen3.8-27B split across both GPUs (its own env:
+#               MODEL ALIAS CTX TS NGL LM BATCH UBATCH CTK CTV FA HOST PORT
+#               CAP NP MTP MD DEVD NGLD DCTK DCTV DNMAX DPMIN FIT FITT_CUDA),
+#               e.g. LEGACY=1 ./serve.sh  or  LEGACY=1 MTP=0 ./serve.sh.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export PATH="$ROOT/tools/local/usr/bin:$PATH"
 export LD_LIBRARY_PATH="$ROOT/build/bin:$ROOT/tools/local/usr/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH:-}"
+
+LEGACY="${LEGACY:-0}"
+if [ "$LEGACY" = 0 ]; then
+    # ---- default: two fully-resident instances, one per GPU ----
+
+    # eGPU (GTX 1070) main agent. 131072 with -np 2 is 65536 per slot — the
+    # same per-slot context the clients already expect (pi contextWindow
+    # 59392, omp 65536), so no client change is needed. At this pool the 1070
+    # holds weights ~5.5 GiB + q4_0 KV ~1.1 GiB + compute ~0.7 GiB ≈ 7.3 GiB
+    # of its 8 GiB.
+    MAIN_MODEL="${MAIN_MODEL:-$ROOT/models/Qwen3.5-9B-Q4_K_M.gguf}"
+    MAIN_ALIAS="${MAIN_ALIAS:-Qwen3.5-9B}"
+    MAIN_CTX="${MAIN_CTX:-131072}"
+    MAIN_NP="${MAIN_NP:-2}"
+    MAIN_PORT="${MAIN_PORT:-8080}"
+
+    # Display GPU (Vega 10) secondary. ~3.3 GiB at the 32768 pool (weights 2.6
+    # + q4_0 KV 0.3 + compute 0.4) leaves ~1.7 GiB of the 5000 MiB cap for the
+    # desktop at a typical baseline; guard.py still kills before any breach.
+    VEGA_MODEL="${VEGA_MODEL:-$ROOT/models/Qwen3.5-4B-Q4_K_M.gguf}"
+    VEGA_ALIAS="${VEGA_ALIAS:-Qwen3.5-4B}"
+    VEGA_CTX="${VEGA_CTX:-32768}"
+    VEGA_NP="${VEGA_NP:-2}"
+    VEGA_PORT="${VEGA_PORT:-8081}"
+    VEGA_CAP="${VEGA_CAP:-5000}"
+
+    THREADS="${THREADS:-8}"
+    HOST="${HOST:-127.0.0.1}"
+
+    if [ ! -c /dev/nvidia0 ] || [ ! -x "$ROOT/build/bin/llama-bench" ] \
+       || ! "$ROOT/build/bin/llama-bench" --list-devices 2>/dev/null | grep -q '^  CUDA0:'; then
+        echo "serve: no CUDA eGPU: /dev/nvidia0 is missing or no CUDA0 backend is built." >&2
+        echo "serve: the default needs the eGPU for the main agent. Build with GGML_CUDA=ON." >&2
+        exit 1
+    fi
+    if ! "$ROOT/build/bin/llama-bench" --list-devices 2>/dev/null | grep -q '^  Vulkan0:'; then
+        echo "serve: no Vulkan0 backend (the Vega 10 display GPU) is built." >&2
+        exit 1
+    fi
+    for m in "$MAIN_MODEL" "$VEGA_MODEL"; do
+        if [ ! -f "$m" ]; then
+            echo "serve: missing $m" >&2
+            echo "serve: run ./scripts/dl_dual.sh to fetch the Qwen3.5-9B + Qwen3.5-4B pair" >&2
+            exit 1
+        fi
+    done
+
+    mkdir -p "$ROOT/logs"
+
+    # --fit on both instances, always, with a per-GPU --fit-target. The 1070 is
+    # not the display GPU, so it only needs a small margin (256 MiB, the legacy
+    # FITT_CUDA value). The Vega instance must hold the display cap no matter
+    # what the desktop is doing: its target leaves (vram_total - CAP) free, and
+    # since the fit sees the desktop's usage in `free`, that is
+    # baseline-independent — a loaded desktop automatically costs it layers,
+    # never the display. No -ngl/-ts anywhere: the fit aborts if either is set.
+    MAIN_FITT="${MAIN_FITT:-256}"
+    VEGA_FITT="${VEGA_FITT:-$(python3 -c "import sys; sys.path.insert(0, '$ROOT/scripts'); import guard; print(int(guard.vram_total_mib() - $VEGA_CAP))" 2>/dev/null || true)}"
+    if [ -z "${VEGA_FITT:-}" ] || [ "$VEGA_FITT" -lt 256 ]; then
+        echo "serve: WARNING could not derive the Vega --fit target (vram_total - cap); using 256 MiB" >&2
+        VEGA_FITT=256
+    fi
+
+    echo "serve: main  $(basename "$MAIN_MODEL") alias=$MAIN_ALIAS dev=CUDA0 ctx=$MAIN_CTX ($(( MAIN_CTX / MAIN_NP ))/slot x $MAIN_NP) --fit-target ${MAIN_FITT}MiB  http://$HOST:$MAIN_PORT"
+    echo "serve: vega  $(basename "$VEGA_MODEL") alias=$VEGA_ALIAS dev=Vulkan0 ctx=$VEGA_CTX ($(( VEGA_CTX / VEGA_NP ))/slot x $VEGA_NP) --fit-target ${VEGA_FITT}MiB cap=${VEGA_CAP}MiB  http://$HOST:$VEGA_PORT"
+    echo "serve: --fit on both (no split, no MTP); logs serve-main.log / serve-vega.log"
+
+    "$ROOT/build/bin/llama-server" \
+        -m "$MAIN_MODEL" -a "$MAIN_ALIAS" -c "$MAIN_CTX" -t "$THREADS" -np "$MAIN_NP" \
+        -dev CUDA0 --fit on -fitt "$MAIN_FITT" -lm dio -b 2048 -ub 512 \
+        -ctk q4_0 -ctv q4_0 -fa on \
+        --host "$HOST" --port "$MAIN_PORT" "$@" >>"$ROOT/logs/serve-main.log" 2>&1 &
+    MAIN_PID=$!
+
+    python3 "$ROOT/scripts/guard.py" --cap-mib "$VEGA_CAP" --label serve-vega \
+        --log "$ROOT/logs/serve-vega.log" -- \
+        "$ROOT/build/bin/llama-server" \
+        -m "$VEGA_MODEL" -a "$VEGA_ALIAS" -c "$VEGA_CTX" -t "$THREADS" -np "$VEGA_NP" \
+        -dev Vulkan0 --fit on -fitt "$VEGA_FITT" -lm dio -b 2048 -ub 512 \
+        -ctk q4_0 -ctv q4_0 -fa on \
+        --host "$HOST" --port "$VEGA_PORT" &
+    VEGA_PID=$!
+
+    cleanup() {
+        kill "$MAIN_PID" "$VEGA_PID" 2>/dev/null || true
+        wait "$MAIN_PID" "$VEGA_PID" 2>/dev/null || true
+    }
+    trap cleanup EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+
+    # Tear both down when either dies (e.g. the watchdog kills the Vega
+    # instance on a display breach); one clean command restarts the pair.
+    rc=0
+    wait -n "$MAIN_PID" "$VEGA_PID" || rc=$?
+    exit "$rc"
+fi
+# ---- legacy (LEGACY=1): one Qwen3.8-27B split across both GPUs ----
 
 MODEL="${MODEL:-$ROOT/models/Qwen3.8-27B-UD-Q4_K_M.gguf}"
 # The name the API advertises (/v1/models). Without it llama-server reports the

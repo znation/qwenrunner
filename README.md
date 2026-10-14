@@ -1,13 +1,25 @@
 qwenrunner
 
-A local LLM inference stack optimized specifically to run the following combination as fast as possible:
+A local LLM inference stack for agentic coding on a 2019 Intel iMac (8-core /
+16-thread Core i9, AMD Vega 10 / Radeon Pro Vega 48 with 8 GB — the display
+GPU) plus a Thunderbolt GTX 1070 eGPU.
 
-* A Qwen-3.8-27B model
-* A 2019 Intel iMac with 8-core (16-hyperthread) Core i9 processor and AMD Vega 10 (Radeon Pro Vega 48) Graphics with 8 GB total
+Usage of the display GPU should never, ever exceed 5 GB since that is also the
+desktop.
 
-Usage of the GPU should never, ever exceed 5 GB since that is also the display GPU.
+The default (`./serve.sh`) runs two fully-resident instances, one per GPU, both
+fitted by llama.cpp's own `--fit` with a per-GPU `--fit-target` — no
+hand-derived layer counts:
 
-We should plan and run experiments to determine the fastest possible way to run Qwen-3.8-27B on this hardware.
+* **Qwen3.5-9B Q4_K_M** on the GTX 1070 eGPU (`:8080`) — the main agent
+* **Qwen3.5-4B Q4_K_M** on the Vega 10 (`:8081`) — a parallel secondary for
+  subagents, under the 5000 MiB watchdog
+
+Two fully-resident models are memory-bandwidth-bound: ~30-40 t/s generation on
+the 1070 for the 9B and ~50-90 t/s on the Vega for the 4B. The previous
+default — one Qwen3.8-27B split across both GPUs, most layers on CPU — ran at
+2-6 t/s; everything below is that config's measurement history, and it survives
+as `LEGACY=1 ./serve.sh`.
 
 ## Result
 
@@ -128,10 +140,8 @@ cd ../..
 
 # 3. models
 mkdir -p models
-BASE=https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/resolve/main
-curl -fL -o models/Qwen3.8-27B-UD-Q4_K_M.gguf "$BASE/Qwen3.8-27B-UD-Q4_K_M.gguf"
-curl -fL -o models/mtp-Qwen3.8-27B-Q4_0.gguf  "$BASE/mtp-Qwen3.8-27B-Q4_0.gguf"
-./scripts/dl_smaller.sh                          # optional: the other three quants
+./scripts/dl_dual.sh                             # the default pair: Qwen3.5-9B + Qwen3.5-4B
+./scripts/dl_smaller.sh                          # optional: extra quants of the legacy 27B
 ```
 
 ## Build
@@ -151,20 +161,27 @@ present. Both backends end up in one binary and `-dev` selects between them.
 ## Run
 
 ```
-./serve.sh                       # 2 slots x 64k, both GPUs, MTP on (the default)
-NP=1 ./serve.sh                  # one slot: the whole 128k pool for one agent
-MTP=0 ./serve.sh                 # the same split without speculative decoding
-CTX=65536 ./serve.sh             # shorter pool (32k/slot), more layers (faster)
-NGL=26 TS=6,1 ./serve.sh         # override the layer count / tensor split
-FIT=1 ./serve.sh                 # let llama.cpp's --fit derive -ngl from free VRAM
-FIT=0 ./serve.sh                 # keep the formula even when the baseline is high
+./serve.sh                       # Qwen3.5-9B on the eGPU (:8080) + Qwen3.5-4B on the Vega (:8081)
+MAIN_CTX=65536 ./serve.sh        # smaller eGPU pool (2 x 32k slots)
+VEGA_CTX=65536 ./serve.sh        # bigger Vega pool (2 x 32k) — still under the cap
+LEGACY=1 ./serve.sh              # the old Qwen3.8-27B split across both GPUs
 ```
 
-`-c` is the **shared pool**, and llama-server divides it by `-np`: the default
-`CTX=131072` with `-np 2` is **65536 per slot**, which is what a client sees and
-what its `contextWindow` must say. Raising `CTX` buys depth at the cost of
-layers — `-c 262144` (two slots at 128k each) does not even load — so the choice
-is 2 x 64k, 1 x 128k, or 4 x 32k.
+Both instances always run llama.cpp's own `--fit on` with a per-GPU
+`--fit-target` (`-fitt`) — the layer count is derived from live free VRAM, never
+by hand. The eGPU instance leaves 256 MiB free (`MAIN_FITT`); the Vega instance
+leaves `vram_total - CAP` free (`VEGA_FITT`, 3176 MiB here), which — because
+the fit sees the desktop's usage in `free` — holds the display cap regardless
+of desktop drift. At the default contexts both models land fully resident, so
+there is no CPU inference path and no MTP (pointless at memory-bandwidth
+speeds). The Vega instance runs under `scripts/guard.py` as the backstop.
+
+Each instance's `-c` is its own **shared pool**, divided by its `-np`. The main
+agent defaults to `MAIN_CTX=131072` with `-np 2` → **65536 per slot** — the same
+per-slot context the clients already expect. The Vega secondary defaults to
+`VEGA_CTX=32768` with `-np 2` → 16k per slot; it is meant for subagents and
+parallel requests, and its 4B footprint (~3.3 GiB at that pool) leaves ~1.7 GiB
+of display-cap headroom at a typical desktop baseline.
 
 The local model's entry in both clients is set to **58k of that 64k slot**,
 leaving room for tool-call output: pi in `~/.pi/agent/models.json`
@@ -178,27 +195,23 @@ output budget (65536/65536). pi's default is the local model
 `--model`. The two tumwater fleets on this box name it as their free
 `fallback`, which is the pair the docs' backend guide recommends (a budgeted API
 primary, the cost-n/a local model behind it).
-`serve.sh` passes `-a Qwen3.8-27B` so both see a stable model id instead of the
-.gguf path; the alias is advisory — llama-server ignores the request's `model`
-field, so a client still sending an older id works.
+`serve.sh` passes `-a Qwen3.5-9B` / `-a Qwen3.5-4B` so clients see stable model
+ids instead of the .gguf paths; the alias is advisory — llama-server ignores the
+request's `model` field, so a client still sending an older id works. The Vega
+secondary on `:8081` is a second, fully parallel server — point a subagent
+fleet at it for a second lane of work that never contends with the main agent.
 
-`serve.sh` requires the eGPU and prints the configuration it picked. It errors
-out if `/dev/nvidia0` is absent or the binary was built without CUDA, because
-the Vega 10 alone cannot hold 128k context under the display cap:
+`serve.sh` requires the eGPU (the default's main agent lives on it) and prints
+the configuration it picked. It errors out if `/dev/nvidia0` is absent or the
+binary was built without CUDA.
 
-* **eGPU present** — one model instance split across the GTX 1070 (CUDA) and the
-  Vega 10 (Vulkan), with the remainder on CPU: `-dev CUDA0,Vulkan0 -sm layer`.
-  The layer count is derived from the context, because the KV cache competes
-  with the weights for the same VRAM, and the tensor split is derived from
-  whether the draft head is resident on the Vega. Without speculation the
-  measured anchors are **40 layers at 8k, 32 at 128k**; with the draft on the
-  Vega the last startable rungs are **38 at 8k, 36 at 32k, 30 at 128k**, and
-  `serve.sh` derives two under those (34/28) because its fit probes peak at 5.2k
-  depth and the flash-attention workspace was assumed to grow with context —
-  measured since, depth added only 16 MiB to the 1070's peak at fixed `-ngl`, so
-  the reserve is cheap insurance rather than a known cost. `-ts 6,1` rather
-  than `4,1`, because the draft's ~1.5 GB otherwise sits on top of six trunk
-  layers. Every ceiling here is set by the **1070**, not the display cap.
+### LEGACY=1 — the Qwen3.8-27B split (the previous default)
+
+`LEGACY=1 ./serve.sh` restores the old single model split across both GPUs:
+one Qwen3.8-27B instance on `-dev CUDA0,Vulkan0 -sm layer`, the remainder on
+CPU, with MTP speculation. Everything below this point is that config's
+documentation — the measured layer formula, the `--fit` fallback, the draft
+chain — and applies to it, not to the default above.
 
 `serve.sh` runs `llama-server` under `scripts/guard.py`, which polls system-wide
 VRAM every 50 ms and `SIGKILL`s the process group if it exceeds `CAP`
@@ -243,10 +256,10 @@ draft on the Vega, **+3.6 %** on Q2_K_XL at `-ngl 16` where the target is fast
 enough that the draft becomes the bottleneck, and **+9 %** on a mid-document
 continuation where only 26 % of drafts are accepted. `MTP=0` turns it off.
 
-## Thunderbolt eGPU (optional)
+## Thunderbolt eGPU
 
-An NVIDIA eGPU over Thunderbolt works, and roughly **triples** the offloadable
-layer count (40 vs 12). Three steps were needed, in order.
+Required for the default: the main agent (Qwen3.5-9B) runs on it. Three steps
+were needed, in order.
 
 **1. Driver + CUDA** (root):
 
