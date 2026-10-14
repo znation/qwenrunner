@@ -7,7 +7,9 @@
 # the KV cache competes with the weights for the same VRAM, so context length
 # and layer count trade against each other. The layer count is derived from the
 # context by the measured formula below; FIT=1 instead lets llama.cpp's own
-# --fit derive it from live free VRAM (see the layer-budget block).
+# --fit derive it from live free VRAM, and an unset FIT falls back to it
+# automatically when the live display baseline is too high for a fixed -ngl
+# (see the layer-budget block).
 #
 # With MTP on (the default) the draft head runs on the *Vega 10*, not the CPU:
 # the MTP block's forward pass is serial with the target's, so once 26+ trunk
@@ -40,6 +42,7 @@
 #   CTX=65536 ./serve.sh            # shorter pool: 32k/slot, more layers (faster)
 #   NGL=36 TS=4,1 ./serve.sh        # override the split (turns --fit off)
 #   FIT=1 ./serve.sh                # let --fit derive -ngl from live free VRAM
+#   FIT=0 ./serve.sh                # keep the formula even on a heavy desktop
 # Extra args are appended verbatim to the llama-server command line.
 set -euo pipefail
 
@@ -197,16 +200,30 @@ DEV="CUDA0,Vulkan0"
 #          choice is discrete and moves with a few MiB of desktop noise (28 at a
 #          7059 MiB free Vega, 30 at 7059+10), and at 30 it spends the reserve
 #          the formula keeps, leaving ~350 MiB of drift tolerance instead of
-#          ~620. Hence opt-in, not default.
+#          ~620. Hence opt-in, not default -- but only while the desktop is
+#          quiet: once the live display baseline passes ~1200 MiB a fixed
+#          formula -ngl would breach the cap, so serve.sh warns and auto-falls
+#          back to --fit (the only path that gives up layers to hold it). An
+#          explicit FIT=0 pins the formula and suppresses the fallback;
+#          NGL=/TS= also keep the formula, because the fit aborts on either.
 #
 # NGL= or TS= takes over: either one turns --fit off, because llama.cpp's fit
 # aborts rather than honour an explicit -ngl/-ts.
+# FIT=0 is the default; FIT=1 forces --fit. An *explicit* FIT=0 pins the
+# formula (the auto-fallback below is suppressed); unset FIT lets serve.sh
+# fall back to --fit when the live desktop baseline is too high for a fixed
+# -ngl. NGL=/TS= also pin the formula (the fit aborts on either). Capture
+# what the user actually set before the formula fills NGL/TS below.
+FIT_SET=0
+[ -n "${FIT+x}" ] && FIT_SET=1
+NGL_TS_SET=0
 FIT="${FIT:-0}"
 # Margin to leave free on the 1070; the fit's own default is 1024 MiB, which
 # costs a layer or two. The 1070 is not the display GPU, so 256 is enough.
 FITT_CUDA="${FITT_CUDA:-256}"
 if [ -n "${NGL:-}" ] || [ -n "${TS:-}" ]; then
     FIT=0
+    NGL_TS_SET=1
 fi
 
 if [ "$MTP" = 1 ]; then
@@ -241,6 +258,40 @@ fi
 # requested 6,1 assigned 28 layers to CUDA0 and 4 to Vulkan0 at -ngl 32, i.e.
 # 7:1, because non-layer tensors go to the primary device. Tuned empirically
 # against the two VRAM counters.
+
+# The safe layer count is a function of the live desktop baseline, not a
+# constant -- measured 746-2188 MiB within one hour. At 128k this config's
+# client footprint is ~3384 MiB at 28 layers, so a fixed -ngl reaches the cap at
+# a baseline near 1216 MiB. The watchdog is the backstop, not the plan: say so
+# before it has to fire. Above that baseline the only safe default is to let
+# --fit give up layers, so an unset FIT auto-falls back to it (with this
+# warning); an explicit FIT=0 or an NGL=/TS= override pins the formula instead.
+BASE_MIB=$(python3 -c "import sys; sys.path.insert(0, '$ROOT/scripts'); import guard; print(int(guard.vram_used_mib()))" 2>/dev/null || true)
+if [ -n "${BASE_MIB:-}" ] && [ "$MTP" = 1 ] && [ "$BASE_MIB" -gt 1200 ]; then
+    if [ "$FIT" = 1 ]; then
+        echo "serve: WARNING display baseline is ${BASE_MIB} MiB (> the ~1216 MiB the" >&2
+        echo "serve: WARNING 28-layer config was measured to survive); --fit will pick" >&2
+        echo "serve: WARNING fewer layers to hold the ${CAP} MiB cap." >&2
+    elif [ "$NGL_TS_SET" = 1 ]; then
+        echo "serve: WARNING display baseline is ${BASE_MIB} MiB; this config fits to about" >&2
+        echo "serve: WARNING 1216 MiB. NGL=/TS= is set, so --fit cannot take over (llama.cpp" >&2
+        echo "serve: WARNING aborts rather than honour either); lower NGL= by 2-4 (~158" >&2
+        echo "serve: WARNING MiB/layer at -ts 6,1) or close desktop GPU users." >&2
+    elif [ "$FIT_SET" = 1 ]; then
+        echo "serve: WARNING display baseline is ${BASE_MIB} MiB (> the ~1216 MiB the" >&2
+        echo "serve: WARNING 28-layer config was measured to survive); FIT=0 is set, so the" >&2
+        echo "serve: WARNING formula is kept and may breach the ${CAP} MiB cap (the watchdog" >&2
+        echo "serve: WARNING would kill the load). Unset FIT, or use FIT=1, to let --fit" >&2
+        echo "serve: WARNING give up layers." >&2
+    else
+        echo "serve: WARNING display baseline is ${BASE_MIB} MiB (> the ~1216 MiB the" >&2
+        echo "serve: WARNING 28-layer config was measured to survive); falling back to" >&2
+        echo "serve: WARNING --fit, which picks fewer layers to hold the ${CAP} MiB cap." >&2
+        echo "serve: WARNING Set FIT=0 or NGL= to keep the measured formula instead." >&2
+        FIT=1
+    fi
+fi
+
 VEGA_MARGIN=""
 if [ "$FIT" = 1 ]; then
     VEGA_MARGIN=$(python3 -c "import sys; sys.path.insert(0, '$ROOT/scripts'); import guard; print(int(guard.vram_total_mib() - $CAP))" 2>/dev/null || true)
@@ -256,25 +307,6 @@ if [ "$FIT" = 1 ]; then
     FIT_ARGS=(--fit on -fitt "$FITT_CUDA,$VEGA_MARGIN")
 else
     FIT_ARGS=(-ngl "$NGL" -ts "$TS")
-fi
-
-# The safe layer count is a function of the live desktop baseline, not a
-# constant -- measured 746-2188 MiB within one hour. At 128k this config's
-# client footprint is ~3384 MiB at 28 layers, so a fixed -ngl reaches the cap at
-# a baseline near 1216 MiB. The watchdog is the backstop, not the plan: say so
-# before it has to fire.
-BASE_MIB=$(python3 -c "import sys; sys.path.insert(0, '$ROOT/scripts'); import guard; print(int(guard.vram_used_mib()))" 2>/dev/null || true)
-if [ -n "${BASE_MIB:-}" ] && [ "$MTP" = 1 ] && [ "$BASE_MIB" -gt 1200 ]; then
-    if [ "$FIT" = 1 ]; then
-        echo "serve: WARNING display baseline is ${BASE_MIB} MiB (> the ~1216 MiB the" >&2
-        echo "serve: WARNING 28-layer config was measured to survive); --fit will pick" >&2
-        echo "serve: WARNING fewer layers to hold the ${CAP} MiB cap." >&2
-    else
-        echo "serve: WARNING display baseline is ${BASE_MIB} MiB; this config fits to about" >&2
-        echo "serve: WARNING 1216 MiB. Lower NGL= by 2-4 (~158 MiB/layer at -ts 6,1), close" >&2
-        echo "serve: WARNING desktop GPU users, or re-run with FIT=1 so llama.cpp's own" >&2
-        echo "serve: WARNING --fit derives the layer count from live free VRAM." >&2
-    fi
 fi
 
 # `-lm dio` reads the weights with O_DIRECT; measured ~12 % faster on prompt

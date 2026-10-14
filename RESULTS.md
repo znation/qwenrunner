@@ -977,7 +977,10 @@ because the fit already sees the desktop's usage in `free`.
   (3900 → 25 layers, 4176 → 26). And the extra two layers cost the drift
   headroom the formula keeps: client 3648 leaves ~350 MiB of desktop tolerance
   against the cap where the formula's 3384 leaves ~620. That is why `serve.sh`
-  keeps the deterministic formula as its default and exposes this as `FIT=1`.
+  keeps the deterministic formula as its default and exposes this as `FIT=1`;
+  it now also auto-falls back to `--fit` (with a warning) when the live display
+  baseline exceeds ~1200 MiB, where the fixed `-ngl` would otherwise breach the
+  cap. An explicit `FIT=0`, or `NGL=`/`TS=`, keeps the formula.
 * **Failure mode, if the fit cannot satisfy the margins:** it logs a warning and
   leaves `n_gpu_layers` at its default, which is `-1` = *all* layers
   (`llama_model::n_gpu_layers()` → `hparams.n_layer_all + 1`). The load then
@@ -1052,8 +1055,11 @@ second sequence's compute buffers: CUDA0 6876 MiB used, 472 free, client 3284) �
 at the cost of the formula's reserve (see "`--fit`: the runtime derives the layer
 budget itself"). Setting `NGL=` or `TS=` forces the fit off, because it aborts
 rather than honour either. `serve.sh` prints the live display baseline and warns
-when it is above the ~1216 MiB this config was measured to survive, and forwards
-`SIGINT`/`SIGTERM` to the child, so Ctrl-C actually stops the server.
+when it is above the ~1216 MiB this config was measured to survive — and, if
+`FIT` is unset, auto-falls back to `--fit` on that same condition, so a heavy
+desktop gives up layers instead of tripping the watchdog (an explicit `FIT=0`
+pins the formula) — then forwards `SIGINT`/`SIGTERM` to the child, so Ctrl-C
+actually stops the server.
 
 ```
 ./serve.sh                       # → http://127.0.0.1:8080, 128k context + MTP

@@ -21,7 +21,7 @@ including six conclusions that earlier, load-contaminated measurements got wrong
 | model | **`models/Qwen3.8-27B-UD-Q4_K_M.gguf`** | 16.46 GB. Smaller quants are *faster* — Q2_K_XL offloads 20 layers vs 12 and gains +52 % generation — but cost +61 % perplexity. See `RESULTS.md` |
 | `-lm` | **`dio`** | 74.55 vs 66.32 t/s prompt against the mmap default, and ~40× lighter RSS |
 | `-ngl` | **largest the live baseline allows** (10 here) | ~252 MiB client VRAM per layer; 10 beats 8 on both axes, 2/2 |
-| `--fit` (serve.sh `FIT=1`) | **off** — opt-in | llama.cpp's own fitter re-derives `-ngl`/`-ts` from live free VRAM with the cap as a `-fitt` margin: 28-30 layers at 128k, i.e. the shipped config to 2 MiB, or two layers (+4 %) faster — but it spends the ~620 MiB drift reserve and its choice moves with desktop noise |
+| `--fit` (serve.sh `FIT=1`) | **off**, auto-fallback on a heavy desktop | llama.cpp's own fitter re-derives `-ngl`/`-ts` from live free VRAM with the cap as a `-fitt` margin: 28-30 layers at 128k, i.e. the shipped config to 2 MiB, or two layers (+4 %) faster — but it spends the ~620 MiB drift reserve and its choice moves with desktop noise. The formula is the default; when the live display baseline exceeds ~1200 MiB `serve.sh` warns and auto-falls back to `--fit` (the only path that gives up layers to hold the cap), unless `FIT=0` or `NGL=`/`TS=` is set |
 | `-b`/`-ub` | **2048/512 (default)** | 70.26 vs 59.09/45.06/29.48 t/s prompt; smaller batches buy VRAM, not speed. At 128k the cap pins it from above too: `-ub 1024` breaches (killed before health), `-b 4096` alone changes nothing (37.04 vs 36.95 t/s) |
 | `-tb` | `= -t` (default) | batch threads 8/12/16 measure 36.95/36.96/36.24 t/s prompt at 128k — equivalent, like `-t` itself |
 | CPU affinity | off (default) | `--cpu-strict 1 -Cr 0-7` is −3 % generation, `-Cr 0-15` −38 %; un-pinned placement is fastest |
@@ -157,6 +157,7 @@ MTP=0 ./serve.sh                 # the same split without speculative decoding
 CTX=65536 ./serve.sh             # shorter pool (32k/slot), more layers (faster)
 NGL=26 TS=6,1 ./serve.sh         # override the layer count / tensor split
 FIT=1 ./serve.sh                 # let llama.cpp's --fit derive -ngl from free VRAM
+FIT=0 ./serve.sh                 # keep the formula even when the baseline is high
 ```
 
 `-c` is the **shared pool**, and llama-server divides it by `-np`: the default
@@ -215,8 +216,10 @@ split to llama.cpp's own `--fit`, with the cap encoded as a `-fitt` margin
 (`vram_total - CAP` on the Vega, so it is baseline-independent); measured at
 128k it picks 28-30 layers — the same config to 2 MiB, or two layers faster —
 but it spends that reserve and its choice moves with a few MiB of desktop
-noise, so it is opt-in. Setting `NGL=` or `TS=` forces the fit off. See
-[`RESULTS.md`](RESULTS.md) for both tables.
+noise, so it is opt-in. `serve.sh` auto-falls back to `--fit` (with a warning)
+when the live display baseline exceeds ~1200 MiB, where the fixed `-ngl` would
+otherwise breach the cap; an explicit `FIT=0`, or setting `NGL=`/`TS=`, keeps
+the formula. See [`RESULTS.md`](RESULTS.md) for both tables.
 
 **Read the printed baseline before trusting `-ngl`.** The desktop is the other
 tenant of this GPU and its footprint drifts (measured 746–2188 MiB within one
