@@ -23,3 +23,9 @@ dmesg.log
 
 # this one will change on every ./serve.sh run I think?
 logs/serve.log
+
+# Raw 0.5 s sampling telemetry from scripts/freqwatch.py and
+# scripts/instrument_run.py — high-frequency streams, regenerated on every
+# use and superseded by the committed result records (results/*.jsonl).
+results/freq*.jsonl
+results/instrument*.jsonl

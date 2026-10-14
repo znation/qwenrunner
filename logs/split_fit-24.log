@@ -1,0 +1,4 @@
+0.00.234.518 W srv  llama_server: security: no API key is set and CORS allows all origins (see https://github.com/ggml-org/llama.cpp/pull/25655)
+0.01.252.607 W common_fit_params: failed to fit params to free device memory: n_gpu_layers already set by user to 24, abort
+0.08.550.351 W read_raw_unsafe: Falling back to buffered IO due to Bad address
+0.11.496.047 W read_raw_unsafe: Falling back to buffered IO due to Bad address

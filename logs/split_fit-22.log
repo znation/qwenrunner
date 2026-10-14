@@ -1,0 +1,4 @@
+0.00.231.908 W srv  llama_server: security: no API key is set and CORS allows all origins (see https://github.com/ggml-org/llama.cpp/pull/25655)
+0.01.230.234 W common_fit_params: failed to fit params to free device memory: n_gpu_layers already set by user to 22, abort
+0.08.264.732 W read_raw_unsafe: Falling back to buffered IO due to Bad address
+0.12.905.238 W srv          init: chat template supports preserving reasoning, it is enabled by default (may use more tokens, disable via --no-reasoning-preserve)
