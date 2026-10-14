@@ -1,0 +1,11 @@
+0.00.020.999 E ggml_cuda_init: failed to initialize CUDA: no CUDA-capable device is detected
+0.01.410.912 I cmn          init: llama threadpool init, n_threads = 8
+0.01.461.606 I 
+0.01.461.682 I system_info: n_threads = 8 (n_threads_batch = 8) / 16 | CUDA : ARCHS = 610 | USE_GRAPHS = 1 | FA_QUANTS = q4_0-q4_0,q8_0-q8_0,f16-f16,bf16-bf16 | CPU : SSE3 = 1 | SSSE3 = 1 | AVX = 1 | AVX2 = 1 | F16C = 1 | FMA = 1 | BMI2 = 1 | LLAMAFILE = 1 | OPENMP = 1 | REPACK = 1 | 
+0.01.461.691 I perplexity: tokenizing the input ..
+0.01.466.755 I perplexity: tokenization took 5.061 ms
+0.01.466.763 I perplexity: calculating perplexity over 6 chunks, n_ctx=512, batch_size=2048, n_seq=4
+0.05.501.537 I perplexity: 4.03 seconds per pass - ETA 0.10 minutes
+[1]2.8263,[2]4.3100,[3]4.2370,[4]3.9814,[5]4.2222,[6]4.9314,
+0.07.838.847 I Final estimate: PPL = 4.9314 +/- 0.34055
+
