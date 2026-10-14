@@ -1613,10 +1613,13 @@ The remaining knobs are settled, not swept further:
   prompt wins. Smaller batches do buy VRAM (3064 → 2683 MiB at b512) if the
   cap is ever tight.
 
-Shipped live at 64k: **~52.7 t/s generation, ~91.5 t/s prompt**, 4465-4477 MiB
-of the Vega (≈520 MiB under the 5000 cap at a ~1230 MiB desktop baseline), and
-valid OpenAI-format tool calls. The 9B's Q4_K_M on the eGPU was not re-swept
-(the eGPU is powered off).
+Shipped live at 64k: **~19 t/s generation on short prompts** (a full 64k-deep
+session runs ~16), 4465-4477 MiB of the Vega under the 5000 cap, valid
+OpenAI-format tool calls. A one-off post-reboot reading of ~53 t/s at 64k
+could not be reproduced — the shipped server rate is ~19, and the *allocated*
+context is a first-order lever: measured server t/s at short prompt was ~35 at
+a 32k pool, ~26 at 48k, ~19 at 64k. The 9B's Q4_K_M on the eGPU was not
+re-swept (the eGPU is powered off).
 
 **Operational lesson: never let a benchmark be force-killed mid-GPU-operation.**
 Two `llama-bench` runs SIGKILLed by a command deadline wedged the AMDGPU/TTM

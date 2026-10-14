@@ -7,9 +7,10 @@
 # The 9B cannot fit under the display cap (its Q4_K_M weights alone exceed
 # 5000 MiB), so the 4B is the default model. --fit always, target
 # (vram_total - CAP) free, so the fit holds the cap regardless of desktop
-# drift; at a quiet desktop the 4B is fully resident and generation is
-# memory-bandwidth-bound (~50-90 t/s on the Vega, vs the 2-6 t/s the old 27B
-# split managed).
+# drift. Generation is ~19 t/s at the shipped 64k allocation (short prompt;
+# ~16 at full depth) and climbs to ~35 t/s at a 32k pool — the *allocated*
+# context is the first-order throughput lever, not the model (vs the 2-6 t/s
+# the old 27B split managed).
 #
 # Overridable via env:
 #   MODEL ALIAS CTX NP PORT CAP THREADS HOST FITT
