@@ -171,11 +171,13 @@ leaving room for tool-call output: pi in `~/.pi/agent/models.json`
 (`contextWindow: 59392`), and omp in `~/.omp/agent/models.yml`, which needs an
 explicit override because its auto-discovery of `http://127.0.0.1:8080`
 otherwise takes the server's raw per-slot context as both the window *and* the
-output budget (65536/65536). pi's own default is the cloud model
-(`huggingface/deepseek-ai/DeepSeek-V4.1-Flash:deepinfra`), so the local one is
-chosen with `--model qwenrunner/Qwen3.8-27B`; the two tumwater fleets on this box
-name it as their free `fallback`, which is the pair the docs' backend guide
-recommends (a budgeted API primary, the cost-n/a local model behind it).
+output budget (65536/65536). pi's default is the local model
+(`defaultProvider: "qwenrunner"`, `defaultModel: "Qwen3.8-27B"` in
+`~/.pi/agent/settings.json`); the cloud model
+(`huggingface/deepseek-ai/DeepSeek-V4.1-Flash:deepinfra`) remains available via
+`--model`. The two tumwater fleets on this box name it as their free
+`fallback`, which is the pair the docs' backend guide recommends (a budgeted API
+primary, the cost-n/a local model behind it).
 `serve.sh` passes `-a Qwen3.8-27B` so both see a stable model id instead of the
 .gguf path; the alias is advisory — llama-server ignores the request's `model`
 field, so a client still sending an older id works.
