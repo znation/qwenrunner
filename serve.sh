@@ -3,31 +3,39 @@
 #
 # DEFAULT (./serve.sh): one fully-resident instance on the Vega 10 display GPU
 # only — no eGPU involved:
-#   * Qwen3.5-4B Q4_K_M on Vulkan0 (:8080), under the 5000 MiB watchdog
+#   * Qwen3.5-4B Q4_K_M on Vulkan0 (:8080), under the 5500 MiB watchdog
 #   * plus its vision projector (mmproj), so image input works — the mmproj
 #     runs on the CPU (--no-mmproj-offload), so text-only traffic stays 100 %
 #     on the GPU and only image input pays a CPU vision-encode
 # The 9B cannot fit under the display cap (its Q4_K_M weights alone exceed
-# 5000 MiB), so the 4B is the default model. --fit always, target
-# (vram_total - CAP) free, so the fit holds the cap regardless of desktop
-# drift. Generation is ~19 t/s at the shipped 64k allocation (short prompt;
+# 5500 MiB), so the 4B is the default model. Two guards, deliberately
+# different: --fit packs the model into FIT_CAP (default 4800 MiB, target
+# (vram_total - FIT_CAP) free, so the fit holds the budget regardless of
+# desktop drift), while guard.py only kills at CAP (default 5500 MiB). The
+# 700 MiB gap is desktop-drift tolerance, not model headroom: the model
+# footprint is fixed at load (measured +34 MiB transient under a real 8k
+# prefill), so the gap is how far the desktop may grow after load before the
+# guard fires. Lowering FIT_CAP to widen the gap is expensive — the 4B is at
+# the fully-resident edge, and 200 MiB less offloads layers to CPU (measured
+# 33.5 -> 13.8 t/s). Generation is ~19 t/s at the shipped
+# 64k allocation (short prompt;
 # ~16 at full depth) and climbs to ~35 t/s at a 32k pool — the *allocated*
 # context is the first-order throughput lever, not the model (vs the 2-6 t/s
 # the old 27B split managed).
 #
 # Overridable via env:
-#   MODEL ALIAS CTX NP PORT CAP THREADS HOST FITT
+#   MODEL ALIAS CTX NP PORT CAP FIT_CAP THREADS HOST FITT
 #   MMPROJ MMPROJ_OFFLOAD (0 = CPU vision encoder, 1 = GPU)
 #   REASONING_BUDGET REASONING_BUDGET_MSG (thinking-token cap; default 1024)
 #   EGPU=1   — two fully-resident instances: Qwen3.5-9B on the GTX 1070 eGPU
 #              (:8080) + Qwen3.5-4B on the Vega (:8081); its own env:
 #              MAIN_MODEL MAIN_ALIAS MAIN_CTX MAIN_NP MAIN_PORT MAIN_FITT
-#              VEGA_MODEL VEGA_ALIAS VEGA_CTX VEGA_NP VEGA_PORT VEGA_CAP VEGA_FITT
+#              VEGA_MODEL VEGA_ALIAS VEGA_CTX VEGA_NP VEGA_PORT VEGA_CAP VEGA_FIT_CAP VEGA_FITT
 #              VEGA_MMPROJ VEGA_MMPROJ_OFFLOAD
 #   LEGACY=1 — the old single Qwen3.8-27B split across both GPUs (requires the
 #              eGPU; its own env:
 #               MODEL ALIAS CTX TS NGL LM BATCH UBATCH CTK CTV FA HOST PORT
-#               CAP NP MTP MD DEVD NGLD DCTK DCTV DNMAX DPMIN FIT FITT_CUDA),
+#               CAP FIT_CAP NP MTP MD DEVD NGLD DCTK DCTV DNMAX DPMIN FIT FITT_CUDA),
 #               e.g. LEGACY=1 ./serve.sh  or  LEGACY=1 MTP=0 ./serve.sh.
 set -euo pipefail
 
@@ -44,7 +52,10 @@ if [ "$EGPU" = 1 ]; then
     # same per-slot context the clients already expect (pi contextWindow
     # 59392, omp 65536), so no client change is needed. At this pool the 1070
     # holds weights ~5.5 GiB + q4_0 KV ~1.1 GiB + compute ~0.7 GiB ≈ 7.3 GiB
-    # of its 8 GiB.
+    # of its 8 GiB. NO display cap and NO guard.py here: the 1070 drives no
+    # display, so it may use the whole GPU — the only limit is the fit margin
+    # MAIN_FITT (256 MiB), which is a --fit-target, not a kill threshold. The
+    # FIT_CAP/CAP guards below are the Vega's (the built-in display GPU) alone.
     MAIN_MODEL="${MAIN_MODEL:-$ROOT/models/Qwen3.5-9B-Q4_K_M.gguf}"
     MAIN_ALIAS="${MAIN_ALIAS:-Qwen3.5-9B}"
     MAIN_CTX="${MAIN_CTX:-131072}"
@@ -53,8 +64,9 @@ if [ "$EGPU" = 1 ]; then
 
     # Display GPU (Vega 10) secondary. Q4_K_S is the measured best 4B quant on
     # this Vega (see the default block below); ~3.3 GiB at the 32768 pool
-    # leaves ~1.7 GiB of the 5000 MiB cap for the desktop at a typical
-    # baseline; guard.py still kills before any breach.
+    # leaves ~1.7 GiB of the cap for the desktop at a typical baseline;
+    # guard.py still kills before any breach. Two guards, as in the default
+    # block: --fit packs into VEGA_FIT_CAP, guard.py kills at VEGA_CAP.
     VEGA_MODEL="${VEGA_MODEL:-$ROOT/models/Qwen3.5-4B-Q4_K_S.gguf}"
     # Same vision projector as the default 4B; CPU-offloaded for the same reason
     # (text-only stays on the Vega; only image input pays the CPU encode).
@@ -64,7 +76,8 @@ if [ "$EGPU" = 1 ]; then
     VEGA_CTX="${VEGA_CTX:-32768}"
     VEGA_NP="${VEGA_NP:-2}"
     VEGA_PORT="${VEGA_PORT:-8081}"
-    VEGA_CAP="${VEGA_CAP:-5000}"
+    VEGA_CAP="${VEGA_CAP:-5500}"
+    VEGA_FIT_CAP="${VEGA_FIT_CAP:-4800}"
     # Reasoning safety net for the 4B (see the default block); shared env.
     REASONING_BUDGET="${REASONING_BUDGET:-1024}"
     REASONING_BUDGET_MSG="${REASONING_BUDGET_MSG:- Stop thinking and provide the final answer now.}"
@@ -108,20 +121,23 @@ if [ "$EGPU" = 1 ]; then
 
     # --fit on both instances, always, with a per-GPU --fit-target. The 1070 is
     # not the display GPU, so it only needs a small margin (256 MiB, the legacy
-    # FITT_CUDA value). The Vega instance must hold the display cap no matter
-    # what the desktop is doing: its target leaves (vram_total - CAP) free, and
-    # since the fit sees the desktop's usage in `free`, that is
+    # FITT_CUDA value) and is NOT run under guard.py — it may use the whole
+    # GPU. The Vega instance must hold the display cap no matter
+    # what the desktop is doing: its target leaves (vram_total - VEGA_FIT_CAP)
+    # free, and since the fit sees the desktop's usage in `free`, that is
     # baseline-independent — a loaded desktop automatically costs it layers,
-    # never the display. No -ngl/-ts anywhere: the fit aborts if either is set.
+    # never the display. guard.py kills at the higher VEGA_CAP, so the gap is
+    # desktop-drift tolerance (the model footprint is fixed at load). No
+    # -ngl/-ts anywhere: the fit aborts if either is set.
     MAIN_FITT="${MAIN_FITT:-256}"
-    VEGA_FITT="${VEGA_FITT:-$(python3 -c "import sys; sys.path.insert(0, '$ROOT/scripts'); import guard; print(int(guard.vram_total_mib() - $VEGA_CAP))" 2>/dev/null || true)}"
+    VEGA_FITT="${VEGA_FITT:-$(python3 -c "import sys; sys.path.insert(0, '$ROOT/scripts'); import guard; print(int(guard.vram_total_mib() - $VEGA_FIT_CAP))" 2>/dev/null || true)}"
     if [ -z "${VEGA_FITT:-}" ] || [ "$VEGA_FITT" -lt 256 ]; then
-        echo "serve: WARNING could not derive the Vega --fit target (vram_total - cap); using 256 MiB" >&2
+        echo "serve: WARNING could not derive the Vega --fit target (vram_total - fit_cap); using 256 MiB" >&2
         VEGA_FITT=256
     fi
 
     echo "serve: main  $(basename "$MAIN_MODEL") alias=$MAIN_ALIAS dev=CUDA0 ctx=$MAIN_CTX ($(( MAIN_CTX / MAIN_NP ))/slot x $MAIN_NP) --fit-target ${MAIN_FITT}MiB  http://$HOST:$MAIN_PORT"
-    echo "serve: vega  $(basename "$VEGA_MODEL") alias=$VEGA_ALIAS dev=Vulkan0 ctx=$VEGA_CTX ($(( VEGA_CTX / VEGA_NP ))/slot x $VEGA_NP) --fit-target ${VEGA_FITT}MiB cap=${VEGA_CAP}MiB  http://$HOST:$VEGA_PORT"
+    echo "serve: vega  $(basename "$VEGA_MODEL") alias=$VEGA_ALIAS dev=Vulkan0 ctx=$VEGA_CTX ($(( VEGA_CTX / VEGA_NP ))/slot x $VEGA_NP) --fit-target ${VEGA_FITT}MiB (fit-cap=${VEGA_FIT_CAP}MiB) cap=${VEGA_CAP}MiB  http://$HOST:$VEGA_PORT"
     if [ -n "$VEGA_MMPROJ" ]; then
         echo "serve: vega mmproj=$(basename "$VEGA_MMPROJ") offload=$([ "$VEGA_MMPROJ_OFFLOAD" = 1 ] && echo GPU || echo CPU)"
     fi
@@ -164,11 +180,14 @@ fi
 if [ "$LEGACY" = 0 ]; then
     # ---- default: one fully-resident instance on the Vega 10 (display GPU),
     # no eGPU involved. The 9B cannot fit under the display cap (its Q4_K_M
-    # weights alone exceed 5000 MiB), so the default model is the 4B; EGPU=1
-    # restores the two-GPU mode. --fit always, leaving (vram_total - CAP) free
-    # so the fit holds the cap regardless of desktop drift (it sees the
-    # desktop in `free`); no -ngl/-ts anywhere (the fit aborts if either is
-    # set). O_DIRECT is unsupported on the Vega (measured: dio falls back to
+    # weights alone exceed 5500 MiB), so the default model is the 4B; EGPU=1
+    # restores the two-GPU mode. --fit always, leaving (vram_total - FIT_CAP)
+    # free so the fit holds the fit budget regardless of desktop drift (it
+    # sees the desktop in `free`); no -ngl/-ts anywhere (the fit aborts if
+    # either is set). guard.py is the runtime backstop at the higher CAP; the
+    # gap is desktop-drift tolerance, since the model footprint is fixed at
+    # load.
+    # O_DIRECT is unsupported on the Vega (measured: dio falls back to
     # buffered IO with a warning), so -lm none.
     # Q4_K_S, not Q4_K_M: measured on this Vega (results/amd4b_*.md) it is
     # +2.6 % generation / +4-5 % prompt at statistically identical perplexity
@@ -186,7 +205,11 @@ if [ "$LEGACY" = 0 ]; then
     CTX="${CTX:-65536}"
     NP="${NP:-1}"
     PORT="${PORT:-8080}"
-    CAP="${CAP:-5000}"
+    # Two guards, deliberately different (see the header): --fit packs the
+    # model into FIT_CAP, guard.py only kills at CAP. The gap is desktop-drift
+    # tolerance after load, not model headroom (the footprint is fixed at load).
+    FIT_CAP="${FIT_CAP:-4800}"
+    CAP="${CAP:-5500}"
     HOST="${HOST:-127.0.0.1}"
     THREADS="${THREADS:-8}"
     # Reasoning safety net: Qwen3.5-4B is a thinking model and can burn the
@@ -200,9 +223,9 @@ if [ "$LEGACY" = 0 ]; then
     # disables the cap for all requests.
     REASONING_BUDGET="${REASONING_BUDGET:-1024}"
     REASONING_BUDGET_MSG="${REASONING_BUDGET_MSG:- Stop thinking and provide the final answer now.}"
-    FITT="${FITT:-$(python3 -c "import sys; sys.path.insert(0, '$ROOT/scripts'); import guard; print(int(guard.vram_total_mib() - $CAP))" 2>/dev/null || true)}"
+    FITT="${FITT:-$(python3 -c "import sys; sys.path.insert(0, '$ROOT/scripts'); import guard; print(int(guard.vram_total_mib() - $FIT_CAP))" 2>/dev/null || true)}"
     if [ -z "${FITT:-}" ] || [ "$FITT" -lt 256 ]; then
-        echo "serve: WARNING could not derive the --fit target (vram_total - cap); using 256 MiB" >&2
+        echo "serve: WARNING could not derive the --fit target (vram_total - fit_cap); using 256 MiB" >&2
         FITT=256
     fi
     if ! "$ROOT/build/bin/llama-bench" --list-devices 2>/dev/null | grep -q '^  Vulkan0:'; then
@@ -229,7 +252,7 @@ if [ "$LEGACY" = 0 ]; then
         MM_ARGS=()
     fi
     mkdir -p "$ROOT/logs"
-    echo "serve: model=$(basename "$MODEL") alias=$ALIAS dev=Vulkan0 ctx=$CTX ($(( CTX / NP ))/slot x $NP) --fit-target ${FITT}MiB cap=${CAP}MiB  http://$HOST:$PORT"
+    echo "serve: model=$(basename "$MODEL") alias=$ALIAS dev=Vulkan0 ctx=$CTX ($(( CTX / NP ))/slot x $NP) --fit-target ${FITT}MiB (fit-cap=${FIT_CAP}MiB) cap=${CAP}MiB  http://$HOST:$PORT"
     if [ -n "$MMPROJ" ]; then
         echo "serve: mmproj=$(basename "$MMPROJ") offload=$([ "$MMPROJ_OFFLOAD" = 1 ] && echo GPU || echo CPU)"
     fi
@@ -265,7 +288,11 @@ THREADS="${THREADS:-8}"
 
 HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-8080}"
-CAP="${CAP:-5000}"
+# Two guards for the display GPU, as in the default block: --fit packs the Vega
+# into FIT_CAP, guard.py only kills at CAP. The 1070 is not the display GPU and
+# is not capped (see FITT_CUDA below).
+FIT_CAP="${FIT_CAP:-4800}"
+CAP="${CAP:-5500}"
 # Two slots by default: a second agent (or a subagent) then makes progress
 # instead of waiting behind the first. Measured at 128k pool / -np 2: n_ctx_slot
 # 65536, two concurrent 1135-token requests both progressing (100.0 s wall
@@ -378,16 +405,17 @@ DEV="CUDA0,Vulkan0"
 #          measured with upstream's 3-token draft chain: the shipped 6 costs the
 #          1070 ~1.3 layers, which moves the 128k ceiling from 30 to 28. See the
 #          DNMAX block for the measurement. Deterministic, and the reserve it
-#          leaves (client 2972 MiB of a 5000 MiB cap on a ~1480 MiB baseline,
+#          leaves (client 2972 MiB of a 5500 MiB cap on a ~1480 MiB baseline,
 #          7689 MiB of the 1070's 8192) is what absorbs desktop drift -- it is
-#          safe to ~1880 MiB -- most, not all, of the 746-2188 MiB range the
-#          baseline is known to occupy; 28 layers is safe only to ~1540, and its
+#          safe to ~2380 MiB (the 5000-cap figure plus the 500 MiB the cap
+#          rose), which now covers the whole 746-2188 MiB range the
+#          baseline is known to occupy; 28 layers is safe only to ~2040, and its
 #          two runs of the same command peaked 200 MiB apart, one of them over
 #          the cap.
 #   FIT=1  llama-server projects per-device weight + KV + compute + draft memory
 #          against live *free* VRAM and picks -ngl and the tensor split itself.
 #          The display cap is encoded as a margin: -fitt asks the fit to leave
-#          (vram_total - CAP) free on the Vega, which is baseline-independent
+#          (vram_total - FIT_CAP) free on the Vega, which is baseline-independent
 #          because the fit already sees the desktop's usage in `free`. Measured
 #          at 128k + MTP it picks 28-30 layers (client 3383-3648 MiB, NVIDIA
 #          7479-7525 MiB) against the formula's 28 (3384/7541) -- those runs also
@@ -396,9 +424,9 @@ DEV="CUDA0,Vulkan0"
 #          from live free memory instead of assuming a baseline -- but the
 #          choice is discrete and moves with a few MiB of desktop noise (28 at a
 #          7059 MiB free Vega, 30 at 7059+10), and at 30 it spends the reserve
-#          the formula keeps, leaving ~350 MiB of drift tolerance instead of
-#          ~620. Hence opt-in, not default -- but only while the desktop is
-#          quiet: once the live display baseline passes ~1200 MiB a fixed
+#          the formula keeps, leaving ~850 MiB of drift tolerance instead of
+#          ~1120. Hence opt-in, not default -- but only while the desktop is
+#          quiet: once the live display baseline passes ~1700 MiB a fixed
 #          formula -ngl would breach the cap, so serve.sh warns and auto-falls
 #          back to --fit (the only path that gives up layers to hold it). An
 #          explicit FIT=0 pins the formula and suppresses the fallback;
@@ -430,7 +458,7 @@ if [ "$MTP" = 1 ]; then
     # n_outputs_max scales with the chain and costs the 1070 336 MiB (~1.3
     # layers) -- see the DNMAX block. Shipping 28 with the 6-token chain puts the
     # 1070 at 8013 of 8192 MiB and leaves the config safe only while the desktop
-    # baseline is <= ~1540 MiB; 26 leaves it at 7689 and safe to ~1880. Measured
+    # baseline is <= ~2040 MiB; 26 leaves it at 7689 and safe to ~2380. Measured
     # at 28, two runs of the same command 3.5 MiB apart in baseline peaked 5053.3
     # (killed) and 4850.9 -- a coin flip; at 26, 4529.1 and 4721.1, clear both
     # times.
@@ -459,29 +487,30 @@ fi
 # The safe layer count is a function of the live desktop baseline, not a
 # constant -- measured 746-2188 MiB within one hour. At 128k this config's
 # client footprint is ~3384 MiB at 28 layers, so a fixed -ngl reaches the cap at
-# a baseline near 1216 MiB. The watchdog is the backstop, not the plan: say so
+# a baseline near 1716 MiB (1216 under the old 5000 cap, +500 for the new one).
+# The watchdog is the backstop, not the plan: say so
 # before it has to fire. Above that baseline the only safe default is to let
 # --fit give up layers, so an unset FIT auto-falls back to it (with this
 # warning); an explicit FIT=0 or an NGL=/TS= override pins the formula instead.
 BASE_MIB=$(python3 -c "import sys; sys.path.insert(0, '$ROOT/scripts'); import guard; print(int(guard.vram_used_mib()))" 2>/dev/null || true)
-if [ -n "${BASE_MIB:-}" ] && [ "$MTP" = 1 ] && [ "$BASE_MIB" -gt 1200 ]; then
+if [ -n "${BASE_MIB:-}" ] && [ "$MTP" = 1 ] && [ "$BASE_MIB" -gt 1700 ]; then
     if [ "$FIT" = 1 ]; then
-        echo "serve: WARNING display baseline is ${BASE_MIB} MiB (> the ~1216 MiB the" >&2
+        echo "serve: WARNING display baseline is ${BASE_MIB} MiB (> the ~1716 MiB the" >&2
         echo "serve: WARNING 28-layer config was measured to survive); --fit will pick" >&2
         echo "serve: WARNING fewer layers to hold the ${CAP} MiB cap." >&2
     elif [ "$NGL_TS_SET" = 1 ]; then
         echo "serve: WARNING display baseline is ${BASE_MIB} MiB; this config fits to about" >&2
-        echo "serve: WARNING 1216 MiB. NGL=/TS= is set, so --fit cannot take over (llama.cpp" >&2
+        echo "serve: WARNING 1716 MiB. NGL=/TS= is set, so --fit cannot take over (llama.cpp" >&2
         echo "serve: WARNING aborts rather than honour either); lower NGL= by 2-4 (~158" >&2
         echo "serve: WARNING MiB/layer at -ts 6,1) or close desktop GPU users." >&2
     elif [ "$FIT_SET" = 1 ]; then
-        echo "serve: WARNING display baseline is ${BASE_MIB} MiB (> the ~1216 MiB the" >&2
+        echo "serve: WARNING display baseline is ${BASE_MIB} MiB (> the ~1716 MiB the" >&2
         echo "serve: WARNING 28-layer config was measured to survive); FIT=0 is set, so the" >&2
         echo "serve: WARNING formula is kept and may breach the ${CAP} MiB cap (the watchdog" >&2
         echo "serve: WARNING would kill the load). Unset FIT, or use FIT=1, to let --fit" >&2
         echo "serve: WARNING give up layers." >&2
     else
-        echo "serve: WARNING display baseline is ${BASE_MIB} MiB (> the ~1216 MiB the" >&2
+        echo "serve: WARNING display baseline is ${BASE_MIB} MiB (> the ~1716 MiB the" >&2
         echo "serve: WARNING 28-layer config was measured to survive); falling back to" >&2
         echo "serve: WARNING --fit, which picks fewer layers to hold the ${CAP} MiB cap." >&2
         echo "serve: WARNING Set FIT=0 or NGL= to keep the measured formula instead." >&2
@@ -491,9 +520,9 @@ fi
 
 VEGA_MARGIN=""
 if [ "$FIT" = 1 ]; then
-    VEGA_MARGIN=$(python3 -c "import sys; sys.path.insert(0, '$ROOT/scripts'); import guard; print(int(guard.vram_total_mib() - $CAP))" 2>/dev/null || true)
+    VEGA_MARGIN=$(python3 -c "import sys; sys.path.insert(0, '$ROOT/scripts'); import guard; print(int(guard.vram_total_mib() - $FIT_CAP))" 2>/dev/null || true)
     if [ -z "${VEGA_MARGIN:-}" ] || [ "$VEGA_MARGIN" -lt 256 ]; then
-        echo "serve: could not derive the --fit margin (vram_total $CAP); using the formula" >&2
+        echo "serve: could not derive the --fit margin (vram_total - fit_cap); using the formula" >&2
         FIT=0
     fi
 fi

@@ -9,12 +9,12 @@ desktop.
 
 The default (`./serve.sh`) runs one fully-resident instance on the Vega 10
 only — no eGPU involved — fitted by llama.cpp's own `--fit` with a
-`--fit-target` of `vram_total - cap`, so the display cap holds regardless of
+`--fit-target` of `vram_total - fit-cap`, so the fit budget holds regardless of
 desktop drift:
 
-* **Qwen3.5-4B Q4_K_S** on the Vega 10 (`:8080`), under the 5000 MiB watchdog
+* **Qwen3.5-4B Q4_K_S** on the Vega 10 (`:8080`), under the 5500 MiB watchdog
 
-The 9B cannot fit under the display cap (its Q4_K_M weights alone exceed 5000
+The 9B cannot fit under the display cap (its Q4_K_M weights alone exceed 5500
 MiB), so the 4B is the default model. Fully resident. Generation rate depends
 on the *allocated* context: ~35 t/s at a 32k pool, ~19 t/s at the shipped 64k
 (short prompts; a full 64k-deep session runs ~16 t/s — see `RESULTS.md`
@@ -46,7 +46,7 @@ including six conclusions that earlier, load-contaminated measurements got wrong
 | model | **`models/Qwen3.8-27B-UD-Q4_K_M.gguf`** | 16.46 GB. Smaller quants are *faster* — Q2_K_XL offloads 20 layers vs 12 and gains +52 % generation — but cost +61 % perplexity. See `RESULTS.md` |
 | `-lm` | **`dio`** | 74.55 vs 66.32 t/s prompt against the mmap default, and ~40× lighter RSS |
 | `-ngl` | **largest the live baseline allows** (10 here) | ~252 MiB client VRAM per layer; 10 beats 8 on both axes, 2/2 |
-| `--fit` (serve.sh `FIT=1`) | **off**, auto-fallback on a heavy desktop | llama.cpp's own fitter re-derives `-ngl`/`-ts` from live free VRAM with the cap as a `-fitt` margin: 28-30 layers at 128k, i.e. the shipped config to 2 MiB, or two layers (+4 %) faster — but it spends the ~620 MiB drift reserve and its choice moves with desktop noise. The formula is the default; when the live display baseline exceeds ~1200 MiB `serve.sh` warns and auto-falls back to `--fit` (the only path that gives up layers to hold the cap), unless `FIT=0` or `NGL=`/`TS=` is set |
+| `--fit` (serve.sh `FIT=1`) | **off**, auto-fallback on a heavy desktop | llama.cpp's own fitter re-derives `-ngl`/`-ts` from live free VRAM with the cap as a `-fitt` margin: 28-30 layers at 128k, i.e. the shipped config to 2 MiB, or two layers (+4 %) faster — but it spends the ~1120 MiB drift reserve and its choice moves with desktop noise. The formula is the default; when the live display baseline exceeds ~1700 MiB `serve.sh` warns and auto-falls back to `--fit` (the only path that gives up layers to hold the cap), unless `FIT=0` or `NGL=`/`TS=` is set |
 | `-b`/`-ub` | **2048/512 (default)** | 70.26 vs 59.09/45.06/29.48 t/s prompt; smaller batches buy VRAM, not speed. At 128k the cap pins it from above too: `-ub 1024` breaches (killed before health), `-b 4096` alone changes nothing (37.04 vs 36.95 t/s) |
 | `-tb` | `= -t` (default) | batch threads 8/12/16 measure 36.95/36.96/36.24 t/s prompt at 128k — equivalent, like `-t` itself |
 | CPU affinity | off (default) | `--cpu-strict 1 -Cr 0-7` is −3 % generation, `-Cr 0-15` −38 %; un-pinned placement is fastest |
@@ -198,18 +198,26 @@ value = effectively unrestricted), or per server with
 `REASONING_BUDGET=-1 ./serve.sh` to disable the cap.
 
 The server always runs llama.cpp's own `--fit on` with a `--fit-target`
-(`-fitt`) — the layer count is derived from live free VRAM, never by hand. The
-Vega instance leaves `vram_total - CAP` free (`FITT`, 3176 MiB here), which —
-because the fit sees the desktop's usage in `free` — holds the display cap
-regardless of desktop drift. At the default context the 4B is fully resident,
-so there is no CPU inference path and no MTP (pointless at memory-bandwidth
-speeds). `scripts/guard.py` is the backstop.
+(`-fitt`) — the layer count is derived from live free VRAM, never by hand. Two
+guards, deliberately different: the fit packs the model into `FIT_CAP` (default
+4800 MiB), so the Vega instance leaves `vram_total - FIT_CAP` free (`FITT`,
+3376 MiB here) — because the fit sees the desktop's usage in `free`, that holds
+the fit budget regardless of desktop drift — while `scripts/guard.py` only
+`SIGKILL`s at the higher `CAP` (default 5500 MiB). The 700 MiB gap is
+**desktop-drift tolerance, not model headroom**: the model footprint is fixed at
+load (KV and compute buffers are preallocated; measured **+34 MiB** transient
+under a real 8045-token prefill), so the gap is how far the desktop may grow
+after load before the guard fires. Widening the gap by lowering `FIT_CAP` is
+expensive — the 4B sits at the fully-resident edge, and 200 MiB less offloads
+layers to CPU (measured **33.5 → 13.8 t/s** at `FIT_CAP` 4800 → 4400), so the
+free lever is `CAP`. At the default context the 4B is fully resident, so there
+is no CPU inference path and no MTP (pointless at memory-bandwidth speeds).
 
 The default is `CTX=65536` with `-np 1` → **one 65536-slot** — the same per-slot
 context the clients already expect (pi `contextWindow` 59392). Measured live
 with a short prompt: **~19 t/s generation** (the full-64k-depth rate is ~16);
 a 32k pool runs ~35 t/s if speed matters more than depth. Vega total
-4465-4477 MiB under the 5000 MiB cap (≈520 MiB headroom at a ~1230 MiB desktop
+4465-4477 MiB under the 5500 MiB cap (≈1020 MiB headroom at a ~1230 MiB desktop
 baseline). `NP=2` halves the pool per slot but buys fairness for concurrent
 agents.
 
@@ -240,7 +248,11 @@ if `/dev/nvidia0` is absent or the binary was built without CUDA.
 `EGPU=1 ./serve.sh` runs Qwen3.5-9B on the GTX 1070 (`:8080`, `MAIN_*` env) and
 Qwen3.5-4B on the Vega (`:8081`, `VEGA_*` env), both fully resident, each
 fitted by `--fit` with its own `--fit-target` (256 MiB on the eGPU, vram_total
-− cap on the display GPU). The 9B's hybrid DeltaNet keeps its KV cache to 8 of
+− `VEGA_FIT_CAP` on the display GPU, with the same fit-cap/runtime-cap split as
+the default). The `FIT_CAP`/`CAP` guards are the **display GPU's alone**: the
+1070 drives no display, so it is not run under `guard.py` and has no cap — it
+may use the whole card, limited only by the 256 MiB fit margin. The 9B's hybrid
+DeltaNet keeps its KV cache to 8 of
 32 layers (~1.1 GiB at the 131072 pool). Measured: ~15.8 t/s on the 1070 and
 ~35.9 t/s on the Vega.
 
@@ -254,24 +266,24 @@ chain — and applies to it, not to the default above.
 
 `serve.sh` runs `llama-server` under `scripts/guard.py`, which polls system-wide
 VRAM every 50 ms and `SIGKILL`s the process group if it exceeds `CAP`
-(default 5000 MiB), so the display GPU is protected by measurement rather than
+(default 5500 MiB; the fit packs into the lower `FIT_CAP`, default 4800 MiB), so
+the display GPU is protected by measurement rather than
 by arithmetic. It prints the live display baseline and warns when it is above the
-~1216 MiB the default config was measured to survive. It forwards
+~1716 MiB the LEGACY config was measured to survive. It forwards
 `SIGINT`/`SIGTERM` to the child, so Ctrl-C actually stops the server.
 
 The layer count comes from the measured formula (`32 - (CTX-32768)/16384` with
 MTP — 32, not 34, because the shipped 6-token draft chain moves the 128k ceiling
 from 30 to 28; see RESULTS.md "The draft chain spends the 1070's reserve"), two
-layers under the last startable rung, which leaves ~570 MiB of the cap clear at a
-1457 MiB baseline — safe while the desktop baseline is ≤ ~1880 MiB, i.e. most but
-not all of the 746-2188 MiB range it drifts over (the top of that range needs
-`FIT=1` or fewer layers). `FIT=1` instead hands `-ngl` and the tensor
+layers under the last startable rung, which leaves ~1070 MiB of the cap clear at a
+1457 MiB baseline — safe while the desktop baseline is ≤ ~2380 MiB, i.e. the
+whole 746-2188 MiB range it drifts over. `FIT=1` instead hands `-ngl` and the tensor
 split to llama.cpp's own `--fit`, with the cap encoded as a `-fitt` margin
-(`vram_total - CAP` on the Vega, so it is baseline-independent); measured at
+(`vram_total - FIT_CAP` on the Vega, so it is baseline-independent); measured at
 128k it picks 28-30 layers — the same config to 2 MiB, or two layers faster —
 but it spends that reserve and its choice moves with a few MiB of desktop
 noise, so it is opt-in. `serve.sh` auto-falls back to `--fit` (with a warning)
-when the live display baseline exceeds ~1200 MiB, where the fixed `-ngl` would
+when the live display baseline exceeds ~1700 MiB, where the fixed `-ngl` would
 otherwise breach the cap; an explicit `FIT=0`, or setting `NGL=`/`TS=`, keeps
 the formula. See [`RESULTS.md`](RESULTS.md) for both tables.
 
