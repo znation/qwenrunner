@@ -15,18 +15,23 @@ attached:
 
 * **eGPU present** — `-dev CUDA0,Vulkan0 -sm layer`: spread across the GTX 1070
   (eGPU), the Vega 10 (built-in display GPU), and the CPU for the rest.
-* **eGPU absent** — `-dev Vulkan0 -sm layer`: the Vega 10 plus the CPU.
+* **eGPU absent** — `-dev Vulkan0 -sm layer`: the Vega 10 plus the CPU. `--fit`
+  offloads nothing here (it counts the host buffer the CPU-side weights land in
+  as device memory), so the Vega runs only the MTP draft.
 
 The built-in display GPU always respects two guards, deliberately different:
 `--fit` packs the model into `FIT_CAP` (default 4600 MiB) via a `-fitt` margin
 of `vram_total - FIT_CAP`, and `scripts/guard.py` only `SIGKILL`s at the higher
 `CAP` (default 5500 MiB). The eGPU drives no display, so it is not capped —
 only a small fit margin (`FITT_CUDA`, default 256 MiB) keeps it from filling
-the card. MTP speculation is on by default, its draft head on the Vega 10. The
-27B is CPU-bound (only a fraction of its 64 layers fit in VRAM), so generation
-is 2-6 t/s — slow, but the 4B that used to be the default was hopeless on
-quality, so the 27B is the model. Everything below is this config's measurement
-history.
+the card. `guard.py` enforces a second limit on RAM — `MemAvailable` above
+`MIN_AVAIL` (default 2048 MiB) — because there is no swap, no cgroup limit and
+no systemd-oomd here, so the kernel OOM killer is otherwise the only backstop
+and it takes the model. MTP speculation is on by default, its draft head on the
+Vega 10. The 27B is CPU-bound (only a fraction of its 64 layers fit in VRAM),
+so generation is 2-6 t/s — slow, but the 4B that used to be the default was
+hopeless on quality, so the 27B is the model. Everything below is this config's
+measurement history.
 
 ## Result
 
@@ -38,8 +43,8 @@ including six conclusions that earlier, load-contaminated measurements got wrong
 |---|---|---|
 | runtime | llama.cpp @ `aa5e0092`, Vulkan/RADV | no ROCm/HIP on Vega 10 — Vulkan is the only GPU compute path |
 | model | **`models/Qwen3.8-27B-UD-Q4_K_M.gguf`** | 16.46 GB. Smaller quants are *faster* — Q2_K_XL offloads 20 layers vs 12 and gains +52 % generation — but cost +61 % perplexity. See `RESULTS.md` |
-| `-lm` | **`dio`** | 74.55 vs 66.32 t/s prompt against the mmap default, and ~40× lighter RSS |
-| `-ngl` | **fit-derived** (was 10 on the Vega-only path) | ~252 MiB client VRAM per layer; 10 beats 8 on both axes, 2/2. `--fit` picks it from live free VRAM now |
+| `-lm` | **`mmap`** | `dio` is 46.10 vs 36.15 t/s prompt at 128k, but it puts the CPU-side weights in the Vulkan *host* buffer type (GTT, unreclaimable system RAM): **22.8 GB vs 6.6 GB of `MemAvailable` drop**, 2 interleaved reps each. The old "~40× lighter RSS" reading measured RSS, which cannot see GTT. `LM=dio` restores the prompt throughput when RAM is free |
+| `-ngl` | **fit-derived** (was 10 on the Vega-only path) | ~252 MiB client VRAM per layer; 10 beats 8 on both axes, 2/2. `--fit` picks it from live free VRAM now — but only when there is a second device to fit against: on the Vega-only path it converges to 0 layers, because it counts the Vulkan host buffer the CPU-side weights land in as device memory |
 | `--fit` | **on (always)** | llama.cpp's own fitter re-derives `-ngl`/`-ts` from live free VRAM with the cap as a `-fitt` margin: 28-30 layers at 128k, i.e. the shipped config to 2 MiB, or two layers (+4 %) faster — but it spends the ~1120 MiB drift reserve and its choice moves with desktop noise. That trade is why the measured formula used to be the default; with the eGPU optional (and no formula for the Vega-only path) `--fit` is the only strategy that works for both. `NGL=`/`TS=` pins the layer count and turns `--fit` off |
 | `-b`/`-ub` | **2048/512 (default)** | 70.26 vs 59.09/45.06/29.48 t/s prompt; smaller batches buy VRAM, not speed. At 128k the cap pins it from above too: `-ub 1024` breaches (killed before health), `-b 4096` alone changes nothing (37.04 vs 36.95 t/s) |
 | `-tb` | `= -t` (default) | batch threads 8/12/16 measure 36.95/36.96/36.24 t/s prompt at 128k — equivalent, like `-t` itself |
@@ -58,8 +63,10 @@ throughput, and where its draft head runs decides how much.** Everything else is
 worth single digits to tens of percent. Its *chain length* is the last thing on
 that path that was untuned: upstream stops at 3 drafts per step and never on
 confidence, and 6 with a 0.5 confidence floor is +18 % where drafts land. The
-binding constraint is that **only 8–12 of 64 layers fit in VRAM**, so the model
-stays CPU-bound and desktop CPU load directly sets throughput.
+binding constraint is that **only a few of the 64 layers fit in VRAM** — 28-38
+with the eGPU attached, and none at all on the Vega-only path, where `--fit`
+converges to `offloaded 0/66` — so the model stays CPU-bound and desktop CPU
+load directly sets throughput.
 
 **A second, exhaustive pass confirmed the shipped configuration is the
 fastest measured on this host** — see RESULTS.md "A second pass". The step time
@@ -107,8 +114,12 @@ layers at a 128k pool and 38 at 8k with MTP on (`MTP=0` restores the 32/40
 split); the default `-np 2` divides that pool into two 64k slots — which is +28 %
 generation over the 1070 alone and roughly triples the offloadable layer count
 (40 vs 12). The eGPU is optional: without it `serve.sh` falls back to the Vega
-10 alone, which holds far fewer layers (only ~8-12 of 64) and runs slower, but
-still respects the cap.
+10 alone, which offloads **no trunk layers at all** — `--fit` counts the
+CPU-side weights, which llama.cpp allocates in the Vulkan host buffer type, as
+device memory, so it converges to `offloaded 0/66` at both 128k and 32k and the
+Vega runs only the MTP draft. Pinning `-ngl` does offload, but at 128k with MTP
+on the budget is thin: 2 layers peak at 4579 MiB of system VRAM, 4 at 5301, and
+6 at 5876 — over the 5500 MiB guard cap. `NGL=` pins it anyway.
 
 The draft head is the newest lever: it is a *serial* forward pass, so with 26+
 trunk layers offloaded the CPU is the bottleneck and the 1070 has no room to
@@ -193,6 +204,22 @@ under a real 8045-token prefill), so the gap is how far the desktop may grow
 after load before the guard fires. The eGPU drives no display, so it is not
 capped — only a small fit margin (`FITT_CUDA`, default 256 MiB) keeps it from
 filling the card.
+
+`guard.py` enforces a second, independent limit: **`MemAvailable` must stay above
+`MIN_AVAIL` (default 2048 MiB)**, or it kills the server itself. There is no
+swap, no cgroup limit and no systemd-oomd on this box, so the kernel OOM killer
+is otherwise the only backstop — and it takes the largest process, which is
+always the model. `serve.sh` also refuses to start when `MemAvailable` is below
+`MIN_AVAIL + 8192` (mmap) or `+ 24576` (dio), rather than discovering it two
+minutes into a 16 GB read. Both numbers are env-overridable (`MIN_AVAIL=`,
+`NEED_MIB=`).
+
+The load mode is the RAM lever, and it is not a throughput knob: `-lm mmap`
+(default) leaves the CPU-side weights as a reclaimable file mapping, while
+`-lm dio` reads them into the Vulkan host buffer type — GTT, unreclaimable
+system RAM. Measured at 128k, `dio` drops `MemAvailable` 22.8 GB against
+`mmap`'s 6.6 GB, for ~21 % more prompt throughput. `LM=dio ./serve.sh` when the
+box has room.
 
 The default is `CTX=131072` with `-np 2` → **two 65536-slots** — the same
 per-slot context the clients already expect (pi `contextWindow` 59392). The 27B
@@ -326,8 +353,8 @@ window above 4 GB. Verify: `nvidia-smi` lists the card with 8192 MiB, and
 | script | purpose |
 |---|---|
 | `scripts/build.sh` | configure + build llama.cpp with Vulkan, pinned revision |
-| `serve.sh` | launch `llama-server` under the VRAM watchdog |
-| `scripts/guard.py` | VRAM watchdog + measurement: display-GPU VRAM, per-DRM-client VRAM, NVIDIA VRAM via NVML, RSS, `cpu_busy_pct`, `bg_cpu_pct` |
+| `serve.sh` | launch `llama-server` under the VRAM cap and the RAM floor |
+| `scripts/guard.py` | VRAM/RAM watchdog + measurement: display-GPU VRAM, per-DRM-client VRAM, NVIDIA VRAM via NVML, `MemAvailable` (the only counter that sees the weights), RSS, `cpu_busy_pct`, `bg_cpu_pct` |
 | `scripts/bench.py` | `llama-bench` sweeps: `ngl`, `kv`, `fa`, `depth`, `ctx`, `threads`, `batch`, `load`, `nkvo`, `nopo`, `quant` |
 | `scripts/mtp_ab.py` | MTP A/B over HTTP, with `--server-extra` for arbitrary flags. Arms: `base`, `mtp-sidecar` (CPU draft), `mtp-sidecar-qkv`, `mtp-draftgpu` (`--draft-dev`/`--ngld-gpu`, the Vega-draft arm), `mtp-nomd` |
 | `scripts/split_fit.py` | fit probe for the two-GPU split — `llama-bench` cannot do it. Sweeps `-ngl`/`-ts`, loads, issues one real completion, reports both GPUs' peaks. `--autofit` omits `-ngl`/`-ts` and drives llama.cpp's own `--fit` (`-fitt` margins) instead |
@@ -353,8 +380,13 @@ wrong answer before it was caught:
   at 0 s.
 * **RAM is the binding constraint, not VRAM.** `/tmp` was a 20 GB tmpfs filled to
   19 GB by other sessions — non-evictable memory on a 39 GiB box with no swap.
-  Run one model load at a time and check `MemAvailable` first. `-lm dio` peaks at
-  ~300 MiB RSS where the mmap modes hold 13–14 GB resident.
+  Run one model load at a time and check `MemAvailable` first. **`MemAvailable`
+  is the only honest counter**: the CPU-side weights live in the Vulkan *host*
+  buffer type (GTT) under `-lm dio` and in a file mapping under `-lm mmap`, so
+  neither RSS nor the VRAM counters see them. Measured at 128k, Q4_K_M, `--fit`,
+  full flag set: `dio` drops `MemAvailable` 22.8 GB with RSS 2.6 GB; `mmap`
+  drops 6.6 GB. The old "`dio` peaks at ~300 MiB RSS" reading was measuring the
+  one number that cannot see the weights.
 * **The probe's API surface picks the code path.** Mid-prompt context
   checkpoints are gated on `message_delimiters`, which only a chat request
   carries, so a raw `/completion` prompt can never exercise them — the

@@ -1,12 +1,22 @@
 #!/usr/bin/env python3
-"""VRAM/RSS-guarded subprocess runner with per-process VRAM attribution.
+"""VRAM/RAM-guarded subprocess runner with per-process VRAM attribution.
 
-Hard rule for this machine: the display GPU (Radeon Pro Vega 48, 8 GiB total)
-is shared with the compositor, so total `mem_info_vram_used` MUST stay under
-5 GB. This module runs a command, polls VRAM while it runs, and kills it if the
-cap is exceeded, so no experiment can wedge the desktop.
+Two hard rules for this machine, both enforced by killing the guarded tree:
 
-Three numbers are recorded, because they answer different questions:
+  * VRAM. The display GPU (Radeon Pro Vega 48, 8 GiB total) is shared with the
+    compositor, so total `mem_info_vram_used` MUST stay under 5 GB.
+  * RAM. There is no swap, no cgroup limit and no systemd-oomd, so the kernel
+    OOM killer is the only backstop — and it takes the largest process, which
+    is always the model. `MemAvailable` MUST stay above `--min-avail-mib`.
+
+The RAM rule exists because the VRAM rule cannot see the failure that actually
+happens. llama.cpp allocates the CPU-side weights in the Vulkan *host* buffer
+type, which is GTT — system RAM the GPU can address — so they appear in neither
+the process's RSS nor the display GPU's VRAM counter. Measured at 128k,
+Q4_K_M, `-ngl 10`: RSS 2.6 GB, GTT 12.7 GB, `MemAvailable` drop 15.9 GB. A
+guard watching RSS would have reported 2.6 GB while the box ran out of memory.
+
+Numbers recorded, because they answer different questions:
 
   * `vram_peak_mib`   -- system-wide `mem_info_vram_used`. This is the real
                          display constraint and is what the cap is enforced on.
@@ -18,6 +28,13 @@ Three numbers are recorded, because they answer different questions:
                          counters, deduped by `drm-client-id`. This is the
                          model's actual footprint; the system counter also
                          contains the desktop, which drifts by >1 GiB.
+  * `mem_avail_drop_mib` -- how much system RAM the run actually consumed.
+                         This is the footprint number to quote. `rss_peak_mib`
+                         is kept for continuity but is misleading in both
+                         directions: 22.3 GB under `-lm mmap` (mapped file
+                         pages, reclaimable) and 2.6 GB under `-lm dio` (the
+                         same weights in GTT, unreclaimable) for the same
+                         ~6.3 GB and ~22.8 GB of real cost respectively.
 
 The system and client numbers do not add up exactly: kernel-side allocations
 (page tables, kernel buffers) have no DRM client, so
@@ -31,8 +48,8 @@ subtract one and produced meaningless negative deltas.)
 
 Stdlib only. Usable as a library (run_guarded) or as a CLI:
 
-    scripts/guard.py [--cap-mib 5000] [--timeout 600] [--out results/guard.jsonl] \
-        [--label NAME] -- <cmd> [args...]
+    scripts/guard.py [--cap-mib 5000] [--min-avail-mib 2048] [--timeout 600] \
+        [--out results/guard.jsonl] [--label NAME] -- <cmd> [args...]
 """
 
 import argparse
@@ -55,6 +72,11 @@ GTT_TOTAL = DRM + "/mem_info_gtt_total"
 PCI_DEV = "0000:03:00.0"
 
 DEFAULT_CAP_MIB = 5000.0
+# RAM floor, MiB. The kernel OOM killer is the only backstop on this box (no
+# swap, no cgroup limit, no systemd-oomd), and it kills the largest process —
+# which is always the model. 2 GiB is below anything the desktop needs to
+# survive and above the point where the kernel starts reclaiming in earnest.
+DEFAULT_MIN_AVAIL_MIB = 2048.0
 POLL_S = 0.05
 
 
@@ -80,6 +102,26 @@ def vram_total_mib():
 
 def gtt_used_mib():
     return _mib(_read_int(GTT_USED))
+
+
+def mem_available_mib():
+    """System `MemAvailable` in MiB, or None.
+
+    This is the only honest RAM number on this host. The model's CPU-side
+    weights are allocated in the Vulkan *host* buffer type, which is GTT —
+    system RAM the GPU can address — so they appear in neither the process's
+    RSS nor the display GPU's VRAM counter. Measured at 128k, Q4_K_M, -ngl 10:
+    RSS 2.6 GB, GTT 12.7 GB, MemAvailable drop 15.9 GB. Budgeting from RSS
+    understates the footprint by ~6x.
+    """
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) / 1024.0
+    except OSError:
+        pass
+    return None
 
 
 class _NvmlMem(ctypes.Structure):
@@ -282,12 +324,13 @@ def client_gtt_mib(pids=None):
 
 
 class Monitor(threading.Thread):
-    """Polls VRAM (system + per-client) and child RSS; kills on cap breach."""
+    """Polls VRAM (system + per-client), MemAvailable and child RSS; kills on breach."""
 
-    def __init__(self, pid, cap_mib, poll_s=POLL_S):
+    def __init__(self, pid, cap_mib, min_avail_mib=DEFAULT_MIN_AVAIL_MIB, poll_s=POLL_S):
         super().__init__(daemon=True)
         self.pid = pid
         self.cap_mib = cap_mib
+        self.min_avail_mib = min_avail_mib
         self.poll_s = poll_s
         self.stop_flag = threading.Event()
         self.vram_peak = 0.0
@@ -298,6 +341,12 @@ class Monitor(threading.Thread):
         self.samples = 0
         self.killed_at = None
         self.top_clients = {}
+        # RAM. `MemAvailable` is the only counter that sees the weights, which
+        # live in GTT (the Vulkan host buffer type) rather than RSS or VRAM.
+        self.avail0 = mem_available_mib()
+        self.avail_min = self.avail0
+        self.ram_violation = False
+        self.ram_killed_at = None
         # Host CPU contention. Throughput on this box is CPU-bound whenever
         # layers are left on the CPU, so an arm measured while the desktop is
         # busy is not comparable to one measured while it is idle.
@@ -341,6 +390,21 @@ class Monitor(threading.Thread):
                 if v > self.cap_mib and not self.violation:
                     self.violation = True
                     self.killed_at = v
+                    try:
+                        os.killpg(os.getpgid(self.pid), signal.SIGKILL)
+                    except OSError:
+                        pass
+            # RAM floor. Checked on every tick, like the VRAM cap: the kernel
+            # OOM killer fires without warning and takes the largest process,
+            # so the guard has to get there first. Killing here is the point —
+            # it is the difference between a recorded violation and a dead
+            # server with no explanation.
+            a = mem_available_mib()
+            if a is not None:
+                self.avail_min = a if self.avail_min is None else min(self.avail_min, a)
+                if a < self.min_avail_mib and not self.ram_violation:
+                    self.ram_violation = True
+                    self.ram_killed_at = a
                     try:
                         os.killpg(os.getpgid(self.pid), signal.SIGKILL)
                     except OSError:
@@ -394,9 +458,10 @@ class Monitor(threading.Thread):
         self.join(timeout=2.0)
 
 
-def run_guarded(cmd, cap_mib=DEFAULT_CAP_MIB, timeout=None, log_path=None,
-                cwd=None, env=None, stdin_text=None, quiet=False):
-    """Run cmd under the VRAM cap. Returns a result dict (JSON-serializable)."""
+def run_guarded(cmd, cap_mib=DEFAULT_CAP_MIB, min_avail_mib=DEFAULT_MIN_AVAIL_MIB,
+                timeout=None, log_path=None, cwd=None, env=None, stdin_text=None,
+                quiet=False):
+    """Run cmd under the VRAM cap and the RAM floor. Returns a result dict."""
     base = vram_used_mib()
     t0 = time.time()
     out_f = open(log_path, "wb") if log_path else None
@@ -415,7 +480,7 @@ def run_guarded(cmd, cap_mib=DEFAULT_CAP_MIB, timeout=None, log_path=None,
             out_f.close()
         return {"cmd": cmd, "error": str(e), "exit_code": None, "wall_s": 0.0}
 
-    mon = Monitor(p.pid, cap_mib)
+    mon = Monitor(p.pid, cap_mib, min_avail_mib)
     mon.start()
 
     # The child runs in its own session, so a Ctrl-C / SIGTERM aimed at us never
@@ -490,6 +555,19 @@ def run_guarded(cmd, cap_mib=DEFAULT_CAP_MIB, timeout=None, log_path=None,
         "client_gtt_peak_mib": round(mon.gtt_peak, 1),
         "client_top": mon.top_clients,
         "rss_peak_mib": round(mon.rss_peak_kib / 1024.0, 1),
+        # The honest RAM numbers. `rss_peak_mib` above is misleading in both
+        # directions: it counts the reclaimable file mapping under `-lm mmap`
+        # (22.3 GB) and misses the GTT the weights occupy under `-lm dio`
+        # (2.6 GB) — for the same weights, at 6.3 GB and 22.8 GB of real cost.
+        # `mem_avail_drop_mib` is what the box actually lost.
+        "mem_avail_baseline_mib": None if mon.avail0 is None else round(mon.avail0, 1),
+        "mem_avail_min_mib": None if mon.avail_min is None else round(mon.avail_min, 1),
+        "mem_avail_drop_mib": (None if mon.avail0 is None or mon.avail_min is None
+                               else round(mon.avail0 - mon.avail_min, 1)),
+        "min_avail_mib": min_avail_mib,
+        "ram_violation": mon.ram_violation,
+        "ram_killed_at_mib": (None if mon.ram_killed_at is None
+                              else round(mon.ram_killed_at, 1)),
         "cpu_busy_pct": None if mon.cpu_busy_pct is None else round(mon.cpu_busy_pct, 1),
         "bg_cpu_pct": None if mon.bg_cpu_pct is None else round(mon.bg_cpu_pct, 1),
         "nvidia_vram_peak_mib": None if not mon.nvidia_total else round(mon.nvidia_peak, 1),
@@ -504,6 +582,8 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--cap-mib", type=float, default=DEFAULT_CAP_MIB)
+    ap.add_argument("--min-avail-mib", type=float, default=DEFAULT_MIN_AVAIL_MIB,
+                    help="kill if system MemAvailable drops below this (MiB)")
     ap.add_argument("--timeout", type=float, default=None)
     ap.add_argument("--log", default=None)
     ap.add_argument("--out", default=None, help="append result JSON to this file")
@@ -518,15 +598,16 @@ def main(argv=None):
     if not cmd:
         ap.error("no command given")
 
-    res = run_guarded(cmd, cap_mib=args.cap_mib, timeout=args.timeout,
-                      log_path=args.log, cwd=args.cwd)
+    res = run_guarded(cmd, cap_mib=args.cap_mib, min_avail_mib=args.min_avail_mib,
+                      timeout=args.timeout, log_path=args.log, cwd=args.cwd)
     res["label"] = args.label
     res["timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%S")
     if args.out:
         with open(args.out, "a") as f:
             f.write(json.dumps(res) + "\n")
     sys.stderr.write(json.dumps(res, indent=2) + "\n")
-    return 0 if res.get("exit_code") == 0 and not res.get("vram_violation") else 1
+    return 0 if (res.get("exit_code") == 0 and not res.get("vram_violation")
+                 and not res.get("ram_violation")) else 1
 
 
 if __name__ == "__main__":

@@ -6,7 +6,9 @@
 # Thunderbolt eGPU is attached:
 #   * eGPU present: -dev CUDA0,Vulkan0 -sm layer — spread across the GTX 1070
 #     (eGPU), the Vega 10 (built-in display GPU), and the CPU for the rest.
-#   * eGPU absent:  -dev Vulkan0 -sm layer — the Vega 10 plus the CPU.
+#   * eGPU absent:  -dev Vulkan0 -sm layer — the Vega 10 plus the CPU. --fit
+#     offloads nothing on this path (see the block at FIT_ON); the Vega runs
+#     only the MTP draft and the CPU runs all 66 trunk layers.
 # The built-in display GPU always respects two guards, deliberately different:
 # --fit packs the model into FIT_CAP (default 4600 MiB) via a -fitt margin of
 # (vram_total - FIT_CAP), so the fit holds the budget regardless of desktop
@@ -18,12 +20,19 @@
 # 256 MiB) keeps it from filling the card. MTP speculation is on by default,
 # its draft head on the Vega 10.
 #
+# RAM is the other hard limit and it is not VRAM: there is no swap, no cgroup
+# limit and no systemd-oomd, so the kernel OOM killer is the only backstop and
+# it takes the model. The CPU-side weights are the whole story — 15.7 GB of
+# them at 128k — and where they live is set by LM (see the block at LM).
+#
 # Overridable via env:
 #   MODEL ALIAS CTX NP PORT CAP FIT_CAP THREADS HOST
 #   MMPROJ MMPROJ_OFFLOAD (0 = CPU vision encoder, 1 = GPU)
 #   MTP MD DEVD NGLD DCTK DCTV DNMAX DPMIN
 #   LM BATCH UBATCH CTK CTV FA
 #   FITT_CUDA (eGPU fit margin, MiB)
+#   MIN_AVAIL (RAM floor handed to guard.py, MiB; default 2048)
+#   NEED_MIB (pre-flight MemAvailable requirement, MiB; default MIN_AVAIL+16384)
 #   NGL=/TS= — explicit layer count / tensor split; turns --fit off (llama.cpp
 #              aborts rather than honour either).
 set -euo pipefail
@@ -147,17 +156,40 @@ else
     DEV="Vulkan0"
 fi
 
-# --fit always: llama-server derives -ngl and the tensor split from live free
-# VRAM per device. The display GPU's margin is (vram_total - FIT_CAP), which is
-# baseline-independent because the fit sees the desktop's usage in `free`; the
-# eGPU (if present) only needs the small FITT_CUDA margin. No -ngl/-ts anywhere
-# by default: the fit aborts if either is set.
+# --fit derives -ngl and the tensor split from live free VRAM per device. The
+# display GPU's margin is (vram_total - FIT_CAP), which is baseline-independent
+# because the fit sees the desktop's usage in `free`; the eGPU (if present) only
+# needs the small FITT_CUDA margin. No -ngl/-ts anywhere by default: the fit
+# aborts if either is set.
 VEGA_MARGIN=$(python3 -c "import sys; sys.path.insert(0, '$ROOT/scripts'); import guard; print(int(guard.vram_total_mib() - $FIT_CAP))" 2>/dev/null || true)
 if [ -z "${VEGA_MARGIN:-}" ] || [ "$VEGA_MARGIN" -lt 256 ]; then
     echo "serve: WARNING could not derive the display --fit margin (vram_total - fit_cap); using 256 MiB" >&2
     VEGA_MARGIN=256
 fi
 
+# The no-eGPU path cannot fit, and this is a llama.cpp limitation rather than a
+# tuning choice. With a single device, llama.cpp allocates the CPU-side weights
+# in the Vulkan *host* buffer type — GTT, which is system RAM — and the fit
+# counts that buffer as device memory. It therefore starts from "projected to
+# use 20695 MiB of device memory vs. 4242 MiB of free device memory", walks
+# n_layer down 4-3-2-1, and settles on 0: `offloaded 0/66 layers to GPU`, with
+# `Vulkan_Host model buffer size = 15692 MiB`. The Vega runs only the MTP draft;
+# the CPU runs all 66 trunk layers. Measured at 128k and at 32k, both 0/66.
+#
+# Pinning -ngl does offload layers, but the budget is thin: at 128k with MTP on,
+# each layer costs ~360 MiB of system VRAM and the fixed cost (compute buffers,
+# draft, KV/RS shares) is ~2000 MiB, so the FIT_CAP=4600 budget buys ~2 layers
+# and the 5500 MiB kill threshold ~4. Measured, full flag set, 128k, one
+# completion each:
+#
+#   arm      offloaded   peak system VRAM   MemAvailable drop (dio)
+#   --fit       0/66          3857 MiB            22.8 GB
+#   -ngl 2      2/66          4579 MiB            21.2 GB
+#   -ngl 4      4/66          5301 MiB            20.4 GB
+#   -ngl 6      6/66          5876 MiB  (over cap) 19.8 GB
+#
+# So the pin is left off: 2 layers is ~1 % of the model and the rungs that
+# matter breach the cap. NGL= pins it anyway if a workload wants the layers.
 FIT_ON=1
 FIT_ARGS=(--fit on)
 if [ "$EGPU" = 1 ]; then
@@ -175,9 +207,27 @@ if [ -n "${NGL:-}" ] || [ -n "${TS:-}" ]; then
     [ -n "${TS:-}" ] && FIT_ARGS+=( -ts "$TS")
 fi
 
-# `-lm dio` reads the weights with O_DIRECT; measured ~12 % faster on prompt
-# than the mmap default and ~40x lighter in RSS. `-lm none` is a close second.
-LM="${LM:-dio}"
+# Load mode decides where the CPU-side weights live, and that decides whether
+# the box survives. `dio` reads them with O_DIRECT into the Vulkan *host* buffer
+# type — GTT, system RAM the GPU can address — which is unreclaimable and
+# unswappable (swap is 0). `mmap` leaves them as a file-backed mapping, which
+# the kernel can evict and re-read. Measured at 128k, Q4_K_M, --fit, full flag
+# set, two interleaved reps each, 5189-token prompt:
+#
+#   -lm    prompt t/s   gen t/s   peak GTT   MemAvailable drop
+#   dio    46.10/46.12  1.11/1.08  16.8 GB    22.7/22.9 GB
+#   mmap   36.15/36.38  1.22/1.17   0.44 GB    7.0/6.6 GB
+#
+# So mmap costs ~21 % prompt and buys ~16 GB of RAM — the difference between a
+# 5 GB margin and a 21 GB one on a 39 GiB box whose desktop already holds ~11 GB.
+# That margin is why it is the default: the kernel OOM killer is the only
+# backstop here, and it takes the model. Generation is unaffected (mmap is
+# marginally ahead). LM=dio restores the prompt throughput when RAM is free.
+#
+# The earlier "dio is ~40x lighter in RSS" reading was an artefact of measuring
+# RSS, which cannot see GTT: at -ngl 10 dio shows RSS 2.6 GB against a 15.9 GB
+# MemAvailable drop. Budget RAM from MemAvailable, never from RSS.
+LM="${LM:-mmap}"
 # Measured at depth 4096: the llama-server default 2048/512 is fastest on prompt.
 BATCH="${BATCH:-2048}"
 UBATCH="${UBATCH:-512}"
@@ -200,7 +250,7 @@ if [ "$FIT_ON" = 1 ]; then
     if [ "$EGPU" = 1 ]; then
         echo "serve: --fit on, margins ${FITT_CUDA},${VEGA_MARGIN} MiB (fit-cap=${FIT_CAP}MiB) cap=${CAP}MiB"
     else
-        echo "serve: --fit on, margin ${VEGA_MARGIN} MiB (fit-cap=${FIT_CAP}MiB) cap=${CAP}MiB"
+        echo "serve: --fit on, margin ${VEGA_MARGIN} MiB (fit-cap=${FIT_CAP}MiB) cap=${CAP}MiB — no eGPU, fits 0 layers"
     fi
 else
     echo "serve: --fit off (NGL=/TS= set): -ngl ${NGL:-auto} -ts ${TS:-auto}"
@@ -214,6 +264,27 @@ if [ -n "$MMPROJ" ]; then
     echo "serve: mmproj=$(basename "$MMPROJ") offload=$([ "$MMPROJ_OFFLOAD" = 1 ] && echo GPU || echo CPU)"
 fi
 echo "serve: http://$HOST:$PORT  log: $ROOT/logs/serve.log"
+
+# RAM pre-flight. The kernel OOM killer is the only backstop on this box: no
+# swap, no cgroup limit, no systemd-oomd. A load that cannot fit is better
+# refused here than discovered two minutes into a 16 GB read — and the weights
+# are GTT or page cache, neither of which RSS sees, so MemAvailable is the only
+# honest number. Measured cost of the shipped config at 128k, full flag set:
+# 6.6 GB with mmap, 22.8 GB with dio. MIN_AVAIL is the floor guard.py enforces
+# while running; the pre-flight wants the same headroom on top of the load.
+MIN_AVAIL="${MIN_AVAIL:-2048}"
+case "$LM" in
+    mmap|auto) LOAD_MIB=8192  ;;
+    *)         LOAD_MIB=24576 ;;
+esac
+NEED_MIB="${NEED_MIB:-$(( MIN_AVAIL + LOAD_MIB ))}"
+AVAIL_MIB=$(awk '/^MemAvailable:/ {print int($2/1024)}' /proc/meminfo)
+if [ -n "${AVAIL_MIB:-}" ] && [ "$AVAIL_MIB" -lt "$NEED_MIB" ]; then
+    echo "serve: refusing to start — MemAvailable ${AVAIL_MIB} MiB < ${NEED_MIB} MiB needed" >&2
+    echo "serve: close applications or lower CTX/NP; NEED_MIB= overrides the estimate" >&2
+    exit 1
+fi
+echo "serve: MemAvailable ${AVAIL_MIB} MiB (need ${NEED_MIB} MiB, floor ${MIN_AVAIL} MiB)"
 
 MTP_ARGS=()
 if [ "$MTP" = 1 ]; then
@@ -231,7 +302,8 @@ if [ -n "$MMPROJ" ]; then
     fi
 fi
 
-exec python3 "$ROOT/scripts/guard.py" --cap-mib "$CAP" --label serve \
+exec python3 "$ROOT/scripts/guard.py" --cap-mib "$CAP" --min-avail-mib "$MIN_AVAIL" \
+    --label serve \
     --log "$ROOT/logs/serve.log" -- \
     "$ROOT/build/bin/llama-server" \
     -m "$MODEL" -a "$ALIAS" -c "$CTX" -t "$THREADS" -np "$NP" \

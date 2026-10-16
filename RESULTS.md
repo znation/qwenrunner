@@ -51,8 +51,8 @@ This host cannot be benchmarked naively, and learning that was most of the work.
   another during this work.
 * **RAM, not VRAM, is the other constraint.** `/tmp` was a 20 GB tmpfs filled to
   19 GB by other sessions; four back-to-back model loads OOM-killed a run. Run
-  one load at a time and prefer `-lm dio`, which peaks at ~300 MiB RSS where the
-  mmap modes hold 13–14 GB.
+  one load at a time and gate on `MemAvailable`, which is the only counter that
+  sees the weights — see "Model load mode" below.
 
 ### Corrections made from clean data
 
@@ -206,16 +206,31 @@ capital of the United States is Washington, D.C. The capital of`
 
 Conclusions:
 
-* **`-lm dio` is the best mode, `-lm none` a close second; both beat the default
-  by ~12 % on prompt throughput.** They are also **~40x lighter**: a `-lm dio`
-  arm peaks at ~300 MiB RSS and commits nothing (`MemAvailable` *rose* 422 MiB
-  across a re-verified arm), where `auto`/`mmap` hold 12.9–14.4 GB resident.
-* Generation is unaffected by load mode (1.97–1.99 across all four).
+* **`-lm dio` is the fastest mode, `-lm none` a close second; both beat the
+  default by ~12 % on prompt throughput.**
+* **The "~40x lighter" reading in the RSS column is an artefact and the
+  conclusion drawn from it was wrong.** RSS cannot see where the CPU-side
+  weights go: `dio` and `none` read them into the Vulkan *host* buffer type,
+  which is GTT — system RAM the GPU can address — while `mmap`/`auto` leave them
+  as a file-backed mapping. GTT is unreclaimable and unswappable (swap is 0);
+  a file mapping is neither. Re-measured at 128k, Q4_K_M, `--fit`, full flag
+  set, two interleaved reps each, 5189-token prompt:
+
+  | `-lm` | prompt t/s | gen t/s | peak GTT | `MemAvailable` drop |
+  |---|---|---|---|---|
+  | `dio` | 46.10 / 46.12 | 1.11 / 1.08 | 16.8 GB | 22.7 / 22.9 GB |
+  | `mmap` | 36.15 / 36.38 | 1.22 / 1.17 | 0.44 GB | 7.0 / 6.6 GB |
+
+  So `dio` costs ~16 GB of RAM for ~21 % prompt throughput, and the earlier
+  "commits nothing" claim was the opposite of the truth. `serve.sh` ships
+  `mmap`; `LM=dio` restores the throughput when RAM is free.
+* Generation is unaffected by load mode (1.97–1.99 across all four at depth 0;
+  1.08–1.22 at 128k, where `mmap` is marginally ahead).
 * **`-lm mlock` is unavailable and unnecessary.** `RLIMIT_MEMLOCK` is 8 MiB soft
   and hard; llama.cpp aborts rather than run unlocked. Raising it needs a
   privileged change and buys nothing — `mlock` pins a *mapping* so its pages
-  cannot be reclaimed, but `none`/`dio` already avoid the reclaimable-mapping
-  problem, and swap is 0 so there is nothing to swap to.
+  cannot be reclaimed, but `mmap` already gives a reclaimable mapping and swap
+  is 0 so there is nothing to swap to.
 
 ## `-ngl` **[clean]**
 
