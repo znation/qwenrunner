@@ -18,7 +18,14 @@ The 9B cannot fit under the display cap (its Q4_K_M weights alone exceed 5000
 MiB), so the 4B is the default model. Fully resident. Generation rate depends
 on the *allocated* context: ~35 t/s at a 32k pool, ~19 t/s at the shipped 64k
 (short prompts; a full 64k-deep session runs ~16 t/s — see `RESULTS.md`
-"AMD-only Vega optimization"). Q4_K_S is the measured best quant. With the
+"AMD-only Vega optimization"). Q4_K_S is the measured best quant.
+
+Qwen3.5-4B is a VL-class model: the text GGUF carries no vision encoder — it
+ships as a separate projector (`models/mmproj-Qwen3.5-4B-F16.gguf`, fetched by
+`dl_dual.sh`), and `serve.sh` serves it by default with the encoder on the CPU
+(`--no-mmproj-offload`). Text-only traffic therefore stays 100 % on the Vega;
+only image input pays a CPU vision-encode. Set `MMPROJ_OFFLOAD=1` to move the
+encoder to the GPU instead. With the
 eGPU attached,
 `EGPU=1 ./serve.sh` adds a **Qwen3.5-9B** main agent on the GTX 1070 (`:8080`)
 and moves the 4B to `:8081` as a parallel secondary (~15.8 t/s / ~37 t/s). The
@@ -146,7 +153,7 @@ cd ../..
 
 # 3. models
 mkdir -p models
-./scripts/dl_dual.sh                             # the default pair: Qwen3.5-9B + Qwen3.5-4B
+./scripts/dl_dual.sh                             # Qwen3.5-9B + Qwen3.5-4B + the 4B's vision projector (mmproj)
 ./scripts/dl_smaller.sh                          # optional: extra quants of the legacy 27B
 ```
 
@@ -172,6 +179,23 @@ CTX=32768 NP=2 ./serve.sh        # two 16k slots instead of one 64k (parallel su
 EGPU=1 ./serve.sh                # with the eGPU: Qwen3.5-9B on the 1070 (:8080) + 4B on the Vega (:8081)
 LEGACY=1 ./serve.sh              # the old Qwen3.8-27B split across both GPUs
 ```
+
+Image input works through the OpenAI-compatible `/v1/chat/completions`
+(`image_url` content parts). The vision encoder (mmproj) runs on the CPU by
+default — `MMPROJ_OFFLOAD=1 ./serve.sh` moves it to the GPU — so text-only
+requests never leave the GPU and only image input pays a CPU vision-encode.
+
+Qwen3.5-4B is a thinking model: it generates a ` thinking …` block before the
+final answer, and `max_tokens` covers *both* phases. On some prompts it never
+emits the end-of-thinking tag and burns the whole budget — the response comes
+back `finish_reason: "length"` with empty `content`. `serve.sh` therefore sets
+a thinking cap (`--reasoning-budget`, default 1024 tokens) with an injected
+budget message; on exhaustion llama.cpp *forces* the end-of-thinking tag so a
+final answer is always produced. The budget is a cap, not a target — requests
+that finish thinking naturally are never affected. Tune it per request with
+the OpenAI body field `reasoning_budget_tokens` (`0` = no thinking, a large
+value = effectively unrestricted), or per server with
+`REASONING_BUDGET=-1 ./serve.sh` to disable the cap.
 
 The server always runs llama.cpp's own `--fit on` with a `--fit-target`
 (`-fitt`) — the layer count is derived from live free VRAM, never by hand. The

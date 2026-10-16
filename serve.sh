@@ -4,6 +4,9 @@
 # DEFAULT (./serve.sh): one fully-resident instance on the Vega 10 display GPU
 # only — no eGPU involved:
 #   * Qwen3.5-4B Q4_K_M on Vulkan0 (:8080), under the 5000 MiB watchdog
+#   * plus its vision projector (mmproj), so image input works — the mmproj
+#     runs on the CPU (--no-mmproj-offload), so text-only traffic stays 100 %
+#     on the GPU and only image input pays a CPU vision-encode
 # The 9B cannot fit under the display cap (its Q4_K_M weights alone exceed
 # 5000 MiB), so the 4B is the default model. --fit always, target
 # (vram_total - CAP) free, so the fit holds the cap regardless of desktop
@@ -14,10 +17,13 @@
 #
 # Overridable via env:
 #   MODEL ALIAS CTX NP PORT CAP THREADS HOST FITT
+#   MMPROJ MMPROJ_OFFLOAD (0 = CPU vision encoder, 1 = GPU)
+#   REASONING_BUDGET REASONING_BUDGET_MSG (thinking-token cap; default 1024)
 #   EGPU=1   — two fully-resident instances: Qwen3.5-9B on the GTX 1070 eGPU
 #              (:8080) + Qwen3.5-4B on the Vega (:8081); its own env:
 #              MAIN_MODEL MAIN_ALIAS MAIN_CTX MAIN_NP MAIN_PORT MAIN_FITT
 #              VEGA_MODEL VEGA_ALIAS VEGA_CTX VEGA_NP VEGA_PORT VEGA_CAP VEGA_FITT
+#              VEGA_MMPROJ VEGA_MMPROJ_OFFLOAD
 #   LEGACY=1 — the old single Qwen3.8-27B split across both GPUs (requires the
 #              eGPU; its own env:
 #               MODEL ALIAS CTX TS NGL LM BATCH UBATCH CTK CTV FA HOST PORT
@@ -50,11 +56,18 @@ if [ "$EGPU" = 1 ]; then
     # leaves ~1.7 GiB of the 5000 MiB cap for the desktop at a typical
     # baseline; guard.py still kills before any breach.
     VEGA_MODEL="${VEGA_MODEL:-$ROOT/models/Qwen3.5-4B-Q4_K_S.gguf}"
+    # Same vision projector as the default 4B; CPU-offloaded for the same reason
+    # (text-only stays on the Vega; only image input pays the CPU encode).
+    VEGA_MMPROJ="${VEGA_MMPROJ-$ROOT/models/mmproj-Qwen3.5-4B-F16.gguf}"
+    VEGA_MMPROJ_OFFLOAD="${VEGA_MMPROJ_OFFLOAD:-0}"
     VEGA_ALIAS="${VEGA_ALIAS:-Qwen3.5-4B}"
     VEGA_CTX="${VEGA_CTX:-32768}"
     VEGA_NP="${VEGA_NP:-2}"
     VEGA_PORT="${VEGA_PORT:-8081}"
     VEGA_CAP="${VEGA_CAP:-5000}"
+    # Reasoning safety net for the 4B (see the default block); shared env.
+    REASONING_BUDGET="${REASONING_BUDGET:-1024}"
+    REASONING_BUDGET_MSG="${REASONING_BUDGET_MSG:- Stop thinking and provide the final answer now.}"
 
     THREADS="${THREADS:-8}"
     HOST="${HOST:-127.0.0.1}"
@@ -76,6 +89,20 @@ if [ "$EGPU" = 1 ]; then
             exit 1
         fi
     done
+    if [ -n "$VEGA_MMPROJ" ]; then
+        if [ ! -f "$VEGA_MMPROJ" ]; then
+            echo "serve: missing vision projector $VEGA_MMPROJ" >&2
+            echo "serve: run ./scripts/dl_dual.sh to fetch it, or set VEGA_MMPROJ= to serve the Vega text-only" >&2
+            exit 1
+        fi
+        if [ "$VEGA_MMPROJ_OFFLOAD" = 1 ]; then
+            VEGA_MM_ARGS=(--mmproj "$VEGA_MMPROJ" --mmproj-offload)
+        else
+            VEGA_MM_ARGS=(--mmproj "$VEGA_MMPROJ" --no-mmproj-offload)
+        fi
+    else
+        VEGA_MM_ARGS=()
+    fi
 
     mkdir -p "$ROOT/logs"
 
@@ -95,6 +122,9 @@ if [ "$EGPU" = 1 ]; then
 
     echo "serve: main  $(basename "$MAIN_MODEL") alias=$MAIN_ALIAS dev=CUDA0 ctx=$MAIN_CTX ($(( MAIN_CTX / MAIN_NP ))/slot x $MAIN_NP) --fit-target ${MAIN_FITT}MiB  http://$HOST:$MAIN_PORT"
     echo "serve: vega  $(basename "$VEGA_MODEL") alias=$VEGA_ALIAS dev=Vulkan0 ctx=$VEGA_CTX ($(( VEGA_CTX / VEGA_NP ))/slot x $VEGA_NP) --fit-target ${VEGA_FITT}MiB cap=${VEGA_CAP}MiB  http://$HOST:$VEGA_PORT"
+    if [ -n "$VEGA_MMPROJ" ]; then
+        echo "serve: vega mmproj=$(basename "$VEGA_MMPROJ") offload=$([ "$VEGA_MMPROJ_OFFLOAD" = 1 ] && echo GPU || echo CPU)"
+    fi
     echo "serve: --fit on both (no split, no MTP); logs serve-main.log / serve-vega.log"
 
     "$ROOT/build/bin/llama-server" \
@@ -110,6 +140,9 @@ if [ "$EGPU" = 1 ]; then
         -m "$VEGA_MODEL" -a "$VEGA_ALIAS" -c "$VEGA_CTX" -t "$THREADS" -np "$VEGA_NP" \
         -dev Vulkan0 --fit on -fitt "$VEGA_FITT" -lm dio -b 2048 -ub 512 \
         -ctk q4_0 -ctv q4_0 -fa on \
+        "${VEGA_MM_ARGS[@]}" \
+        --reasoning-budget "$REASONING_BUDGET" \
+        --reasoning-budget-message "$REASONING_BUDGET_MSG" \
         --host "$HOST" --port "$VEGA_PORT" &
     VEGA_PID=$!
 
@@ -142,6 +175,13 @@ if [ "$LEGACY" = 0 ]; then
     # (8.54 vs 8.47 on ppl_corpus.txt), and ~140 MiB lighter under the cap.
     # Q4_0 is faster still (+6.5 %) but costs a real quality hit (8.72).
     MODEL="${MODEL:-$ROOT/models/Qwen3.5-4B-Q4_K_S.gguf}"
+    # Vision: Qwen3.5-4B is a VL-class model — the text GGUF carries no vision
+    # encoder; it ships in a separate projector (mmproj). Served on the CPU by
+    # default (MMPROJ_OFFLOAD=1 moves it to the GPU) so text-only input stays
+    # entirely on Vulkan0 and only image input pays the CPU encode. Fetched by
+    # scripts/dl_dual.sh.
+    MMPROJ="${MMPROJ-$ROOT/models/mmproj-Qwen3.5-4B-F16.gguf}"
+    MMPROJ_OFFLOAD="${MMPROJ_OFFLOAD:-0}"
     ALIAS="${ALIAS:-Qwen3.5-4B}"
     CTX="${CTX:-65536}"
     NP="${NP:-1}"
@@ -149,6 +189,17 @@ if [ "$LEGACY" = 0 ]; then
     CAP="${CAP:-5000}"
     HOST="${HOST:-127.0.0.1}"
     THREADS="${THREADS:-8}"
+    # Reasoning safety net: Qwen3.5-4B is a thinking model and can burn the
+    # whole max_tokens budget in the thinking phase (it never emits the
+    # end-of-thinking tag), leaving nothing for the final answer. llama.cpp's
+    # --reasoning-budget caps the thinking tokens and on exhaustion FORCES the
+    # end tag, so a final answer is always produced. The budget is a cap, not
+    # a target: requests that finish thinking naturally are never affected.
+    # Per-request override via the OpenAI body field "reasoning_budget_tokens"
+    # (0 = no thinking, large value = effectively unrestricted); REASONING_BUDGET=-1
+    # disables the cap for all requests.
+    REASONING_BUDGET="${REASONING_BUDGET:-1024}"
+    REASONING_BUDGET_MSG="${REASONING_BUDGET_MSG:- Stop thinking and provide the final answer now.}"
     FITT="${FITT:-$(python3 -c "import sys; sys.path.insert(0, '$ROOT/scripts'); import guard; print(int(guard.vram_total_mib() - $CAP))" 2>/dev/null || true)}"
     if [ -z "${FITT:-}" ] || [ "$FITT" -lt 256 ]; then
         echo "serve: WARNING could not derive the --fit target (vram_total - cap); using 256 MiB" >&2
@@ -163,14 +214,35 @@ if [ "$LEGACY" = 0 ]; then
         echo "serve: run ./scripts/dl_dual.sh to fetch the Qwen3.5-9B + Qwen3.5-4B pair" >&2
         exit 1
     fi
+    if [ -n "$MMPROJ" ]; then
+        if [ ! -f "$MMPROJ" ]; then
+            echo "serve: missing vision projector $MMPROJ" >&2
+            echo "serve: run ./scripts/dl_dual.sh to fetch it, or set MMPROJ= to serve text-only" >&2
+            exit 1
+        fi
+        if [ "$MMPROJ_OFFLOAD" = 1 ]; then
+            MM_ARGS=(--mmproj "$MMPROJ" --mmproj-offload)
+        else
+            MM_ARGS=(--mmproj "$MMPROJ" --no-mmproj-offload)
+        fi
+    else
+        MM_ARGS=()
+    fi
     mkdir -p "$ROOT/logs"
     echo "serve: model=$(basename "$MODEL") alias=$ALIAS dev=Vulkan0 ctx=$CTX ($(( CTX / NP ))/slot x $NP) --fit-target ${FITT}MiB cap=${CAP}MiB  http://$HOST:$PORT"
+    if [ -n "$MMPROJ" ]; then
+        echo "serve: mmproj=$(basename "$MMPROJ") offload=$([ "$MMPROJ_OFFLOAD" = 1 ] && echo GPU || echo CPU)"
+    fi
+    echo "serve: reasoning-budget=$REASONING_BUDGET tokens (0 = no thinking, -1 = unrestricted)"
     exec python3 "$ROOT/scripts/guard.py" --cap-mib "$CAP" --label serve \
         --log "$ROOT/logs/serve.log" -- \
         "$ROOT/build/bin/llama-server" \
         -m "$MODEL" -a "$ALIAS" -c "$CTX" -t "$THREADS" -np "$NP" \
         -dev Vulkan0 --fit on -fitt "$FITT" -lm none -b 2048 -ub 512 \
         -ctk q4_0 -ctv q4_0 -fa on \
+        "${MM_ARGS[@]}" \
+        --reasoning-budget "$REASONING_BUDGET" \
+        --reasoning-budget-message "$REASONING_BUDGET_MSG" \
         --host "$HOST" --port "$PORT" "$@"
 fi
 # ---- legacy (LEGACY=1): one Qwen3.8-27B split across both GPUs ----
