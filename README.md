@@ -147,7 +147,7 @@ cd ../..
 
 # 3. models
 mkdir -p models
-./scripts/dl_smaller.sh                          # Qwen3.8-27B Q4_K_M (the default) + optional extra quants
+./scripts/dl_smaller.sh                          # Qwen3.8-27B Q4_K_M (the default) + optional extra quants + the vision projector (mmproj)
 ```
 
 ## Build
@@ -170,6 +170,15 @@ present. Both backends end up in one binary and `-dev` selects between them.
 ./serve.sh                       # Qwen3.8-27B split across the GPUs + CPU (:8080)
 CTX=32768 NP=2 ./serve.sh        # two 16k slots instead of two 64k (parallel subagents)
 ```
+
+Qwen3.8-27B is a VL-class model: the text GGUF carries no vision encoder — it
+ships as a separate projector (`models/mmproj-Qwen3.8-27B-F16.gguf`, fetched by
+`dl_smaller.sh`), and `serve.sh` serves it by default with the encoder on the
+CPU (`--no-mmproj-offload`). Text-only traffic therefore stays 100 % on the GPU;
+only image input pays a CPU vision-encode. Set `MMPROJ_OFFLOAD=1` to move the
+encoder to the GPU instead. Image input works through the OpenAI-compatible
+`/v1/chat/completions` (`image_url` content parts); set `MMPROJ=` to serve
+text-only.
 
 The server always runs llama.cpp's own `--fit on` with a `--fit-target`
 (`-fitt`) — the layer count is derived from live free VRAM, never by hand. Two

@@ -20,6 +20,7 @@
 #
 # Overridable via env:
 #   MODEL ALIAS CTX NP PORT CAP FIT_CAP THREADS HOST
+#   MMPROJ MMPROJ_OFFLOAD (0 = CPU vision encoder, 1 = GPU)
 #   MTP MD DEVD NGLD DCTK DCTV DNMAX DPMIN
 #   LM BATCH UBATCH CTK CTV FA
 #   FITT_CUDA (eGPU fit margin, MiB)
@@ -36,6 +37,13 @@ MODEL="${MODEL:-$ROOT/models/Qwen3.8-27B-UD-Q4_K_M.gguf}"
 # .gguf path, so a client's model id becomes the path. The alias gives both
 # clients one stable id to refer to.
 ALIAS="${ALIAS:-Qwen3.8-27B}"
+# Vision: Qwen3.8-27B is a VL-class model — the text GGUF carries no vision
+# encoder; it ships in a separate projector (mmproj). Served on the CPU by
+# default (MMPROJ_OFFLOAD=1 moves it to the GPU) so text-only input stays
+# entirely on the GPU and only image input pays the CPU encode. Fetched by
+# scripts/dl_smaller.sh.
+MMPROJ="${MMPROJ:-$ROOT/models/mmproj-Qwen3.8-27B-F16.gguf}"
+MMPROJ_OFFLOAD="${MMPROJ_OFFLOAD:-0}"
 # CTX is the *pool*, and llama-server divides it by NP: the default 131072 with
 # NP=2 is 65536 per slot, which is what a client actually gets and what its
 # contextWindow must say. q4_0 KV plus flash attention keep the 128k pool at
@@ -122,6 +130,11 @@ if [ ! -f "$MODEL" ]; then
     echo "serve: fetch the Qwen3.8-27B GGUF into models/ (see README)" >&2
     exit 1
 fi
+if [ -n "$MMPROJ" ] && [ ! -f "$MMPROJ" ]; then
+    echo "serve: missing vision projector $MMPROJ" >&2
+    echo "serve: run ./scripts/dl_smaller.sh to fetch it, or set MMPROJ= to serve text-only" >&2
+    exit 1
+fi
 if [ "$MTP" = 1 ] && [ ! -f "$MD" ]; then
     echo "serve: missing MTP draft $MD" >&2
     echo "serve: set MTP=0 to disable speculation, or fetch the draft model" >&2
@@ -197,6 +210,9 @@ if [ "$MTP" = 1 ]; then
 else
     echo "serve: mtp=off"
 fi
+if [ -n "$MMPROJ" ]; then
+    echo "serve: mmproj=$(basename "$MMPROJ") offload=$([ "$MMPROJ_OFFLOAD" = 1 ] && echo GPU || echo CPU)"
+fi
 echo "serve: http://$HOST:$PORT  log: $ROOT/logs/serve.log"
 
 MTP_ARGS=()
@@ -206,6 +222,15 @@ if [ "$MTP" = 1 ]; then
               --spec-draft-n-max "$DNMAX" --spec-draft-p-min "$DPMIN")
 fi
 
+MM_ARGS=()
+if [ -n "$MMPROJ" ]; then
+    if [ "$MMPROJ_OFFLOAD" = 1 ]; then
+        MM_ARGS=(--mmproj "$MMPROJ" --mmproj-offload)
+    else
+        MM_ARGS=(--mmproj "$MMPROJ" --no-mmproj-offload)
+    fi
+fi
+
 exec python3 "$ROOT/scripts/guard.py" --cap-mib "$CAP" --label serve \
     --log "$ROOT/logs/serve.log" -- \
     "$ROOT/build/bin/llama-server" \
@@ -213,5 +238,5 @@ exec python3 "$ROOT/scripts/guard.py" --cap-mib "$CAP" --label serve \
     -dev "$DEV" -sm layer "${FIT_ARGS[@]}" \
     -lm "$LM" -b "$BATCH" -ub "$UBATCH" \
     -ctk "$CTK" -ctv "$CTV" -fa "$FA" \
-    "${MTP_ARGS[@]}" \
+    "${MTP_ARGS[@]}" "${MM_ARGS[@]}" \
     --host "$HOST" --port "$PORT" "$@"

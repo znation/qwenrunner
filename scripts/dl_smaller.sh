@@ -1,6 +1,7 @@
 #!/bin/bash
 # Download the Qwen3.8-27B GGUFs: the default Q4_K_M (serve.sh's model) plus
-# the smaller quants used by the quant Pareto sweep.
+# the smaller quants used by the quant Pareto sweep, and the vision projector
+# (mmproj) that serve.sh serves by default for image input.
 set -u
 cd /home/zach/qwenrunner
 BASE=https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/resolve/main
@@ -9,4 +10,11 @@ for f in Qwen3.8-27B-UD-Q4_K_M.gguf Qwen3.8-27B-UD-IQ3_S.gguf Qwen3.8-27B-UD-Q2_
   curl -fL --retry 8 --retry-delay 5 -C - -o "models/$f" "$BASE/$f" || echo "=== FAILED $f rc=$?"
   ls -la "models/$f" 2>/dev/null
 done
+# The 27B's vision projector, under the name serve.sh expects.
+f="models/mmproj-Qwen3.8-27B-F16.gguf"
+echo "=== $(date -Is) start $f"
+curl -fL --retry 8 --retry-delay 5 -C - -o "$f" \
+    "$BASE/mmproj-F16.gguf" \
+    || { echo "=== FAILED $f rc=$?"; exit 1; }
+ls -la "$f"
 echo "=== $(date -Is) ALL DONE"
