@@ -200,24 +200,29 @@ value = effectively unrestricted), or per server with
 The server always runs llama.cpp's own `--fit on` with a `--fit-target`
 (`-fitt`) — the layer count is derived from live free VRAM, never by hand. Two
 guards, deliberately different: the fit packs the model into `FIT_CAP` (default
-4800 MiB), so the Vega instance leaves `vram_total - FIT_CAP` free (`FITT`,
-3376 MiB here) — because the fit sees the desktop's usage in `free`, that holds
+4600 MiB), so the Vega instance leaves `vram_total - FIT_CAP` free (`FITT`,
+3576 MiB here) — because the fit sees the desktop's usage in `free`, that holds
 the fit budget regardless of desktop drift — while `scripts/guard.py` only
-`SIGKILL`s at the higher `CAP` (default 5500 MiB). The 700 MiB gap is
+`SIGKILL`s at the higher `CAP` (default 5500 MiB). The 900 MiB gap is
 **desktop-drift tolerance, not model headroom**: the model footprint is fixed at
 load (KV and compute buffers are preallocated; measured **+34 MiB** transient
 under a real 8045-token prefill), so the gap is how far the desktop may grow
-after load before the guard fires. Widening the gap by lowering `FIT_CAP` is
-expensive — the 4B sits at the fully-resident edge, and 200 MiB less offloads
-layers to CPU (measured **33.5 → 13.8 t/s** at `FIT_CAP` 4800 → 4400), so the
-free lever is `CAP`. At the default context the 4B is fully resident, so there
-is no CPU inference path and no MTP (pointless at memory-bandwidth speeds).
+after load before the guard fires. The shipped `FIT_CAP` is 4600, not 4800: the
+gap is 900 MiB and the measured drift tolerance ~1006 MiB (Vega 4494 MiB under
+the 5500 MiB cap at a ~1735 MiB baseline). That is bought with throughput — the
+4B sits at the fully-resident edge, and 200 MiB less offloads layers to CPU
+(measured **33.5 → 13.8 t/s** at `FIT_CAP` 4800 → 4400, and **29 → 26 layers** /
+~35 % slower generation at 4800 → 4600). Raising `CAP` instead buys the same
+drift room for free but spends the desktop's protection; lowering `CAP` alone
+makes the guard fire sooner. At `FIT_CAP` 4800 the fit keeps 29 layers on the
+GPU; the shipped 4600 drops it to 26, so the default now has a CPU inference
+path (MTP stays off — pointless at memory-bandwidth speeds).
 
 The default is `CTX=65536` with `-np 1` → **one 65536-slot** — the same per-slot
 context the clients already expect (pi `contextWindow` 59392). Measured live
 with a short prompt: **~19 t/s generation** (the full-64k-depth rate is ~16);
 a 32k pool runs ~35 t/s if speed matters more than depth. Vega total
-4465-4477 MiB under the 5500 MiB cap (≈1020 MiB headroom at a ~1230 MiB desktop
+~4494 MiB under the 5500 MiB cap (≈1006 MiB headroom at a ~1735 MiB desktop
 baseline). `NP=2` halves the pool per slot but buys fairness for concurrent
 agents.
 
@@ -266,7 +271,7 @@ chain — and applies to it, not to the default above.
 
 `serve.sh` runs `llama-server` under `scripts/guard.py`, which polls system-wide
 VRAM every 50 ms and `SIGKILL`s the process group if it exceeds `CAP`
-(default 5500 MiB; the fit packs into the lower `FIT_CAP`, default 4800 MiB), so
+(default 5500 MiB; the fit packs into the lower `FIT_CAP`, default 4600 MiB), so
 the display GPU is protected by measurement rather than
 by arithmetic. It prints the live display baseline and warns when it is above the
 ~1716 MiB the LEGACY config was measured to survive. It forwards

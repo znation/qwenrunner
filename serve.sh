@@ -9,10 +9,10 @@
 #     on the GPU and only image input pays a CPU vision-encode
 # The 9B cannot fit under the display cap (its Q4_K_M weights alone exceed
 # 5500 MiB), so the 4B is the default model. Two guards, deliberately
-# different: --fit packs the model into FIT_CAP (default 4800 MiB, target
+# different: --fit packs the model into FIT_CAP (default 4600 MiB, target
 # (vram_total - FIT_CAP) free, so the fit holds the budget regardless of
 # desktop drift), while guard.py only kills at CAP (default 5500 MiB). The
-# 700 MiB gap is desktop-drift tolerance, not model headroom: the model
+# 900 MiB gap is desktop-drift tolerance, not model headroom: the model
 # footprint is fixed at load (measured +34 MiB transient under a real 8k
 # prefill), so the gap is how far the desktop may grow after load before the
 # guard fires. Lowering FIT_CAP to widen the gap is expensive — the 4B is at
@@ -77,7 +77,7 @@ if [ "$EGPU" = 1 ]; then
     VEGA_NP="${VEGA_NP:-2}"
     VEGA_PORT="${VEGA_PORT:-8081}"
     VEGA_CAP="${VEGA_CAP:-5500}"
-    VEGA_FIT_CAP="${VEGA_FIT_CAP:-4800}"
+    VEGA_FIT_CAP="${VEGA_FIT_CAP:-4600}"
     # Reasoning safety net for the 4B (see the default block); shared env.
     REASONING_BUDGET="${REASONING_BUDGET:-1024}"
     REASONING_BUDGET_MSG="${REASONING_BUDGET_MSG:- Stop thinking and provide the final answer now.}"
@@ -208,7 +208,7 @@ if [ "$LEGACY" = 0 ]; then
     # Two guards, deliberately different (see the header): --fit packs the
     # model into FIT_CAP, guard.py only kills at CAP. The gap is desktop-drift
     # tolerance after load, not model headroom (the footprint is fixed at load).
-    FIT_CAP="${FIT_CAP:-4800}"
+    FIT_CAP="${FIT_CAP:-4600}"
     CAP="${CAP:-5500}"
     HOST="${HOST:-127.0.0.1}"
     THREADS="${THREADS:-8}"
@@ -291,7 +291,7 @@ PORT="${PORT:-8080}"
 # Two guards for the display GPU, as in the default block: --fit packs the Vega
 # into FIT_CAP, guard.py only kills at CAP. The 1070 is not the display GPU and
 # is not capped (see FITT_CUDA below).
-FIT_CAP="${FIT_CAP:-4800}"
+FIT_CAP="${FIT_CAP:-4600}"
 CAP="${CAP:-5500}"
 # Two slots by default: a second agent (or a subagent) then makes progress
 # instead of waiting behind the first. Measured at 128k pool / -np 2: n_ctx_slot
