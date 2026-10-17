@@ -22,7 +22,7 @@ __pycache__/
 dmesg.log
 
 # these change on every ./serve.sh run
-logs/serve.log
+logs/serve*.log*
 logs/serve-main.log
 logs/serve-vega.log
 
