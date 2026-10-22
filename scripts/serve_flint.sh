@@ -92,9 +92,23 @@ THREADS="${THREADS:-8}"
 # mmap: zero-copy into Metal buffers and shared between instances.
 LM="${LM:-mmap}"
 
-# The card's operating point. Measured here only at this pair.
-BATCH="${BATCH:-256}"
-UBATCH="${UBATCH:-128}"
+# Prefill batch. The GGUF card suggests -b 256 -ub 128, and that is measurably
+# worse at depth here: llama-server splits a prompt into -b-sized chunks, so the
+# card's values cost 85 % of prefill at 27k -- TTFT 24.3-24.7 s against 13.2 s
+# for 2048/512 (warm, cache-busted, same prompt, same server). Paired
+# llama-bench at d30000 in single invocations:
+#
+#   -ub 128   pp512  802-939 t/s   tg128  76.9-94.4 t/s
+#   -ub 512   pp512 1255-1618      tg128  94.6-95.0
+#
+# Shallow it is a wash (pp512 ~3700 either way, tg128 125 against 123). Only
+# paired runs are comparable on this box -- it carries load 16-18 from other
+# workloads, and an unpaired -ub 1024/2048 run measured decode 15-30 % low
+# across the board, i.e. contamination rather than a -ub effect. The t/s table
+# at the top of this file came from llama-bench, whose own batch defaults are
+# 2048/512, so these defaults now match what that table describes.
+BATCH="${BATCH:-2048}"
+UBATCH="${UBATCH:-512}"
 
 # f16 KV: the card's value, and it is what the t/s above were measured with.
 # 28 672 B/token is cheap enough that there is no memory reason to quantize it,

@@ -19,11 +19,12 @@ measured identically rather than through llama.cpp's own timings).
 | workload (streamed, same harness, 384-token responses) | llama.cpp | llama.cpp + n-gram | `rec` (MLX) | `rec` vs llama.cpp |
 | :---- | ---: | ---: | ---: | ---: |
 | copy-heavy prompt, 4.1k, temp 0 | 121.6 | 200-203 | **226.8** | 1.87x |
-| copy-heavy prompt, 4.1k, temp 1 | 118.0 | 203.0 | **213.7** | 1.81x |
+| copy-heavy prompt, 4.1k, temp 1 | 118.0 | 156-203 | **213.7** | 1.81x |
+| markdown document, 30k, temp 0, chat | 80.0-95.5 | 72.7-96.4 | **141.4-141.8** | 1.5-1.8x |
 | agentic chat, 27k, temp 1 | 93.4 | 97.3 | **134.9** | 1.44x |
 | markdown continuation, 100k, temp 1 | 49.4-62.5 | 56.0-62.5 | **75.8-76.6** | ~1.4x |
-| prefill 27k, TTFT (warm, cache-busted) | 24.3-24.7 s | - | **9.4-9.5 s** | 2.6x |
-| prefill 100k, TTFT (warm, cache-busted) | 119.4-126.5 s | - | **45.4 s** | 2.7x |
+| prefill 27k, TTFT (warm, cache-busted) | 13.2 s | - | **9.4-9.5 s** | 1.4x |
+| prefill 100k, TTFT (warm, cache-busted) | 71.8-82.7 s | - | **45.4 s** | 1.7x |
 
 `rec` is Recursive's own engine for Apple Silicon
 ([recursive-oss/rec](https://github.com/recursive-oss/rec), installed to
@@ -34,6 +35,12 @@ README claims 1.4-2.6x over llama.cpp for this model on an M4 Pro, which is the
 same range measured independently here. Launch it with
 `scripts/serve_flint_rec.sh`; the llama.cpp path stays as
 `scripts/build_flint.sh` + `scripts/serve_flint.sh`.
+
+Practical difference for clients: `rec` serves **only** `/v1/chat/completions`
+(`/v1/completions` is a 404), so a raw-completion workload has to stay on
+llama.cpp. Note also that `rec`'s numbers above were taken through the chat
+endpoint, while llama.cpp's 30k/100k rows above are chat too -- the raw
+comparison cannot be made on this runtime.
 
 Quality caveat, not measured here: the two runtimes run *different* 4-bit
 checkpoints. Third-party scoring of the MLX release puts it at mean KL 0.0481,
@@ -72,6 +79,24 @@ experts x 3 matrices = 846 small matvecs per token, each 2048 x 512, plus
 everything else in the graph. Anything that puts more rows in flight changes
 the kernel family as well as amortising the weight read.
 
+**Prefill is a batch problem, and the card's values are wrong for this machine.**
+The GGUF card suggests `-b 256 -ub 128`. llama-server splits a prompt into
+`-b`-sized chunks, so the card's values cost 85 % of prefill at 27k: TTFT
+24.3-24.7 s against **13.2 s** at 2048/512, measured on the same prompt with the
+same server (warm, cache-busted). At 100k the same change takes TTFT from
+119.4-126.5 s to **71.8-82.7 s**. Paired llama-bench at d30000 agrees on the
+mechanism: `-ub 128` 802-939 t/s prefill and 76.9-94.4 t/s decode against
+`-ub 512` 1255-1618 and 94.6-95.0. Shallow it is a wash (pp512 ~3700 either
+way). `serve_flint.sh` now defaults to 2048/512, which is also what
+llama-bench's own defaults are -- the t/s in its header describe those, not the
+card's.
+
+That measurement also produced the sharpest lesson in this file about this
+machine: it runs at load 16-18 from other workloads, and one unpaired sweep
+measured decode 15-30 % low *across every configuration in it*, including ones
+that cannot be affected by `-ub`. Unpaired numbers from a busy box are not
+evidence; the paired runs above are.
+
 ## Speculative decoding: a big lossless win, but only on the right text
 
 Flint ships no MTP head, and no EAGLE-3/Medusa head exists for it, so the only
@@ -85,7 +110,8 @@ compared.
 | verbatim reproduction, 4.1k, temp 0 | 119.1 | **200.7** (+68 %) | 71-82 % | raw, 512 tok |
 | verbatim reproduction, 4.1k, temp 1 | 118.0 | **156-203** (+30-72 %) | 0.39-0.77 | chat, 384 tok |
 | markdown continuation, 12k, temp 0 | 77.2-86.2 | **119-163** (+50-91 %) | 37-53 % | raw, 384 tok |
-| markdown continuation, 30k, temp 0 | 76.4-95.6 | **229-283** (+195-270 %) | 73-74 % | raw, 384 tok |
+| markdown continuation, 30k, temp 0, raw | 76.4-95.6 | **229-283** (+195-270 %) | 73-74 % | raw, 384 tok |
+| markdown document, 30k, temp 0, chat | 80.0-95.5 | 72.7-96.4 (neutral) | no drafts | chat, 384 tok |
 | agentic chat, 27k, temp 1 | 93.4 | **97.3** (+4 %) | 29 % | chat, 384 tok |
 | agentic chat, 27k, temp 0 | 93.4 | 79.9 (-15 %) | 0 % | chat, 384 tok |
 | agentic chat, 100k, temp 1 | 49.4-62.5 | 56.0-62.5 (neutral) | no drafts | chat, 384 tok |
@@ -104,7 +130,17 @@ The gain is a property of the text, exactly as `RESULTS.md` found for MTP on
 Qwen: when the output re-emits text that is already in the context (verbatim
 reproduction, file-level edits, markdown continuation) the drafter hits
 66-82 % and the win is 70-270 %; when the output is novel reasoning it ranges
-from nothing to a small loss. `ngram-mod` refuses to draft shorter than
+from nothing to a small loss. **The endpoint matters as much as the prompt.**
+The +195-270 % row is a *raw* continuation: the model keeps writing the
+document it was fed, which is the ideal case for a context-copying drafter. Ask
+the same server the same question through `/v1/chat/completions` -- which is
+what every client does -- and the model answers *about* the document instead,
+the drafter finds no 48-token run to copy, and the result is neutral
+(72.7-96.4 against 80.0-95.5). The win survives in chat mode only when the
+*task* is copy-heavy: 4.1k verbatim reproduction measured 156-203 against 118.0
+through the chat endpoint.
+
+`ngram-mod` refuses to draft shorter than
 `--spec-ngram-mod-n-min` (default 48), which is what keeps the reasoning case
 neutral; `ngram-simple` drafts short sequences, and that is the arm that
 measured -15 % when the acceptance was zero. `serve_flint.sh` therefore

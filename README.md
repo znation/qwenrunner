@@ -28,14 +28,17 @@ model vendor's own Apple engine:
 | workload (streamed, same harness) | llama.cpp | llama.cpp + n-gram | `rec` (MLX) |
 | :---- | ---: | ---: | ---: |
 | copy-heavy prompt, 4.1k, temp 0 | 121.6 | 200.7 | **226.8** |
+| markdown document, 30k, temp 0, chat | 80.0-95.5 | 72.7-96.4 | **141.4-141.8** |
 | agentic chat, 27k, temp 1 | 93.4 | 97.3 | **134.9** |
 | markdown continuation, 100k, temp 1 | 49.4-62.5 | 56.0-62.5 | **75.8-76.6** |
-| prefill 27k / 100k, TTFT | 24.4 s / 123 s | - | **9.4 s / 45.4 s** |
+| prefill 27k / 100k, TTFT | 13.2 s / 77 s | - | **9.4 s / 45.4 s** |
 
 * `./scripts/build_flint.sh` + `./scripts/serve_flint.sh` — the llama.cpp path
   (`SPEC=ngram-mod` by default: draft-free speculation is lossless and worth
-  +66-72 % on copy-heavy text at 30k depth even +195-270 %, neutral on
-  reasoning-heavy agentic traffic)
+  +66-72 % on copy-heavy text, +195-270 % on a raw 30k continuation, +4 % on
+  agentic chat at the card's sampling, and -6-19 % on *greedy* agentic chat,
+  which wants `SPEC=0`. Batch defaults are 2048/512, not the card's 256/128:
+  those cost 85 % of prefill at 27k)
 * `./scripts/serve_flint_rec.sh` — the `rec` path, 1.4-1.9x decode and 2.6x
   prefill over llama.cpp here, matching the vendor's own 1.4-2.6x claim
 
