@@ -14,11 +14,18 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-LLAMA_DIR="$ROOT/third_party/llama.cpp"
+# Source checkout, build directory and log directory are all overridable so a
+# second configuration (scripts/build_flint.sh: same flags, different llama.cpp
+# revision) can reuse this script instead of copying the flag list. The defaults
+# are the pinned checkout this repo's numbers were measured on, and the tracked
+# logs/ path those numbers cite.
+LLAMA_DIR="${LLAMA_DIR:-$ROOT/third_party/llama.cpp}"
 BUILD_DIR="${BUILD_DIR:-$ROOT/build}"
+LOG_DIR="${LOG_DIR:-$ROOT/logs}"
 JOBS="${JOBS:-$(sysctl -n hw.ncpu)}"
+mkdir -p "$LOG_DIR"
 
-if [ ! -d "$LLAMA_DIR/.git" ]; then
+if [ ! -e "$LLAMA_DIR/.git" ]; then
   echo "build: $LLAMA_DIR is missing. Run:" >&2
   echo "build:   git clone https://github.com/ggml-org/llama.cpp $LLAMA_DIR" >&2
   exit 1
@@ -51,9 +58,9 @@ CMAKE_ARGS=(
 )
 
 cmake -S "$LLAMA_DIR" -B "$BUILD_DIR" "${CMAKE_ARGS[@]}" \
-  2>&1 | tee "$ROOT/logs/configure.log"
+  2>&1 | tee "$LOG_DIR/configure.log"
 
-cmake --build "$BUILD_DIR" -j "$JOBS" 2>&1 | tee "$ROOT/logs/build.log"
+cmake --build "$BUILD_DIR" -j "$JOBS" 2>&1 | tee "$LOG_DIR/build.log"
 
 echo "=== built binaries ==="
 ls -la "$BUILD_DIR/bin/"
