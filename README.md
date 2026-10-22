@@ -17,6 +17,33 @@ discarded and why.
 > carries that configuration. On Apple Silicon the problem is different and
 > much smaller: one Metal device, one memory pool, and the entire model fits.
 
+## Second model: Flint
+
+A second model lives in this repo, and on this machine it is the faster one:
+**Recursive Flint** (39.8 B total / ~2.5 B active MoE, Apache-2.0). ~5x this
+Qwen configuration's throughput, because 2.5 B parameters are read per token
+instead of 27 B. Two runtimes are wired up, and the measured winner is the
+model vendor's own Apple engine:
+
+| workload (streamed, same harness) | llama.cpp | llama.cpp + n-gram | `rec` (MLX) |
+| :---- | ---: | ---: | ---: |
+| copy-heavy prompt, 4.1k, temp 0 | 121.6 | 200.7 | **226.8** |
+| agentic chat, 27k, temp 1 | 93.4 | 97.3 | **134.9** |
+| markdown continuation, 100k, temp 1 | 49.4-62.5 | 56.0-62.5 | **75.8-76.6** |
+| prefill 27k / 100k, TTFT | 24.4 s / 123 s | - | **9.4 s / 45.4 s** |
+
+* `./scripts/build_flint.sh` + `./scripts/serve_flint.sh` — the llama.cpp path
+  (`SPEC=ngram-mod` by default: draft-free speculation is lossless and worth
+  +66-72 % on copy-heavy text at 30k depth even +195-270 %, neutral on
+  reasoning-heavy agentic traffic)
+* `./scripts/serve_flint_rec.sh` — the `rec` path, 1.4-1.9x decode and 2.6x
+  prefill over llama.cpp here, matching the vendor's own 1.4-2.6x claim
+
+[`FLINT.md`](FLINT.md) has the full picture: the roofline (llama.cpp sustains
+193-220 GB/s of the 510-530 GB/s this machine delivers, flat across depth),
+why the MoE matvec has no tensor-op path below 32 rows, the speculation results
+by workload with their protocols, and what was deliberately not done.
+
 ## Result
 
 | lever | setting | evidence |

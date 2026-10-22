@@ -23,9 +23,12 @@
 # *full* 262 144-token context therefore costs 7.0 GiB, against ~8 GiB for
 # Qwen's 128k. Model + full context ≈ 31 GiB.
 #
-# There is no draft head in this GGUF (the repo is one 26.0 GB file): no MTP, no
-# speculative decode, so the t/s above are plain decode, and none of serve.sh's
-# MTP machinery applies here.
+# There is no draft head in this GGUF (the repo is one 26.0 GB file), so none of
+# serve.sh's MTP machinery applies. What does apply is llama.cpp's model-free
+# n-gram drafter, which SPEC below turns on by default -- it is lossless, worth
+# +66-72 % on copy-heavy traffic, and neutral on reasoning-heavy traffic. The
+# t/s table above was measured with speculation off, on llama-bench, which has
+# no speculative support at all; FLINT.md has the spec A/B by workload.
 #
 # Requires llama.cpp with Flint support — the pinned checkout predates it. The
 # binary is a second build; see scripts/build_flint.sh for the revision and why
@@ -117,11 +120,48 @@ CRAM="${CRAM:-0}"
 # model + context leaves this machine's 128 GB plenty of room.
 SWAPCAP="${SWAPCAP:-0}"
 
+# Draft-free speculative decoding. Flint ships no MTP head and no EAGLE/Medusa
+# head exists for it, so the only speculation available is the model-free
+# n-gram family llama.cpp carries. Measured here (FLINT.md, "Speculative
+# decoding"): a large *lossless* win when the output re-emits text that is
+# already in context -- +66-72 % on a verbatim-reproduction prompt at both temp 0
+# and the card's temp 1, +195-270 % on a markdown continuation at 30k depth --
+# and neutral-to-slightly-positive on reasoning-heavy agentic traffic (+1-4 % at
+# 27k, card sampling). At 100k it found nothing to copy and measured neutral.
+#
+# Default ngram-mod, because it refuses to draft shorter than NMIN tokens: that
+# is what keeps the reasoning-heavy case neutral. ngram-simple drafts short
+# sequences and measured -15 % on temp-0 agentic chat (drafting, never
+# accepting) while being equal on copy-heavy text. The one configuration where
+# the default is a real cost is *greedy* agentic traffic: at temp 0 the model's
+# chat output is terse non-code reasoning, acceptance falls to zero, and
+# ngram-mod measured -6 % to -19 % there -- so a greedy client (temperature 0
+# per request, as scripts/mtp_ab.py drives its arms) wants SPEC=0.
+#
+#   SPEC=0 ./scripts/serve_flint.sh                 # off (greedy clients)
+#   SPEC=ngram-simple ./scripts/serve_flint.sh      # alternative drafter
+#   NMIN=32 ./scripts/serve_flint.sh                # draft more aggressively
+SPEC="${SPEC:-ngram-mod}"
+NMATCH="${NMATCH:-24}"   # n-gram lookup length (--spec-ngram-mod-n-match)
+NMIN="${NMIN:-48}"       # minimum draft length; shorter drafts are dropped
+NMAX="${NMAX:-64}"       # maximum draft length
+
 # Sampling. The Flint GGUF embeds general.sampling.{temp,top_p,top_k} = 1.0 /
 # 0.95 / 20 and llama-server applies them to requests that omit them, so these
 # are here to pin the card's evaluation setting explicitly and to set min-p,
 # which llama.cpp otherwise defaults to 0.05.
 SAMPLE_ARGS=(--temp 1 --top-p 0.95 --top-k 20 --min-p 0)
+
+SPEC_ARGS=()
+case "$SPEC" in
+    0|off|none) ;;
+    ngram-mod)
+        SPEC_ARGS=(--spec-type ngram-mod
+                   --spec-ngram-mod-n-match "$NMATCH"
+                   --spec-ngram-mod-n-min "$NMIN"
+                   --spec-ngram-mod-n-max "$NMAX") ;;
+    *)  SPEC_ARGS=(--spec-type "$SPEC") ;;
+esac
 
 mkdir -p "$ROOT/logs"
 
@@ -157,7 +197,7 @@ SWA_MIB=$(python3 -c "print(int(35*513*4*128*2*($(kv_bytes_per_tok "$CTK")+$(kv_
 
 echo "serve: model=$(basename "$MODEL") alias=$ALIAS ctx=$CTX/slot slots=$NP instances=$INSTANCES threads=$THREADS"
 echo "serve: -ngl $NGL -lm $LM -b $BATCH -ub $UBATCH -ctk $CTK -ctv $CTV -fa $FA"
-echo "serve: speculative=none (no draft head in this GGUF)"
+echo "serve: speculative=${SPEC}${NMATCH:+ n_match=$NMATCH n_min=$NMIN n_max=$NMAX}"
 echo "serve: kv≈${KV_MIB} MiB/slot + swa ${SWA_MIB} MiB/slot -> weights 24.21 GiB shared + ${INSTANCES} server(s) x ${NP} slot(s) x (${KV_MIB} MiB kv)"
 echo "serve: kv=$CTK/$CTV  prompt-cache=${CRAM}MiB  swap-cap=${SWAPCAP}MiB  http://$HOST:$PORT..$((PORT + INSTANCES - 1))  logs: $ROOT/logs/serve.flint.$PORT.log"
 
@@ -169,6 +209,7 @@ for i in $(seq 0 $((INSTANCES - 1))); do
         -m "$MODEL" --alias "$ALIAS" -ngl "$NGL" -c "$TOTAL_CTX" -np "$NP" -t "$THREADS" \
         -lm "$LM" -b "$BATCH" -ub "$UBATCH" \
         -ctk "$CTK" -ctv "$CTV" -fa "$FA" --cache-ram "$CRAM" \
+        ${SPEC_ARGS[@]+"${SPEC_ARGS[@]}"} \
         --jinja "${SAMPLE_ARGS[@]}" \
         --host "$HOST" --port "$port" "$@" &
 done
