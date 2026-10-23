@@ -55,37 +55,38 @@ MODEL="${MODEL:-$ROOT/models/flint-int4-q4_1.gguf}"
 # the GGUF both name "flint".
 ALIAS="${ALIAS:-flint}"
 
-# The documented configuration is 262 144 tokens and this machine can afford it
-# at the default f16 KV (7.0 GiB), so the context is not traded down the way it
-# is on the Qwen side. Reduce it only to buy memory back or to go faster at
-# depth, not to fit: 24.21 + 7.0 GiB is small here.
-CTX="${CTX:-262144}"
+# Per-slot context. The card documents 262 144 tokens, but with four slots that
+# is 28 GiB of f16 KV (7.0 GiB each), and real agent harnesses rarely carry more
+# than ~100k tokens of transcript. 131 072 halves it to 3.5 GiB/slot, 14 GiB for
+# four slots, on top of 24.21 GiB of weights. Raise it if your agents really run
+# to 200k+ tokens -- each +131 072 costs another 3.5 GiB *per slot* -- and note a
+# session that outgrows its slot is truncated, not given a neighbour's.
+CTX="${CTX:-131072}"
 
-# Slots *within* the server (-np), each getting CTX of KV. Default 1: that is the
-# single-session latency configuration, and it is the right default because this
-# build's per-stream rate is what a lone agent feels.
+# Slots *within* the server (-np), each getting CTX of KV. Default 4, one per
+# concurrent harness, because that is the shape this repo serves: N harnesses or
+# subagents pointed at one endpoint.
 #
-# For N *concurrent* agents set NP=N -- llama-server then decodes all N rows in
-# one step, and a step reads the weights once regardless of row count, which is
-# the whole point. Measured here (chat, 256-token responses, temp 0, SPEC=0, one
-# instance at a time; full table in FLINT.md):
+# llama-server puts up to N requests into one decode step, and a step reads the
+# weights once regardless of how many rows it carries, so extra rows amortise the
+# 1.56 GB/token weight read. Measured here, four concurrent requests, one
+# instance at a time, chat, 256-token responses, temp 0, SPEC=0 (full tables in
+# FLINT.md):
 #
 #   shallow, 4 concurrent    -np 1  105.7 agg (121-123 each, serialized)
+#                            -np 2  161.3 agg (82.6-94.5 each)
 #                            -np 4  301-310 agg (75.0-77.5 each)   <- 2.9x
-#                            -np 8  304-310 agg  -- same as -np 4: slots beyond
+#                            -np 8  304-310 agg  <- same as -np 4: slots beyond
 #                            the real concurrency are wasted memory
-#   27k depth, 4 concurrent  -np 4  157.9 agg (39.5 each)
-#                            rec    ~135 agg (queued; rec does one generation at
-#                            a time by design, so its aggregate is capped at its
-#                            single-stream rate)
+#   4 sessions, appending transcripts, quiet box:
+#                            -np 4  171.6 agg, TTFT p50 1.19 s, turn wall 5.5 s
+#                            rec     57.2 agg, TTFT p50 14.8 s  (rec serves one
+#                            generation at a time, so it queues)
 #
-# NP=4 saturates this machine's memory system at shallow depth (306 t/s x
-# 1.56 GB/token ~ 477 GB/s of the 510-530 GB/s it can read). At depth the
-# per-session cost turns into KV -- 28 672 B/token, not shared across slots --
-# and the batching advantage narrows to ~15 %. Slots are not free: with CTX at
-# the full 262 144 each slot costs 7 GiB of f16 KV, so NP=1 against NP=4 is also
-# a 21 GiB decision. -c is the total, so TOTAL_CTX scales with NP.
-NP="${NP:-1}"
+# NP=1 is the single-session latency configuration (123.5 t/s for the one stream
+# against ~77 each for four batched); set NP=1 when there is only one agent and
+# it matters. -c is the total, so TOTAL_CTX scales with NP.
+NP="${NP:-4}"
 TOTAL_CTX=$(( CTX * NP ))
 
 # Independent servers. Each is +24.21 GiB of weights (shared through the page
@@ -174,7 +175,15 @@ SWAPCAP="${SWAPCAP:-0}"
 #   SPEC=0 ./scripts/serve_flint.sh                 # off (greedy clients)
 #   SPEC=ngram-simple ./scripts/serve_flint.sh      # alternative drafter
 #   NMIN=32 ./scripts/serve_flint.sh                # draft more aggressively
-SPEC="${SPEC:-ngram-mod}"
+# Default: ngram-mod for a single slot, off for several. The drafter's n-gram
+# table is shared across sequences in this revision ("shared across all
+# sequences", common/speculative.cpp), so its benefit is a single-stream,
+# single-session one and it does not survive batching. Measured at -np 4 with
+# four appending sessions, interleaved A-B-A-B: 133.95 and 97.70 t/s on against
+# 125.50 and 129.18 t/s off -- no benefit, plausibly a small cost. At -np 1 the
+# same switch was worth +68 % on verbatim reproduction and neutral-to-positive on
+# agentic chat at the card's sampling.
+SPEC="${SPEC:-$([ "${NP:-4}" -gt 1 ] && echo 0 || echo ngram-mod)}"
 NMATCH="${NMATCH:-24}"   # n-gram lookup length (--spec-ngram-mod-n-match)
 NMIN="${NMIN:-48}"       # minimum draft length; shorter drafts are dropped
 NMAX="${NMAX:-64}"       # maximum draft length
