@@ -114,6 +114,49 @@ revision keeps one table shared across sequences ("shared across all
 sequences", `common/speculative.cpp`), so multi-session acceptance can differ
 from the single-stream numbers above; every number in this section is `SPEC=0`.
 
+### Several harnesses at once
+
+The sections above measure *decode-heavy, uniform, repeated* traffic. Real agent
+harnesses are the opposite: every turn is a different, growing transcript with a
+short output. That inverts which number matters, and it changes three things.
+
+**1. Prefill does not batch across sessions; it queues.** Four sessions, four
+*distinct* ~21k prompts, 64-token outputs, `-np 4`:
+
+| | TTFT per session | wall |
+| :---- | :---- | ---: |
+| `-np 1` | 12.7, 32.2, 49.3, 66.6 s | 71.2 s |
+| `-np 4` | 16.1, 29.1, 41.5, 51.9 s | 57.2 s |
+
+Both configs move the same ~84k prompt tokens in ~55-70 s, i.e. ~1.6k t/s of
+aggregate prefill either way: `-b`-sized chunks of the four prompts fill the
+batch *in sequence* rather than side by side. So a harness's first-token
+latency under load is roughly (its place in the queue) x (its prompt / prefill
+rate) -- the fourth session waits ~3x the first, and `-np 4` buys only ~20 % of
+wall. This is the metric that matters for agent traffic, and it is the one my
+decode-focused tables do not show.
+
+**2. Slot reuse collapses the per-turn cost, and it works at `-np 4`.** The same
+four prompts sent a second time: TTFT 0.34, 0.47, 1.08, 1.15 s (llama.cpp found
+each session's cached prefix in its slot), then all four decoded in parallel at
+12.0-12.2 t/s each, 6.3 s of wall for 252 tokens. That is the appending-transcript
+case: an agent turn costs its *delta* prefill plus decode, not its whole
+transcript -- the same lever `README.md` documents for Qwen, and the reason
+multi-harness use is viable at all. It holds only while each session's slot
+keeps its KV, so the failure mode to watch is slot eviction: a session whose
+transcript is displaced re-prefills from scratch at ~1.6k t/s.
+
+**3. Distinct contents cost ~13 %.** Four sessions with identical prompts let
+the batch share expert unions; four distinct excerpts dropped `-np 4` shallow
+aggregate from 306 to 268 t/s. Any real multi-harness workload looks like the
+second number.
+
+Memory is the binding constraint once both slots and transcripts are real: f16
+KV is 28 672 B/token, so the KV floor is `NP x per-slot context x 28 KiB` --
+four 100k-token transcripts are 11.2 GiB, four 262 144-token ones are 28 GiB,
+on top of 24.21 GiB of weights. `-c` is the total (`CTX x NP`), and a session
+that outgrows its share is truncated rather than borrowing from a neighbour.
+
 ## Where the time goes
 
 **The bytes.** Per token, decode reads 1.56 GB of weights: 1.01 GB of always-on

@@ -208,6 +208,9 @@ def main(argv=None):
                 "concurrency": args.concurrency,
                 "requests_ok": len(wins),
                 "per_request_tps": sorted(round(x["decode_tps"] or 0, 1) for x in wins),
+                "per_request_ttft": sorted(round(x["ttft_s"], 2) for x in wins if x["ttft_s"] is not None),
+                "prompt_tokens": sorted(set((x.get("usage") or {}).get("prompt_tokens")
+                                            for x in wins if (x.get("usage") or {}).get("prompt_tokens"))),
                 "aggregate_tps": agg,
                 "aggregate_wall_tps": agg_wall,
                 "aggregate_tokens": n_tok,
@@ -225,9 +228,9 @@ def main(argv=None):
             for k in ("ttft_s", "wall_s", "decode_s", "n_delta"):
                 r.pop(k, None)
             recs.append(r)
-            print("  rep%d conc=%-2d ok=%-2d per-req=%-22s aggregate=%-8s wall-rate=%-8s (%d tok / %ss, wall %ss)%s"
-                  % (rep, args.concurrency, len(wins), r["per_request_tps"], agg, agg_wall, n_tok,
-                     r["window_s"], r["wall_all_s"],
+            print("  rep%d conc=%-2d ok=%-2d ttft=%-18s per-req=%-22s aggregate=%-8s wall-rate=%-8s (%d tok / %ss, wall %ss)%s"
+                  % (rep, args.concurrency, len(wins), r["per_request_ttft"], r["per_request_tps"],
+                     agg, agg_wall, n_tok, r["window_s"], r["wall_all_s"],
                      "" if not r["errors"] else "  ERR " + r["errors"][0][:60]))
             if args.out:
                 with open(os.path.join(ROOT, args.out), "a") as f:
