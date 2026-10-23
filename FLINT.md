@@ -14,6 +14,23 @@ workload) and `scripts/openai_stream_bench.py` (wire-level streaming benchmark
 that works against any OpenAI-compatible server, so llama.cpp and MLX are
 measured identically rather than through llama.cpp's own timings).
 
+**Text in, text out — there is no vision.** The card says so (`Input / output:
+Text / text`), the org publishes no vision sibling, and the checkpoint carries
+nothing to hook one to: 779 tensors with no vision tower, patch embedding or
+projector among them, no image/vision keys in the metadata, no `mmproj` file in
+the repository, and `src/models/flint.cpp` builds `build_inp_embd(tok_embd)` and
+nothing else. A request that carries an image content part is refused outright
+rather than mis-answered:
+
+```
+HTTP 500: image input is not supported - hint: if this is unexpected,
+          you may need to provide the mmproj
+```
+
+So the `input: ["text"]` in the pi/omp catalog entries is a correct declaration,
+not a conservative one, and image work has to route to one of the vision models
+already in those catalogs.
+
 ## Two runtimes, and the vendor's own engine wins
 
 | workload (streamed, same harness, 384-token responses) | llama.cpp | llama.cpp + n-gram | `rec` (MLX) | `rec` vs llama.cpp |
