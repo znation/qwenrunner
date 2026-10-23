@@ -356,6 +356,29 @@ Two properties are load-bearing:
   (verified on `/v1/chat/completions`), so a small `max_tokens` can be consumed
   entirely by thinking and return empty `content`.
 
+### Flint
+
+Flint is wired into the same two catalogs as a second local provider,
+`flintrunner`, so a harness can pick it per task; tumwater's fallback is left
+pointing at Qwen.
+
+| client | file | entry |
+|---|---|---|
+| pi | `~/.pi/agent/models.json` | provider `flintrunner`, model `flint`, cost 0, `contextWindow` 131072 |
+| omp | `~/.omp/agent/models.yml` | same provider and model |
+
+Its base URL is `http://127.0.0.1:8091/v1` — `serve_flint.sh`'s port, distinct
+from `serve.sh`'s 8090, so both models can be up at once — and the model id is
+llama-server's `--alias flint`. `contextWindow` mirrors the *per-slot* context
+(`CTX`, default 131072): with `NP=4` a session that outgrows its slot is
+truncated rather than borrowing a neighbour's, so keep the two in step.
+
+Unlike the Qwen entries, `supportsDeveloperRole: true`: the Flint chat template
+defines a `<|developer|>` role and llama-server passes it through — verified by
+sending a `developer` message, which returns a normal answer (and an
+`openai-completions` tool call verified separately: `finish_reason: tool_calls`,
+`read_file({"path": "/etc/hosts"})`).
+
 ## Harness
 
 | script | purpose |
