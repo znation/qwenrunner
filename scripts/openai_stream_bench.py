@@ -23,6 +23,7 @@ import argparse
 import json
 import os
 import sys
+import threading
 import time
 import urllib.request
 
@@ -43,6 +44,8 @@ def stream_once(url, payload, api_key):
     text = []
     usage = None
     finish = None
+    first_abs = None
+    last_abs = None
     with urllib.request.urlopen(req, timeout=3600) as r:
         for raw in r:
             line = raw.decode("utf-8", "replace").strip()
@@ -69,7 +72,9 @@ def stream_once(url, payload, api_key):
                     n_delta += 1
                     if t_first is None:
                         t_first = time.time()
+                        first_abs = t_first
                     t_last = time.time()
+                    last_abs = t_last
                     text.append(piece)
     t_end = time.time()
 
@@ -84,6 +89,8 @@ def stream_once(url, payload, api_key):
         "usage": usage,
         "decode_s": None if decode_s is None else round(decode_s, 3),
         "decode_tps": None if not decode_s or n_out < 2 else round((n_out - 1) / decode_s, 2),
+        "first_abs": first_abs,
+        "last_abs": last_abs,
         "char_head": ("".join(text))[:64].replace("\n", " "),
     }
 
@@ -101,6 +108,15 @@ def main(argv=None):
     ap.add_argument("--raw", dest="chat", action="store_false",
                     help="use /completions (raw prompt) instead of /chat/completions")
     ap.add_argument("--reps", type=int, default=2)
+    ap.add_argument("--concurrency", type=int, default=1,
+                    help="fire N requests at once; each gets a distinct prompt marker. "
+                         "With batching (-np N in llama-server) the streams overlap and "
+                         "aggregate_tps is the combined rate; with a single slot, or an "
+                         "engine that queues, it collapses to the single-stream rate")
+    ap.add_argument("--prompt-slices", type=int, default=0,
+                    help="split the prompt file into N slices and give session i slice i, "
+                         "so concurrent requests carry *different* content (different MoE "
+                         "expert unions) instead of near-identical prompts")
     ap.add_argument("--max-tokens", type=int, default=384)
     ap.add_argument("--temperature", type=float, default=0.0,
                     help="negative omits the field (server default)")
@@ -146,25 +162,79 @@ def main(argv=None):
         # The nonce goes at the FRONT: llama.cpp's prompt cache matches on the
         # prefix, so appending it would leave the whole prompt a cache hit and
         # measure nothing.
-        text = prompt if not args.nonce else "<!-- probe %d -->\n" % rep + prompt
-        payload = make_payload(text)
-        try:
-            r = stream_once(url, payload, args.api_key)
-        except Exception as e:  # noqa: BLE001
-            print("  rep%d FAILED: %s: %s" % (rep, type(e).__name__, e))
+        base_text = prompt if not args.nonce else "<!-- probe %d -->\n" % rep + prompt
+
+        results = [None] * args.concurrency
+        errors = [None] * args.concurrency
+
+        slices = None
+        if args.prompt_slices:
+            n = args.prompt_slices
+            size = (len(prompt) + n - 1) // n
+            slices = [prompt[i * size:(i + 1) * size] for i in range(n)]
+
+        def worker(i):
+            if slices:
+                text = slices[i % len(slices)]
+            else:
+                text = base_text if args.concurrency == 1 else "<!-- session %d -->\n" % i + base_text
+            try:
+                results[i] = stream_once(url, make_payload(text), args.api_key)
+            except Exception as e:  # noqa: BLE001
+                errors[i] = "%s: %s" % (type(e).__name__, e)
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(args.concurrency)]
+        wall0 = time.time()
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        wall = time.time() - wall0
+
+        if any(results):
+            wins = [r for r in results if r]
+            # Aggregate over the window in which *any* stream was producing: the
+            # union of the per-request decode windows. With batching the streams
+            # overlap and this is the honest combined rate; serialized (a single
+            # slot, or an engine that queues) the windows barely overlap and the
+            # aggregate collapses to the single-stream rate.
+            first = min(r["first_abs"] for r in wins)
+            last = max(r["last_abs"] for r in wins)
+            n_tok = sum(r["n_out"] for r in wins)
+            agg = round(n_tok / (last - first), 2) if last > first else None
+            agg_wall = round(n_tok / wall, 2) if wall > 0 else None
+            r = dict(wins[0])
+            r.update({
+                "concurrency": args.concurrency,
+                "requests_ok": len(wins),
+                "per_request_tps": sorted(round(x["decode_tps"] or 0, 1) for x in wins),
+                "aggregate_tps": agg,
+                "aggregate_wall_tps": agg_wall,
+                "aggregate_tokens": n_tok,
+                "window_s": round(last - first, 3),
+                "wall_all_s": round(wall, 3),
+                "errors": [e for e in errors if e],
+                "rep": rep,
+                "label": args.label,
+                "base_url": args.base_url,
+                "prompt_file": args.prompt_file,
+                "max_tokens": args.max_tokens,
+                "temperature": args.temperature,
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            })
+            for k in ("ttft_s", "wall_s", "decode_s", "n_delta"):
+                r.pop(k, None)
+            recs.append(r)
+            print("  rep%d conc=%-2d ok=%-2d per-req=%-22s aggregate=%-8s wall-rate=%-8s (%d tok / %ss, wall %ss)%s"
+                  % (rep, args.concurrency, len(wins), r["per_request_tps"], agg, agg_wall, n_tok,
+                     r["window_s"], r["wall_all_s"],
+                     "" if not r["errors"] else "  ERR " + r["errors"][0][:60]))
+            if args.out:
+                with open(os.path.join(ROOT, args.out), "a") as f:
+                    f.write(json.dumps(r) + "\n")
+        else:
+            print("  rep%d conc=%-2d FAILED: %s" % (rep, args.concurrency, errors[0]))
             break
-        r.update({"rep": rep, "label": args.label, "base_url": args.base_url,
-                  "prompt_file": args.prompt_file, "max_tokens": args.max_tokens,
-                  "temperature": args.temperature, "warmup": args.warmup,
-                  "nonce": args.nonce,
-                  "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S")})
-        recs.append(r)
-        print("  rep%d ttft=%-7s wall=%-7s out=%-5s decode=%-8s finish=%-6s %r"
-              % (rep, r["ttft_s"], r["wall_s"], r["n_out"], r["decode_tps"],
-                 r["finish"], r["char_head"][:40]))
-        if args.out:
-            with open(os.path.join(ROOT, args.out), "a") as f:
-                f.write(json.dumps(r) + "\n")
     return 0
 
 

@@ -61,11 +61,30 @@ ALIAS="${ALIAS:-flint}"
 # depth, not to fit: 24.21 + 7.0 GiB is small here.
 CTX="${CTX:-262144}"
 
-# Slots *within* the server (-np), each getting CTX of KV. 1, because that is
-# the GGUF card's default and because a single slot already saturates the Metal
-# device (measured aggregate on the Qwen side is flat once one stream is GPU
-# bound). Each extra slot costs 7 GiB of KV at full context plus Metal compute
-# buffers; -c is the total, so TOTAL_CTX scales with NP.
+# Slots *within* the server (-np), each getting CTX of KV. Default 1: that is the
+# single-session latency configuration, and it is the right default because this
+# build's per-stream rate is what a lone agent feels.
+#
+# For N *concurrent* agents set NP=N -- llama-server then decodes all N rows in
+# one step, and a step reads the weights once regardless of row count, which is
+# the whole point. Measured here (chat, 256-token responses, temp 0, SPEC=0, one
+# instance at a time; full table in FLINT.md):
+#
+#   shallow, 4 concurrent    -np 1  105.7 agg (121-123 each, serialized)
+#                            -np 4  301-310 agg (75.0-77.5 each)   <- 2.9x
+#                            -np 8  304-310 agg  -- same as -np 4: slots beyond
+#                            the real concurrency are wasted memory
+#   27k depth, 4 concurrent  -np 4  157.9 agg (39.5 each)
+#                            rec    ~135 agg (queued; rec does one generation at
+#                            a time by design, so its aggregate is capped at its
+#                            single-stream rate)
+#
+# NP=4 saturates this machine's memory system at shallow depth (306 t/s x
+# 1.56 GB/token ~ 477 GB/s of the 510-530 GB/s it can read). At depth the
+# per-session cost turns into KV -- 28 672 B/token, not shared across slots --
+# and the batching advantage narrows to ~15 %. Slots are not free: with CTX at
+# the full 262 144 each slot costs 7 GiB of f16 KV, so NP=1 against NP=4 is also
+# a 21 GiB decision. -c is the total, so TOTAL_CTX scales with NP.
 NP="${NP:-1}"
 TOTAL_CTX=$(( CTX * NP ))
 

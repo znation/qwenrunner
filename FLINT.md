@@ -48,6 +48,72 @@ p99 0.730, 94.1 % top-1 against BF16 ([OsaurusAI card](https://huggingface.co/Os
 no equivalent number is published for `RecursiveSI/flint-int4-gguf`. The speed
 comparison above is apples-to-apples; the quality comparison is not.
 
+## Slots and aggregate throughput: the reason to keep llama.cpp
+
+`rec` processes **one generation at a time** -- its docs say so ("overlapping
+requests can receive HTTP 429") and it measured so here: four concurrent
+requests came back in order, each at full engine speed (~220 t/s), for an
+aggregate of **173-175 t/s**, which is just the single-stream rate. Its
+aggregate is therefore *pinned* at whatever one stream does.
+
+llama-server `-np N` puts up to N requests into one decode step, and a step
+reads the weights once regardless of how many rows are in it, so extra rows
+amortise the 1.56 GB/token weight read. Measured, one instance at a time, chat
+endpoint, 256-token responses, temp 0, `SPEC=0`:
+
+| config (llama.cpp) | shallow, per session | shallow, aggregate | 27k depth, per session | 27k depth, aggregate |
+| :---- | ---: | ---: | ---: | ---: |
+| `-np 1`, 4 concurrent | 121-123 | 105.7 | 86-96 | ~90 (one at a time) |
+| `-np 2`, 4 concurrent | 82.6-94.5 | 161.3 | - | - |
+| `-np 4`, 4 concurrent | 75.0-77.5 | **301-310** | 39.5 | **157.9** |
+| `-np 4`, 4 concurrent, 4 *distinct* contents | 67-67 | 268.2 | - | - |
+| `-np 8`, 4 concurrent | 75.9-77.6 | 304-310 (no gain) | - | - |
+| `-np 8`, 8 concurrent | 47.4-61.6 | 376-488 | - | - |
+| `rec`, 4 concurrent | 217-226 (queued) | 173.5-175.2 | 124-140 (queued) | ~135 |
+
+Reading of that table:
+
+* **Maximum aggregate: `-np N` with N = your real concurrency.** NP=4 gives
+  301-310 t/s against 105.7 serialized and 123.5 for a single stream. NP=8 with
+  only 4 concurrent requests gives exactly NP=4's numbers, i.e. slots beyond
+  concurrency are wasted memory (each slot is 7 GiB of f16 KV at 262 144
+  context, 0.44 GiB at 16 384).
+* **The knee is the memory roofline.** At NP=4, 306 t/s x 1.56 GB/token is
+  477 GB/s, i.e. ~92 % of the 510-530 GB/s this machine delivers to a streaming
+  kernel. Four rows already saturate it at shallow depth. The NP=8/8-concurrent
+  figure exceeds that roofline only because eight near-identical prompts pick
+  the same experts, shrinking the per-step expert read -- with four *distinct*
+  contents NP=4 drops from 306 to 268 t/s (418 GB/s), which is the honest
+  shallow number.
+* **At depth the comparison narrows to a tie, and the reason is instructive.**
+  A session's step at 27k walks its own cache (28 672 B/token, no sharing
+  across slots): 0.77 GB of KV against 1.56 GB of weights, so batching four
+  rows costs 3.1 GB + 1.56 GB per step. End to end, four sessions each
+  producing 1 024 tokens from 27k of context:
+
+  | | first pass (prefills included) | repeat pass |
+  | :---- | ---: | ---: |
+  | llama.cpp `-np 4` | 42.6 t/s wall-rate | **138.4** |
+  | `rec` (queued) | 52.2 | 42.9 |
+
+  The first pass is a wash. The repeat pass is not: llama.cpp's slots still
+  held the four conversations' KV, so the second pass skipped prefill entirely
+  (29.6 s of wall for 4 092 tokens), while rec re-prefilled all four (95.4 s).
+  [INFERENCE] That reads as slot-KV persistence on one side and a cache policy
+  that did not retain four 27k contexts on the other -- it is the measured wall
+  time, not the mechanism, that is solid.
+* **Runtime by concurrency.** One or two sessions: `rec` (220 against 123 per
+  stream shallow; 135 against 93 at 27k). Four or more, especially at shallow
+  context or on repeat turns: llama.cpp with `-np N`. At 27k/4 sessions the two
+  are within ~15 % on decode alone (llama 158 against rec's ~135 aggregate) --
+  the wide gap in the shallow rows is what batching buys when the weight read
+  dominates, and at depth it does not.
+
+Not measured: speculative decoding with `-np` > 1. The n-gram drafter in this
+revision keeps one table shared across sequences ("shared across all
+sequences", `common/speculative.cpp`), so multi-session acceptance can differ
+from the single-stream numbers above; every number in this section is `SPEC=0`.
+
 ## Where the time goes
 
 **The bytes.** Per token, decode reads 1.56 GB of weights: 1.01 GB of always-on
