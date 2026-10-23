@@ -102,12 +102,13 @@ Reading of that table:
   [INFERENCE] That reads as slot-KV persistence on one side and a cache policy
   that did not retain four 27k contexts on the other -- it is the measured wall
   time, not the mechanism, that is solid.
-* **Runtime by concurrency.** One or two sessions: `rec` (220 against 123 per
-  stream shallow; 135 against 93 at 27k). Four or more, especially at shallow
-  context or on repeat turns: llama.cpp with `-np N`. At 27k/4 sessions the two
-  are within ~15 % on decode alone (llama 158 against rec's ~135 aggregate) --
-  the wide gap in the shallow rows is what batching buys when the weight read
-  dominates, and at depth it does not.
+* **Runtime by concurrency.** One agent (even with appending turns): `rec` --
+  55.1 against 26.6 t/s aggregate with comparable TTFT, and 220 against 123 t/s
+  on a single stream. Two or more concurrent agents: llama.cpp with
+  `-np N` = the number of agents, because rec queues (30.5 s against 2.2 s of
+  TTFT at four sessions). At 27k/4 sessions with *fixed* prompts the two are
+  within ~15 % on decode alone (llama 158 against rec's ~135), so it is the
+  appending-transcript case and the concurrency that decide, not depth alone.
 
 Not measured: speculative decoding with `-np` > 1. The n-gram drafter in this
 revision keeps one table shared across sequences ("shared across all
@@ -150,6 +151,56 @@ transcript is displaced re-prefills from scratch at ~1.6k t/s.
 the batch share expert unions; four distinct excerpts dropped `-np 4` shallow
 aggregate from 306 to 268 t/s. Any real multi-harness workload looks like the
 second number.
+
+**4. The turn loop, which is the workload that matters.** Each session appends
+its own output plus a ~700-token tool observation to its own transcript (12k
+characters of context at turn 0, ~24.5k by turn 5), 256-token outputs, turns
+fired and measured per session -- `scripts/turn_loop_bench.py`, one server at a
+time, all rows from a loaded window (see 5):
+
+| | TTFT p50 | TTFT p90 | TTFT max | turn wall p50 | aggregate out | aggregate prefill |
+| :---- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 session, llama.cpp `-np 1` | 0.49 s | 0.59 s | 0.60 s | 9.8 s | 26.6 t/s | 607 t/s |
+| 1 session, `rec` | 0.76 s | 3.30 s | 3.33 s | **3.9 s** | **55.1 t/s** | 1256 t/s |
+| 4 sessions, llama.cpp `-np 4` | **2.18 s** | 6.98 s | 8.19 s | 23.7 s | **43.0 t/s** | 1004 t/s |
+| 4 sessions, `rec` | 30.5 s | 32.8 s | 34.7 s | 34.9 s | 29.4 t/s | 703 t/s |
+
+The mechanism is **queueing, not re-prefill**. Both runtimes reuse prefixes for
+an appending transcript -- llama.cpp in its slot, rec in its cache -- so a turn
+costs its delta prefill and TTFT stays flat as context grows (llama.cpp ~0.5 s at
+one session, ~2.2 s at four; rec ~0.8 s at one). What differs is what happens
+when sessions overlap: llama.cpp decodes the four rows together, so each session
+keeps its own rate; rec takes them one at a time, so a turn's first token waits
+behind the other sessions' turns and the *p50 TTFT goes from 0.8 s to 30 s*.
+Per-session balance follows: llama.cpp's four sessions averaged 23.70-23.82 s
+per turn, rec's 29.1-34.0 s.
+
+So the serving shape inverts between one agent and several: **one agent, rec
+wins on throughput (55.1 against 26.6 t/s) with comparable first-token latency;
+several agents, llama.cpp with `-np N` wins on both** (43.0 against 29.4 t/s,
+and 2.2 s against 30.5 s of TTFT). An earlier version of this file attributed
+rec's 4-session TTFT to re-prefilling; the 1-session run disproves that and the
+number above is the correction.
+
+**5. Both runtimes are hostage to *host* load, not GPU.** Mid-measurement this
+machine went from load average 16 to 130-170 (the user's other workloads: a
+fleet of node processes, Spotlight indexing the ~50 GB of checkpoints this work
+downloaded), and decode fell from 123.5 to 21.6-26.9 t/s -- 4.6-5.7x -- while a
+streaming Metal kernel still measured 492 GB/s of read bandwidth (was 510-530)
+and the GPU sat at 26 % busy. So the GPU and its memory were idle and the
+per-token cost was host-side waiting: each step needs the CPU to build, dispatch
+and fence. rec degraded less in the same window (226 -> 59.8-69.9 t/s, 3.2-3.8x),
+consistent with fewer host round-trips per token, but not enough to overcome the
+slot-reuse and batching gap above. **This matters because it is the normal state
+during agentic work**: a coding harness runs builds, tests, linters and git on
+the same machine, so "several harnesses at once" *is* a loaded host. Absolute
+t/s from a quiet machine do not describe it.
+
+Caveat on the table in 4: both runs happened inside that loaded window, so the
+absolute rates are ~4-5x below what the same configuration does on a quiet box
+(that is why 43 t/s aggregate appears where the shallow table above shows
+268-306). The load was slightly *higher* during the llama.cpp run (128-170)
+than the rec run (130), so the comparison is if anything biased toward rec.
 
 Memory is the binding constraint once both slots and transcripts are real: f16
 KV is 28 672 B/token, so the KV floor is `NP x per-slot context x 28 KiB` --

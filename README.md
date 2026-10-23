@@ -40,7 +40,10 @@ model vendor's own Apple engine:
   which wants `SPEC=0`. Batch defaults are 2048/512, not the card's 256/128:
   those cost 85 % of prefill at 27k)
 * `./scripts/serve_flint_rec.sh` — the `rec` path, 1.4-1.9x decode and 2.6x
-  prefill over llama.cpp here, matching the vendor's own 1.4-2.6x claim
+  prefill over llama.cpp here, matching the vendor's own 1.4-2.6x claim. It is
+  the faster choice for **one** agent; for several concurrent harnesses it
+  queues one generation at a time (30.5 s against 2.2 s of turn-level TTFT at
+  four sessions), so the llama.cpp path with `NP=N` takes over there
 
 [`FLINT.md`](FLINT.md) has the full picture: the roofline (llama.cpp sustains
 193-220 GB/s of the 510-530 GB/s this machine delivers, flat across depth),
