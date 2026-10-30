@@ -21,7 +21,9 @@
 # (K and V) x 2 B = 28 672 B, because the other 35 layers are sliding-window at
 # 513 tokens and carry a fixed ~35 MiB per slot instead of a growing cache. The
 # *full* 262 144-token context therefore costs 7.0 GiB, against ~8 GiB for
-# Qwen's 128k. Model + full context ≈ 31 GiB.
+# Qwen's 128k. Model + one full-context slot ≈ 31 GiB; the default 8 slots at
+# CTX=131072 measure 59.3 GiB of RSS all in, leaving ~68 GiB of the 128 GB for
+# whatever else the machine is doing (see the CTX block below for the table).
 #
 # There is no draft head in this GGUF (the repo is one 26.0 GB file), so none of
 # serve.sh's MTP machinery applies. What does apply is llama.cpp's model-free
@@ -38,8 +40,10 @@
 #   MODEL CTX NP INSTANCES PORT HOST THREADS NGL LM BATCH UBATCH CTK CTV FA CRAM ALIAS SWAPCAP
 #
 #   ./scripts/serve_flint.sh                  # one full-context slot on 8091
-#   NP=2 ./scripts/serve_flint.sh             # +7 GiB KV, two sessions
-#   CTX=131072 ./scripts/serve_flint.sh       # -3.5 GiB KV, faster at depth
+#   NP=4 ./scripts/serve_flint.sh             # four harnesses, -14 GiB KV
+#   NP=1 ./scripts/serve_flint.sh             # one stream, fastest per token
+#   CTX=65536 ./scripts/serve_flint.sh        # -14 GiB KV at 8 slots, shallower
+#   CRAM=4096 ./scripts/serve_flint.sh        # more conversations than slots
 #   CRAM=8192 ./scripts/serve_flint.sh        # host prompt cache, see below
 # Extra args are appended verbatim to every llama-server command line.
 set -euo pipefail
@@ -55,17 +59,19 @@ MODEL="${MODEL:-$ROOT/models/flint-int4-q4_1.gguf}"
 # the GGUF both name "flint".
 ALIAS="${ALIAS:-flint}"
 
-# Per-slot context. The card documents 262 144 tokens, but with four slots that
-# is 28 GiB of f16 KV (7.0 GiB each), and real agent harnesses rarely carry more
-# than ~100k tokens of transcript. 131 072 halves it to 3.5 GiB/slot, 14 GiB for
-# four slots, on top of 24.21 GiB of weights. Raise it if your agents really run
-# to 200k+ tokens -- each +131 072 costs another 3.5 GiB *per slot* -- and note a
-# session that outgrows its slot is truncated, not given a neighbour's.
+# Per-slot context. The card documents 262 144 tokens, but with eight slots that
+# is 56 GiB of f16 KV (7.0 GiB each), and real agent harnesses rarely carry more
+# than ~100k tokens of transcript. 131 072 halves it to 3.5 GiB/slot, 28 GiB for
+# eight slots, on top of 24.21 GiB of weights (measured RSS at the defaults:
+# 59.3 GiB for 8 slots, 42.1 GiB for 4, 33.0 GiB for 4 slots at CTX=65536).
+# Raise it if your agents really run to 200k+ tokens -- each +131 072 costs
+# another 3.5 GiB *per slot* -- and note a session that outgrows its slot is
+# truncated, not given a neighbour's.
 CTX="${CTX:-131072}"
 
-# Slots *within* the server (-np), each getting CTX of KV. Default 4, one per
-# concurrent harness, because that is the shape this repo serves: N harnesses or
-# subagents pointed at one endpoint.
+# Slots *within* the server (-np), each getting CTX of KV. Default 8: one per
+# concurrent harness in the fleet this repo serves, because the slot count is
+# the one knob that decides whether a fleet's throughput survives.
 #
 # llama-server puts up to N requests into one decode step, and a step reads the
 # weights once regardless of how many rows it carries, so extra rows amortise the
@@ -78,15 +84,28 @@ CTX="${CTX:-131072}"
 #                            -np 4  301-310 agg (75.0-77.5 each)   <- 2.9x
 #                            -np 8  304-310 agg  <- same as -np 4: slots beyond
 #                            the real concurrency are wasted memory
-#   4 sessions, appending transcripts, quiet box:
-#                            -np 4  171.6 agg, TTFT p50 1.19 s, turn wall 5.5 s
-#                            rec     57.2 agg, TTFT p50 14.8 s  (rec serves one
-#                            generation at a time, so it queues)
+#   shallow, 8 concurrent    -np 8  376-488 agg (47.4-61.6 each)   <- 1.3-1.5x
+#                            the -np 4 / 4-concurrent figure
 #
-# NP=1 is the single-session latency configuration (123.5 t/s for the one stream
-# against ~77 each for four batched); set NP=1 when there is only one agent and
-# it matters. -c is the total, so TOTAL_CTX scales with NP.
-NP="${NP:-4}"
+# The rule that matters is *slots >= concurrent sessions*, and the failure when
+# it is violated is not graceful. Measured with the turn loop (8 appending
+# transcripts, 256-token turns, one server at a time, interleaved reps):
+#
+#   -np 4, 4 sessions            123.3 / 117.2 agg out, prefill 2882 / 2739,
+#                                TTFT p50 1.88 / 1.42 s, wall p50 7.3 / 8.3 s
+#   -np 8, 8 sessions            143.4 / 140.0 agg out, prefill 3349 / 3271,
+#                                TTFT p50 2.00 / 1.90 s, wall p50 12.8 / 13.0 s
+#   -np 4, 8 sessions, CRAM=0     62.9 agg out, prefill 1470, TTFT p50 21.2 s,
+#                                wall p50 32.2 s   <- every turn re-prefills
+#   -np 4, 8 sessions, CRAM=4096 107.8 / 113.7 agg out, prefill 2518 / 2656,
+#                                TTFT p50 9.4 / 9.2 s, wall p50 16.2 / 16.1 s
+#
+# So: NP=8 for an eight-harness fleet (+11-15 % aggregate over NP=4, same
+# per-turn TTFT, at +17 GiB of KV); NP=4 for four harnesses or a single stream
+# (NP=1 is the single-session latency configuration -- 123.5 t/s for the one
+# stream against ~77 each for four batched). Slots beyond the real concurrency
+# are wasted memory. -c is the total, so TOTAL_CTX scales with NP.
+NP="${NP:-8}"
 TOTAL_CTX=$(( CTX * NP ))
 
 # Independent servers. Each is +24.21 GiB of weights (shared through the page
@@ -103,10 +122,12 @@ HOST="${HOST:-127.0.0.1}"
 # equivalent; 99 is what serve.sh uses and what the t/s above were measured at.
 NGL="${NGL:-99}"
 
-# The GGUF card's value. Not swept on this machine: decode is Metal-bound here
-# (the CPU only embeds tokens, dispatches and samples), so the Qwen-side
-# finding that 4 beats 8 for prefill may or may not transfer -- if you sweep
-# threads, sweep prefill, not generation.
+# The GGUF card's value. Swept at the fleet shape (8 slots, 8 appending
+# sessions, interleaved, card sampling) once the batch below was fixed: -t 12
+# measured 130.3 t/s aggregate out against 148.9 for -t 8 -- a loss, not a win,
+# so the card's 8 stands. Decode here is Metal-bound (the CPU embeds tokens,
+# dispatches and samples), and the Qwen-side finding that 4 beats 8 for prefill
+# did not transfer either: single-stream pp512 at d20000 is the same at 4 and 8.
 THREADS="${THREADS:-8}"
 
 # mmap: zero-copy into Metal buffers and shared between instances.
@@ -127,7 +148,27 @@ LM="${LM:-mmap}"
 # across the board, i.e. contamination rather than a -ub effect. The t/s table
 # at the top of this file came from llama-bench, whose own batch defaults are
 # 2048/512, so these defaults now match what that table describes.
-BATCH="${BATCH:-2048}"
+#
+# The *logical* batch is the one knob llama-bench cannot see, because it needs
+# several slots in flight: -b caps how many prompt tokens one decode call may
+# carry, and a fleet's turn deltas arrive in waves of NP x ~900 tokens. At -b
+# 2048 the server splits that wave across several decodes and the slots' prefills
+# run mostly in sequence; at -b 4096 two to four slots' chunks land in one decode.
+# Turn loop, 8 slots, 8 sessions, card sampling, interleaved (medians of 3 reps,
+# plus a second window):
+#
+#   -b 2048   agg out 131.3 / 121.0 / 120.6 / 145.3 / 111.3
+#   -b 4096   agg out 148.9 / 141.6 / 157.2 / 137.6 / 128.7
+#   -b 8192   agg out 143.1                   <- no further gain past 4096
+#
+# pooled over seven interleaved runs each (three windows): median 141.6 against
+# 124.2 t/s, prefill 3591 against 3405, turn wall p50 10.3 against 11.3 s, TTFT
+# +0.5 s -- 4096 wins six of the seven paired comparisons and one window is
+# level, so read it as +12-14 % aggregate, at no RSS cost (56.2 GiB either way)
+# and with single-stream pp/tg unchanged (pp512 at d20000 1651.6/1661.9 at 2048
+# against 1682.1/1658.5 at 4096; tg identical). -ub 1024 with -b 4096 measured
+# 139.6 against 148.9, so the physical batch stays 512.
+BATCH="${BATCH:-4096}"
 UBATCH="${UBATCH:-512}"
 
 # f16 KV: the card's value, and it is what the t/s above were measured with.
@@ -138,16 +179,32 @@ CTK="${CTK:-f16}"
 CTV="${CTV:-f16}"
 FA="${FA:-on}"
 
-# Server prompt cache in host RAM (--cache-ram). Default 0, the card's value.
-# The card's reason is host memory: this is a ceiling that costs RAM whether or
-# not it is used. Note what 0 does *not* disable -- a slot still reuses its own
-# KV prefix, so an appending transcript prefills only the delta; CRAM only
-# covers a conversation *displaced* by another one (and with CRAM=0 the server
-# logs "--cache-idle-slots requires --cache-ram, disabling", which is that same
-# limit, not a misconfiguration). At f16 flint KV a full 262 144-token
-# conversation is 7 GiB, so size CRAM as 7 GiB x (conversations kept warm), e.g.
-# CRAM=7168 for one. Untested for this model (it is measured for Qwen in
-# RESULTS.md, "Prefill cache").
+# Server prompt cache in host RAM (--cache-ram). Default 0. Note what 0 does
+# *not* disable -- a slot still reuses its own KV prefix, so an appending
+# transcript prefills only the delta; CRAM only covers a conversation *displaced*
+# by another one (and with CRAM=0 the server logs "--cache-idle-slots requires
+# --cache-ram, disabling", which is that same limit, not a misconfiguration).
+#
+# Measured for this model (turn loop, appending transcripts, card sampling,
+# interleaved reps, two reps per row):
+#
+#   sessions/slots  CRAM     agg out t/s     prefill t/s    TTFT p50     RSS
+#   8 / 4           0        79.7 / 79.9     1836 / 1883    13.2 / 12.1 s  40.2 GiB
+#   8 / 4           4096     130.4 / 142.9   3586 / 3425     5.3 /  5.3 s  47.0 GiB
+#   12 / 8          0        73.7 / 76.7     1814 / 1854    14.4 / 12.7 s  54.0 GiB
+#   12 / 8          4096     142.1 / 153.4   3489 / 3974     6.2 /  4.0 s  62.3 GiB
+#   8 / 8           0        131.3 / 121.0 / 120.6 (three windows)          56.2 GiB
+#   8 / 8           4096     109.9 / 109.8   2843 / 3042     1.0 /  0.8 s  59.0 GiB
+#
+# So CRAM is worth 1.6-2x whenever concurrent conversations exceed NP, and it
+# *costs* ~9 % of throughput when they do not: with no conversation to displace,
+# the server still saves each idle slot's KV to the cache on every new task,
+# which is pure copying. Leave it 0 at NP >= conversations; set it when the
+# fleet can outgrow the slots, sized as ~0.9 GiB per 32k-token conversation (a
+# full 262 144-token one is 7 GiB). The corner worth knowing: 12 harnesses on 8
+# slots with CRAM measured *more* aggregate than 8 on 8 (142-153 against
+# 121-131 t/s) because twelve clients keep every slot busy -- what that shape
+# costs is first-token latency (TTFT 4-6 s against 0.8-1.3 s).
 CRAM="${CRAM:-0}"
 
 # New-swap guard (see serve.sh / scripts/guard.py). Default off: 31 GiB of
@@ -175,15 +232,26 @@ SWAPCAP="${SWAPCAP:-0}"
 #   SPEC=0 ./scripts/serve_flint.sh                 # off (greedy clients)
 #   SPEC=ngram-simple ./scripts/serve_flint.sh      # alternative drafter
 #   NMIN=32 ./scripts/serve_flint.sh                # draft more aggressively
-# Default: ngram-mod for a single slot, off for several. The drafter's n-gram
-# table is shared across sequences in this revision ("shared across all
-# sequences", common/speculative.cpp), so its benefit is a single-stream,
-# single-session one and it does not survive batching. Measured at -np 4 with
+# Default: ngram-mod for a single slot, off for several. Measured at -np 4 with
 # four appending sessions, interleaved A-B-A-B: 133.95 and 97.70 t/s on against
 # 125.50 and 129.18 t/s off -- no benefit, plausibly a small cost. At -np 1 the
 # same switch was worth +68 % on verbatim reproduction and neutral-to-positive on
 # agentic chat at the card's sampling.
-SPEC="${SPEC:-$([ "${NP:-4}" -gt 1 ] && echo 0 || echo ngram-mod)}"
+#
+# Re-measured at the fleet shape (8 slots, 8 appending sessions, card sampling,
+# two interleaved reps each) including the *per-sequence* drafters, which exist
+# because the simple/mod tables are shared across sequences in this revision
+# ("shared across all sequences", common/speculative.cpp):
+#
+#   SPEC=0               113.8 / 123.3 t/s aggregate out
+#   SPEC=ngram-map-k     107.7 / 119.0
+#   SPEC=ngram-map-k4v   115.1 / 112.8
+#   SPEC=ngram-mod       109.7 /  99.5
+#   SPEC=ngram-cache      81.9 /  84.5   <- and 15-21 s turns
+#
+# Per-sequence tables do not rescue it: nothing beats off once eight sessions
+# share one decode step, so the default stays 0 for NP > 1.
+SPEC="${SPEC:-$([ "${NP:-8}" -gt 1 ] && echo 0 || echo ngram-mod)}"
 NMATCH="${NMATCH:-24}"   # n-gram lookup length (--spec-ngram-mod-n-match)
 NMIN="${NMIN:-48}"       # minimum draft length; shorter drafts are dropped
 NMAX="${NMAX:-64}"       # maximum draft length
@@ -257,6 +325,10 @@ for i in $(seq 0 $((INSTANCES - 1))); do
 done
 
 # Ctrl-C must reach every server: kill the whole group, which lets each guard
-# forward the signal to its own child.
-trap 'kill 0' INT TERM
+# forward the signal to its own child. Disarm the trap first: a *second* signal
+# (a supervisor's cleanup, a second Ctrl-C) used to run `kill 0` again, and a
+# double interrupt is what trips llama.cpp's shutdown-path assertion in
+# ggml_metal_device_free -- the server then aborts while still holding the port,
+# which the next launch sees as "address already in use".
+trap 'trap - INT TERM; kill 0' INT TERM
 wait

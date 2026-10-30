@@ -1,0 +1,6 @@
+serve: model=flint-int4-q4_1.gguf alias=flint ctx=131072/slot slots=8 instances=1 threads=8
+serve: -ngl 99 -lm mmap -b 2048 -ub 512 -ctk f16 -ctv f16 -fa on
+serve: speculative=0 n_match=24 n_min=48 n_max=64
+serve: kv≈3584 MiB/slot + swa 35 MiB/slot -> weights 24.21 GiB shared + 1 server(s) x 8 slot(s) x (3584 MiB kv)
+serve: kv=f16/f16  prompt-cache=0MiB  swap-cap=0MiB  http://127.0.0.1:8091..8091  logs: /Users/zach/qwenrunner/logs/serve.flint.8091.log
+{"bg_cpu_pct": 6.5, "cpu_busy_pct": 13.4, "exit_code": 0, "gpu_busy_pct_peak": 100, "gpu_mem_peak_mib": 57615.3, "log": "/Users/zach/qwenrunner/logs/serve.flint.8091.log", "mem_peak_mib": 84541.9, "rss_peak_mib": 57560.6, "samples": 42, "signals": [15, 15], "swap_baseline_mib": 0.0, "swap_delta_mib": 0.0, "swap_peak_mib": 0.0, "swap_violation": false, "timed_out": false, "tree_cpu_pct": 6.9, "wall_s": 45.202}

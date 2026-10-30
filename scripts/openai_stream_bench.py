@@ -2,10 +2,9 @@
 """Streaming benchmark against any OpenAI-compatible endpoint.
 
 Why this exists next to scripts/ngram_ab.py: llama-server reports a `timings`
-block, but a non-llama.cpp runtime (e.g. Recursive's own `rec`, which is MLX
-under the hood) does not. Comparing two runtimes on llama.cpp's own timing
-fields is not a fair comparison anyway, so this measures both stacks the same
-way -- from the wire:
+block, but not every OpenAI-compatible server does, and server-reported fields
+are not a fair way to compare two stacks anyway. This measures whatever is
+served the same way -- from the wire:
 
   TTFT        time from request to the first streamed token (the prefill cost)
   decode t/s  (n_out - 1) / (last_token_time - first_token_time), i.e. pure
@@ -14,7 +13,7 @@ way -- from the wire:
 
 Token counts come from the number of streamed deltas, cross-checked against the
 `usage` block when the server sends one (llama.cpp does not in streaming mode
-unless asked, MLX servers usually do).
+unless asked; some servers always do).
 
 Stdlib only. Serialized by design: run one arm at a time.
 """
@@ -64,8 +63,8 @@ def stream_once(url, payload, api_key):
                 if ch.get("finish_reason"):
                     finish = ch["finish_reason"]
                 d = ch.get("delta") or {}
-                # llama.cpp streams `reasoning_content`, Recursive's `rec` streams
-                # `reasoning`; both stream `content`. Count all three.
+                # llama.cpp streams `reasoning_content`, other servers may stream
+                # `reasoning`; all of them stream `content`. Count all three.
                 piece = ((d.get("content") or "") + (d.get("reasoning_content") or "")
                          + (d.get("reasoning") or ""))
                 if piece:
@@ -99,7 +98,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--base-url", required=True,
-                    help="e.g. http://127.0.0.1:8091/v1 or http://127.0.0.1:11500/v1")
+                    help="e.g. http://127.0.0.1:8091/v1")
     ap.add_argument("--model", default="flint")
     ap.add_argument("--api-key", default="")
     ap.add_argument("--label", default="", help="name for this arm in the output")

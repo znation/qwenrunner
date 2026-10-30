@@ -9,10 +9,12 @@ the Qwen-3.8-27B operating point in `README.md`, for the arithmetic reason that
 
 Everything below was measured on the M5 Max described in `README.md`, one model
 instance at a time, arms interleaved. Raw records are in `results/` and
-`logs/`; the harnesses are `scripts/ngram_ab.py` (speculative decoding A/B by
+`logs/`; the harnesses are `scripts/fleet_ab.py` (server configurations against
+the turn loop, interleaved), `scripts/turn_loop_bench.py` (the fleet workload:
+N appending transcripts), `scripts/ngram_ab.py` (speculative decoding A/B by
 workload) and `scripts/openai_stream_bench.py` (wire-level streaming benchmark
-that works against any OpenAI-compatible server, so llama.cpp and MLX are
-measured identically rather than through llama.cpp's own timings).
+that works against any OpenAI-compatible server, so its numbers are the
+wire's, not llama.cpp's own timings).
 
 **Text in, text out — there is no vision.** The card says so (`Input / output:
 Text / text`), the org publishes no vision sibling, and the checkpoint carries
@@ -31,47 +33,7 @@ So the `input: ["text"]` in the pi/omp catalog entries is a correct declaration,
 not a conservative one, and image work has to route to one of the vision models
 already in those catalogs.
 
-## Two runtimes, and the vendor's own engine wins
-
-| workload (streamed, same harness, 384-token responses) | llama.cpp | llama.cpp + n-gram | `rec` (MLX) | `rec` vs llama.cpp |
-| :---- | ---: | ---: | ---: | ---: |
-| copy-heavy prompt, 4.1k, temp 0 | 121.6 | 200-203 | **226.8** | 1.87x |
-| copy-heavy prompt, 4.1k, temp 1 | 118.0 | 156-203 | **213.7** | 1.81x |
-| markdown document, 30k, temp 0, chat | 80.0-95.5 | 72.7-96.4 | **141.4-141.8** | 1.5-1.8x |
-| agentic chat, 27k, temp 1 | 93.4 | 97.3 | **134.9** | 1.44x |
-| markdown continuation, 100k, temp 1 | 49.4-62.5 | 56.0-62.5 | **75.8-76.6** | ~1.4x |
-| prefill 27k, TTFT (warm, cache-busted) | 13.2 s | - | **9.4-9.5 s** | 1.4x |
-| prefill 100k, TTFT (warm, cache-busted) | 71.8-82.7 s | - | **45.4 s** | 1.7x |
-
-`rec` is Recursive's own engine for Apple Silicon
-([recursive-oss/rec](https://github.com/recursive-oss/rec), installed to
-`~/.local/bin/rec`): MLX plus Metal kernels (the runtime carries a Metal
-"megakernel" and per-architecture kernels), running the 4-bit MLX checkpoint
-(group-64 affine, 8-bit embeddings, bf16 KV) instead of the Q4_1 GGUF. Its
-README claims 1.4-2.6x over llama.cpp for this model on an M4 Pro, which is the
-same range measured independently here. Launch it with
-`scripts/serve_flint_rec.sh`; the llama.cpp path stays as
-`scripts/build_flint.sh` + `scripts/serve_flint.sh`.
-
-Practical difference for clients: `rec` serves **only** `/v1/chat/completions`
-(`/v1/completions` is a 404), so a raw-completion workload has to stay on
-llama.cpp. Note also that `rec`'s numbers above were taken through the chat
-endpoint, while llama.cpp's 30k/100k rows above are chat too -- the raw
-comparison cannot be made on this runtime.
-
-Quality caveat, not measured here: the two runtimes run *different* 4-bit
-checkpoints. Third-party scoring of the MLX release puts it at mean KL 0.0481,
-p99 0.730, 94.1 % top-1 against BF16 ([OsaurusAI card](https://huggingface.co/OsaurusAI/Flint-40B-A2.5B-JANGH2));
-no equivalent number is published for `RecursiveSI/flint-int4-gguf`. The speed
-comparison above is apples-to-apples; the quality comparison is not.
-
-## Slots and aggregate throughput: the reason to keep llama.cpp
-
-`rec` processes **one generation at a time** -- its docs say so ("overlapping
-requests can receive HTTP 429") and it measured so here: four concurrent
-requests came back in order, each at full engine speed (~220 t/s), for an
-aggregate of **173-175 t/s**, which is just the single-stream rate. Its
-aggregate is therefore *pinned* at whatever one stream does.
+## Slots and aggregate throughput
 
 llama-server `-np N` puts up to N requests into one decode step, and a step
 reads the weights once regardless of how many rows are in it, so extra rows
@@ -86,7 +48,6 @@ endpoint, 256-token responses, temp 0, `SPEC=0`:
 | `-np 4`, 4 concurrent, 4 *distinct* contents | 67-67 | 268.2 | - | - |
 | `-np 8`, 4 concurrent | 75.9-77.6 | 304-310 (no gain) | - | - |
 | `-np 8`, 8 concurrent | 47.4-61.6 | 376-488 | - | - |
-| `rec`, 4 concurrent | 217-226 (queued) | 173.5-175.2 | 124-140 (queued) | ~135 |
 
 Reading of that table:
 
@@ -102,30 +63,15 @@ Reading of that table:
   the same experts, shrinking the per-step expert read -- with four *distinct*
   contents NP=4 drops from 306 to 268 t/s (418 GB/s), which is the honest
   shallow number.
-* **At depth the comparison narrows to a tie, and the reason is instructive.**
-  A session's step at 27k walks its own cache (28 672 B/token, no sharing
-  across slots): 0.77 GB of KV against 1.56 GB of weights, so batching four
-  rows costs 3.1 GB + 1.56 GB per step. End to end, four sessions each
-  producing 1 024 tokens from 27k of context:
-
-  | | first pass (prefills included) | repeat pass |
-  | :---- | ---: | ---: |
-  | llama.cpp `-np 4` | 42.6 t/s wall-rate | **138.4** |
-  | `rec` (queued) | 52.2 | 42.9 |
-
-  The first pass is a wash. The repeat pass is not: llama.cpp's slots still
-  held the four conversations' KV, so the second pass skipped prefill entirely
-  (29.6 s of wall for 4 092 tokens), while rec re-prefilled all four (95.4 s).
-  [INFERENCE] That reads as slot-KV persistence on one side and a cache policy
-  that did not retain four 27k contexts on the other -- it is the measured wall
-  time, not the mechanism, that is solid.
-* **Runtime by concurrency.** One agent (even with appending turns): `rec` --
-  55.1 against 26.6 t/s aggregate with comparable TTFT, and 220 against 123 t/s
-  on a single stream. Two or more concurrent agents: llama.cpp with
-  `-np N` = the number of agents, because rec queues (30.5 s against 2.2 s of
-  TTFT at four sessions). At 27k/4 sessions with *fixed* prompts the two are
-  within ~15 % on decode alone (llama 158 against rec's ~135), so it is the
-  appending-transcript case and the concurrency that decide, not depth alone.
+* **At depth a slot is worth as much as the weights.** A session's step at 27k
+  walks its own cache (28 672 B/token, no sharing across slots): 0.77 GB of KV
+  against 1.56 GB of weights, so batching four rows costs 3.1 GB + 1.56 GB per
+  step. Four sessions each producing 1 024 tokens from 27k of context measured
+  42.6 t/s wall-rate on the first pass (prefills included) and **138.4 t/s** on
+  the repeat pass: the slots still held the four conversations' KV, so the
+  second pass skipped prefill entirely (29.6 s of wall for 4 092 tokens). That
+  persistence is the whole case for slots over fresh processes, and why `NP` is
+  the fleet's throughput knob.
 
 Not measured: speculative decoding with `-np` > 1. The n-gram drafter in this
 revision keeps one table shared across sequences ("shared across all
@@ -175,31 +121,21 @@ characters of context at turn 0, ~24.5k by turn 5), 256-token outputs, turns
 fired and measured per session -- `scripts/turn_loop_bench.py`, one server at a
 time, all rows from a loaded window (see 5):
 
-| sessions, runtime, window | TTFT p50 | TTFT p90 | TTFT max | turn wall p50 | aggregate out | aggregate prefill |
+| sessions, window | TTFT p50 | TTFT p90 | TTFT max | turn wall p50 | aggregate out | aggregate prefill |
 | :---- | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1, llama.cpp `-np 1`, loaded | 0.49 s | 0.59 s | 0.60 s | 9.8 s | 26.6 t/s | 607 t/s |
-| 1, `rec`, loaded | 0.76 s | 3.30 s | 3.33 s | **3.9 s** | **55.1 t/s** | 1256 t/s |
-| 4, llama.cpp `-np 4`, quiet box (load 9.7) | **1.19 s** | 4.78 s | 5.05 s | **5.5 s** | **171.6 t/s** | 4009 t/s |
-| 4, llama.cpp `-np 4`, loaded (128-170) | 2.18 s | 6.98 s | 8.19 s | 23.7 s | 43.0 t/s | 1004 t/s |
-| 4, `rec`, quiet-ish box (load 27-33) | 14.8 s | 18.3 s | 20.8 s | 17.0 s | 57.2 t/s | 1370 t/s |
-| 4, `rec`, loaded (130) | 30.5 s | 32.8 s | 34.7 s | 34.9 s | 29.4 t/s | 703 t/s |
+| 1, `-np 1`, loaded | 0.49 s | 0.59 s | 0.60 s | 9.8 s | 26.6 t/s | 607 t/s |
+| 4, `-np 4`, quiet box (load 9.7) | **1.19 s** | 4.78 s | 5.05 s | **5.5 s** | **171.6 t/s** | 4009 t/s |
+| 4, `-np 4`, loaded (128-170) | 2.18 s | 6.98 s | 8.19 s | 23.7 s | 43.0 t/s | 1004 t/s |
 
-The mechanism is **queueing, not re-prefill**. Both runtimes reuse prefixes for
-an appending transcript -- llama.cpp in its slot, rec in its cache -- so a turn
-costs its delta prefill and TTFT stays flat as context grows (llama.cpp ~0.5 s at
-one session, ~2.2 s at four; rec ~0.8 s at one). What differs is what happens
-when sessions overlap: llama.cpp decodes the four rows together, so each session
-keeps its own rate; rec takes them one at a time, so a turn's first token waits
-behind the other sessions' turns and the *p50 TTFT goes from 0.8 s to 30 s*.
-Per-session balance follows: llama.cpp's four sessions averaged 23.70-23.82 s
-per turn, rec's 29.1-34.0 s.
-
-So the serving shape inverts between one agent and several: **one agent, rec
-wins on throughput (55.1 against 26.6 t/s) with comparable first-token latency;
-several agents, llama.cpp with `-np N` wins on both** (43.0 against 29.4 t/s,
-and 2.2 s against 30.5 s of TTFT). An earlier version of this file attributed
-rec's 4-session TTFT to re-prefilling; the 1-session run disproves that and the
-number above is the correction.
+The mechanism is **queueing, not re-prefill**. A slot reuses its own KV prefix
+for an appending transcript, so a turn costs its delta prefill and TTFT stays
+flat as the context grows: ~0.5 s at one session, ~2.2 s at four, and the four
+sessions' per-turn wall stayed balanced at 23.70-23.82 s. What the slot count
+changes is what happens when sessions *overlap*: at `-np 1` the four turns
+serialize (TTFT 12.7, 32.2, 49.3, 66.6 s in item 1's table), at `-np 4` the four
+rows decode together so each session keeps its own rate, and at `-np 8` with only
+four sessions nothing improves -- slots beyond the real concurrency are wasted
+memory, which is why `NP` is sized to the fleet.
 
 **5. Absolute rates swing ~4x on this shared machine, and the cause is not the
 obvious one.** Paired A-B-A-B arms, llama.cpp `-np 4`, same 4x4 turn loop:
@@ -223,29 +159,176 @@ threads, it is not memory bandwidth, and an earlier revision of this file
 attributed it to "host-side scheduling" -- that is withdrawn, because the
 spinner test was designed to confirm it and instead refuted it. What is
 established is only that a shared machine moves these numbers by up to ~4x
-between windows, which is larger than every optimisation in this file except
-`rec` itself.
+between windows, which is larger than every optimisation in this file.
 
-Consequences for anyone tuning here: pick the runtime from the *structural*
-facts, which held in every window measured (multi-session llama.cpp beats rec by
-2-4x on throughput and 10x+ on turn TTFT, because batching and slot reuse are
-architectural), and treat absolute t/s as a range. The one number that stayed
+Consequences for anyone tuning here: pick the *structure* from the facts that
+held in every window measured -- slots, slot reuse and cross-slot batching are
+architectural -- and treat absolute t/s as a range. The one number that stayed
 tight across all windows is first-token latency for llama.cpp `-np 4`: 1.19-2.18 s
 p50 per turn, clean or loaded, which is what an agent's turn latency actually
 depends on.
 
-The four rows marked loaded come from windows with ambient load average 128-170
-and are 2-4x below their quiet-box counterparts; that window's cause is
-unresolved (item 5). The comparison within the window holds because the load was
-higher during the llama.cpp run than the rec run, so it was biased toward rec --
-and the same ordering appears on the quiet box, where llama.cpp `-np 4` measures
-171.6 t/s against rec's 57.2.
+The two rows marked loaded come from windows with ambient load average 128-170
+and are 4x below their quiet-box counterparts; that window's cause is unresolved
+(item 5), and the quiet-box run of the same configuration (171.6 t/s against
+43.0) is the control that says it is the window, not the configuration.
 
 Memory is the binding constraint once both slots and transcripts are real: f16
 KV is 28 672 B/token, so the KV floor is `NP x per-slot context x 28 KiB` --
 four 100k-token transcripts are 11.2 GiB, four 262 144-token ones are 28 GiB,
 on top of 24.21 GiB of weights. `-c` is the total (`CTX x NP`), and a session
 that outgrows its share is truncated rather than borrowing from a neighbour.
+
+## A fleet of harnesses: slots are the knob, CRAM is the rescue
+
+The tables above are one instance at a time with prompts built for the test. The
+shape this repo actually serves is a *fleet*: N harnesses, each holding its own
+transcript, each firing a turn when its own tool call returns. That workload is
+`scripts/turn_loop_bench.py` (N sessions, appending transcripts, 256-token
+turns), and `scripts/fleet_ab.py` runs it against interleaved server
+configurations -- one server at a time, arms alternating A-B-A-B -- so the arms
+share a window instead of a load average. Measured 2026-10-29, two interleaved
+reps per arm, ambient load 8-125 from other workloads on the box:
+
+| server config | sessions | aggregate out | aggregate prefill | TTFT p50 | turn wall p50 | RSS |
+| :---- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `-np 4`, CTX=131072 | 4 | 123.3 / 117.2 t/s | 2882 / 2739 t/s | 1.88 / 1.42 s | 7.3 / 8.3 s | 42.1 GiB |
+| `-np 8`, CTX=131072 | 8 | 143.4 / 140.0 t/s | 3349 / 3271 t/s | 2.00 / 1.90 s | 12.8 / 13.0 s | 59.3 GiB |
+| `-np 4`, CTX=131072, CRAM=0 | 8 | 79.7 / 79.9 t/s | 1836 / 1883 t/s | 13.2 / 12.1 s | 20.8 / 20.9 s | 40.2 GiB |
+| `-np 4`, CTX=131072, CRAM=4096 | 8 | 130.4 / 142.9 t/s | 3586 / 3425 t/s | 5.3 / 5.3 s | 9.4 / 9.6 s | 47.0 GiB |
+
+The first two rows and the last two are separate interleaved rounds (6 turns and
+4 turns respectively, two reps each); compare within a pair, and note that the
+slot-starved pair ran in the quieter window (its `-np 4` control would sit near
+the top of the first pair's spread, not at 79 t/s).
+
+Reading of that table:
+
+* **Slots >= concurrent sessions, or the fleet re-prefills every turn.** The
+  third row is the failure: eight conversations on four slots with the prompt
+  cache off, so each arriving turn takes a slot from a conversation whose KV is
+  then dropped -- every turn pays a whole-transcript prefill, and TTFT p50 goes
+  from ~2 s to 12-13 s while aggregate output *falls* to 80 t/s. This is not a
+  slow arm, it is a broken configuration, and it is the one that looks like "we
+  have four slots, let's point eight agents at it".
+* **CRAM is the rescue, not a substitute.** `--cache-ram 4096` keeps the
+  displaced conversations' KV in host RAM, and in the same window it turns the
+  third row into the fourth: 79.8 -> 136.7 t/s aggregate output (+71 %), prefill
+  1860 -> 3506 t/s (+88 %), TTFT p50 12.6 -> 5.3 s, turn wall 20.9 -> 9.5 s, for
+  +7 GiB of RSS. What it does not do is beat giving the fleet its own slots --
+  `-np 8` measured 141.7 t/s at TTFT p50 1.9 s for +10 GiB more -- because with
+  eight conversations on four slots the decode step still carries four rows.
+* **Eight sessions on eight slots is worth ~+12 % of total tokens** over four on
+  four: pooled over three `-np 8` runs and two `-np 4` runs (the table above plus
+  a second interleaved round at 4 turns), output aggregates 141.7 / 126.9 / 137.1
+  against 127.3 / 127.1 t/s and prefill 3310 / 3210 / 3182 against 2972 / 2813 --
+  so +6 % on output, +12 % on prefill, ~+12 % on the token count that matters,
+  at the same per-turn TTFT, for +16 GiB of KV. That is the whole reason
+  `serve_flint.sh` now defaults to `NP=8`: the fleet's tokens are ~96 % prefill
+  (3200 t/s of prefill against 135 t/s of output), and both rates rise with the
+  number of rows a step carries, so the slot count is the throughput knob.
+* **The RAM-saving alternative is `-np 4` plus CRAM**: 47.0 GiB against 57.5-59.3
+  for `-np 8`, at 136.7 against 141.7 t/s aggregate output, and the price is
+  first-token latency (TTFT p50 5.3 s against 1.9 s, because half the fleet is
+  waiting for a slot at any moment). When the machine has RAM to spare, slots
+  buy latency and throughput together; when it does not, CRAM is the cheaper
+  half of the same fix.
+* **RAM, measured** (RSS of the server process, weights included): 41.3-42.1
+  GiB at `-np 4`/CTX=131072, 57.5-59.3 GiB at `-np 8`/CTX=131072, 33.0 GiB at
+  `-np 4`/CTX=65536, +7-8 GiB with CRAM=4096 in use. The weights are 24.21 GiB of
+  that, so the KV is `NP x CTX x 28 KiB` plus a fixed ~35 MiB per slot for the
+  sliding-window layers -- the CTX block in `serve_flint.sh` is the table to
+  size from.
+
+### Tuning the fleet defaults
+
+Every knob a multi-harness fleet touches was then swept at the fleet shape itself
+(8 slots, 8 appending sessions, 4 turns, card sampling, interleaved reps with the
+arm order reversed each rep, one server at a time). One default changed:
+
+| knob | default | fleet measurement |
+| :---- | :---- | :---- |
+| `-b` (BATCH) | **4096** (was 2048) | pooled over seven interleaved runs each, in three windows: median 141.6 against 124.2 t/s aggregate out, prefill 3591 against 3405; 4096 wins six of the seven paired comparisons and one window is level, so read it as +12-14 % aggregate; turn wall p50 10.3 against 11.3 s; TTFT +0.5 s; RSS unchanged |
+| `-b 8192` | not taken | 143.1 t/s, no gain past 4096 |
+| `-ub` 1024 with `-b` 4096 | not taken | 139.6 against 148.9 |
+| `-t` (THREADS) | 8, unchanged | 12 measured 130.3 against 148.9 -- an artefact of arm order (see below) |
+| CRAM | 0, unchanged | 4096 *costs* ~9 % at 8 sessions / 8 slots (109.9 against 131.3) and is worth 1.6-2x when conversations exceed slots |
+| SPEC | 0 at NP > 1, unchanged | off 113.8 / 123.3; `ngram-map-k` 107.7 / 119.0; `ngram-map-k4v` 115.1 / 112.8; `ngram-mod` 109.7 / 99.5; `ngram-cache` 81.9 / 84.5 |
+
+Two notes on method, because both cost a run to learn:
+
+* **`-b` is invisible to llama-bench and to a single stream.** It caps the prompt
+  tokens one decode may carry, and only a *wave* of turn deltas (NP x ~900
+  tokens) is large enough to feel the cap; single-stream pp512 at d20000
+  (1651.6 / 1661.9 at 2048 against 1682.1 / 1658.5 at 4096) and tg128 are
+  identical. A batch default for a fleet cannot be inherited from the
+  single-stream tables above, only measured with the fleet harness.
+* **Arm order matters even when the arms interleave.** The first sweep ran the
+  same arm order every rep while the box's ambient load fell over the run, which
+  handed the last arm a 13 % "win" for `-t 12`; `scripts/fleet_ab.py` now
+  reverses the order on every other rep and the effect disappeared. The `-b`
+  result survives that control, and so does the CRAM result above.
+
+### Where a prefill token goes, and what the kernels can do
+
+Microbenchmarks (`test-backend-ops perf`, this revision, M5 Max) and the model's
+own depth curve bracket what is left on the table, and they say the two halves of
+a prefill token are limited by different things:
+
+| shape (Q4_1 unless noted) | achieved | the same shape, other kernel |
+| :---- | ---: | ---: |
+| dense GEMM 2048x512x2048 | **27.5 TFLOPS** | - |
+| MoE `mul_mat_id`, 256 experts / 6 used, same shape | **10.1 TFLOPS** | 27.5 dense |
+| MoE `mul_mat_id` at n=2048 tokens | 9.4 TFLOPS | 8.6 (down-proj shape) |
+| FA prefill, hsk=hsv=128, kv=16384, nb=512 | **70.7 TFLOPS** | 88.98 with GQA-8 |
+| FA prefill, kv=32768, nb=4096 | 17.2 TFLOPS | 19.2 at kv=4096 |
+| FA decode (vec), nb=1, kv=4096 | 0.74 TFLOPS | 0.51 at kv=32768 |
+
+* **The MoE expert GEMM is the biggest gap: 10.1 TFLOPS against 27.5 for the
+  dense path at the same dtype and shape.** In the model that is ~23 % of a
+  prefill token at depth (the routed experts cost 1.77 GFLOP/token against 1.18
+  for the two shared experts, which are plain dense matmuls and already run at
+  the 27 TFLOPS above). The kernel is not bandwidth-bound there (237 GB/s of
+  the ~510 available) and not row-padding-bound either -- it is the same
+  10.1 TFLOPS at 12 rows per expert (ub 512) and at 48 rows per expert (ub
+  2048) -- so the win would be in the tile/dispatch structure of
+  `kernel_mul_mm_id`, not in a flag.
+* **Prefill attention is fast when the KV is cache-resident and slow when it is
+  not.** The same kernel reads 70.7 TFLOPS at nb=512/kv=16384 and 17.2 at
+  nb=4096/kv=32768, and the model's own depth curve shows the same shape:
+  pp512 holds ~1670 t/s from d2048 to d8192 and then falls linearly (1368 at
+  d16384, 1090 at d32768), i.e. attention is flat while the per-layer KV fits in
+  cache and DRAM-bound past ~8k. Flint runs 32 query heads over 4 KV heads, so
+  each KV head's rows are read by eight query heads; the GQA-8 microbenchmark
+  (same FLOPs, one KV head instead of eight) is 26 % faster, which is that
+  sharing being partly served by cache and partly not.
+* **The shipped flash-attention tile is already the right one.** Widening the
+  query tile to 64 rows and halving the KV chunk (Q=64/C=32) measured 23 %
+  *slower* (14.7 against 19.2 TFLOPS at kv=4096/nb=4096, 13.0 against 17.2 at
+  kv=32768) and is reverted; the threadgroup-memory budget does not allow Q=64
+  with the 64-row chunk, and the smaller chunk costs more than the wider tile
+  wins.
+* **The tensor API is not a switch left unflipped here.** On M5 the Metal
+  backend routes both plain matmuls and `mul_mat_id` through the Metal 4 tensor
+  path already: `GGML_METAL_TENSOR_DISABLE=1` measures pp512 at d20000 at
+  701-836 t/s against 1431-1591 with it on, i.e. ~2x. The `ne11 % 64` condition
+  that sends non-multiple-of-64 KV lengths to the half8x8 kernel is real in the
+  microbenchmark (8.15 against 70.70 TFLOPS at nb=512) but costs only 3.4 % at
+  the model level (d20000 against d20032): the graph hands FA a KV length the
+  backend can use, so the microbenchmark overstates what the fallback costs in
+  the model.
+* **Backend switches are noise.** Paired pp512 at d20032 with
+  `GGML_METAL_CONCURRENCY_DISABLE`, `GGML_METAL_FUSION_DISABLE`,
+  `GGML_METAL_GRAPH_OPTIMIZE_DISABLE` and `GGML_OP_OFFLOAD_MIN_BATCH=1` all land
+  inside the base arms' own spread (1443-1584 t/s); the only consistent signal
+  is that concurrency *on* is 3.5-7 % better, which is the default.
+
+So the honest summary of this round: the fleet-level knobs are measured and now
+defaulted (8 slots, CRAM documented), the per-token knobs are at their best
+values, and the remaining wins are kernel work with named targets -- the MoE
+expert GEMM first (10.1 -> 27 TFLOPS would be ~1.2x on a depth-20k prefill
+token), GQA-aware attention second (1.6x on the attention term at depth, but
+only past the point where the KV stops fitting in cache).
 
 ## Where the time goes
 
@@ -398,9 +481,6 @@ default.
   family as the n-gram drafters, but it is an example binary with no batching,
   no prompt cache and no OpenAI surface, so it cannot be compared fairly
   against `llama-server`.
-* **MLX via mlx-lm.** Upstream mlx-lm has no Flint architecture; the MLX
-  weights are only usable through `rec`, which is why the comparison above is
-  against `rec` rather than against a hand-built MLX path.
 
 ## Reproduce
 
@@ -414,14 +494,34 @@ hf download RecursiveSI/flint-int4-gguf flint-int4-q4_1.gguf --local-dir models
 ./scripts/ngram_ab.py --prompt-file data/flint_agentic_30k.txt --chat \
     --arms base,ngram-mod --reps 2 --n-predict 384 --temperature -1
 
-# cross-runtime comparison through one harness (start one server, then the other)
+# fleet A/B: interleaved server configurations against the turn loop
+python3 scripts/fleet_ab.py --reps 2 --turns 6 \
+    --arm "np4:NP=4,sessions=4" --arm "np8:NP=8,sessions=8" \
+    --arm "np4cram:NP=4,sessions=8,CRAM=4096"
+
+# the fleet-default sweep (order alternates every rep; card sampling)
+python3 scripts/fleet_ab.py --reps 3 --turns 4 --temperature -1 \
+    --arm "b2048:NP=8,sessions=8,BATCH=2048" --arm "b4096:NP=8,sessions=8,BATCH=4096" \
+    --arm "b8192:NP=8,sessions=8,BATCH=8192" \
+    --arm "b4096t12:NP=8,sessions=8,BATCH=4096,THREADS=12" \
+    --arm "b4096u1k:NP=8,sessions=8,BATCH=4096,UBATCH=1024"
+
+# per-kernel ceilings and the tensor-API A/B. Build the test binary first --
+# note GGML_BUILD_TESTS must stay off at this revision (ggml/CMakeLists.txt
+# adds a ggml/tests subdirectory that the tree does not carry):
+#   cd third_party/llama-flint-build
+#   cmake -DGGML_BUILD_TESTS=OFF -DLLAMA_BUILD_TESTS=ON . && ninja test-backend-ops
+# the MoE shapes in the first command were added to tests/test-backend-ops.cpp
+# (256 experts / 6 used, Q4_1, m=512/k=2048 and m=2048/k=512, n = 1..2048)
+./third_party/llama-flint-build/bin/test-backend-ops perf -b MTL0 -o MUL_MAT_ID -p 'type_a=q4_1.*n_mats=256'
+./third_party/llama-flint-build/bin/test-backend-ops perf -b MTL0 -o FLASH_ATTN_EXT -p 'hsk=128,hsv=128'
+GGML_METAL_TENSOR_DISABLE=1 ./third_party/llama-flint-build/bin/llama-bench \
+    -m models/flint-int4-q4_1.gguf -ngl 99 -fa on -d 20000 -p 512 -n 0
+
+# wire-level streaming benchmark against the served endpoint
 ./scripts/serve_flint.sh &                                     # llama.cpp on 8091
 ./scripts/openai_stream_bench.py --base-url http://127.0.0.1:8091/v1 \
     --label llama --prompt-file data/flint_agentic_30k.txt --reps 2 --max-tokens 384
-./scripts/serve_flint_rec.sh &                                 # rec on 11500
-./scripts/openai_stream_bench.py --base-url http://127.0.0.1:11500/v1 \
-    --api-key "$(rec auth token)" --label rec \
-    --prompt-file data/flint_agentic_30k.txt --reps 2 --max-tokens 384
 ```
 
 Prompts added for these measurements: `data/flint_copy_prompt.txt` (verbatim

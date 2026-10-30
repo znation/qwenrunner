@@ -22,28 +22,24 @@ discarded and why.
 A second model lives in this repo, and on this machine it is the faster one:
 **Recursive Flint** (39.8 B total / ~2.5 B active MoE, Apache-2.0). ~5x this
 Qwen configuration's throughput, because 2.5 B parameters are read per token
-instead of 27 B. Two runtimes are wired up, and the measured winner is the
-model vendor's own Apple engine:
+instead of 27 B. It is served by llama.cpp, defaulted for the fleet this repo
+points at it (`NP=8`, one slot per concurrent harness):
 
-| workload (streamed, same harness) | llama.cpp | llama.cpp + n-gram | `rec` (MLX) |
-| :---- | ---: | ---: | ---: |
-| copy-heavy prompt, 4.1k, temp 0 | 121.6 | 200.7 | **226.8** |
-| markdown document, 30k, temp 0, chat | 80.0-95.5 | 72.7-96.4 | **141.4-141.8** |
-| agentic chat, 27k, temp 1 | 93.4 | 97.3 | **134.9** |
-| markdown continuation, 100k, temp 1 | 49.4-62.5 | 56.0-62.5 | **75.8-76.6** |
-| prefill 27k / 100k, TTFT | 13.2 s / 77 s | - | **9.4 s / 45.4 s** |
+| workload (streamed, same harness, one slot) | llama.cpp | llama.cpp + n-gram |
+| :---- | ---: | ---: |
+| copy-heavy prompt, 4.1k, temp 0 | 121.6 | **200.7** |
+| markdown document, 30k, temp 0, chat | 80.0-95.5 | 72.7-96.4 |
+| agentic chat, 27k, temp 1 | 93.4 | 97.3 |
+| markdown continuation, 100k, temp 1 | 49.4-62.5 | 56.0-62.5 |
+| prefill 27k / 100k, TTFT | 13.2 s / 77 s | - |
 
-* `./scripts/build_flint.sh` + `./scripts/serve_flint.sh` — the llama.cpp path
-  (`SPEC=ngram-mod` by default: draft-free speculation is lossless and worth
-  +66-72 % on copy-heavy text, +195-270 % on a raw 30k continuation, +4 % on
-  agentic chat at the card's sampling, and -6-19 % on *greedy* agentic chat,
-  which wants `SPEC=0`. Batch defaults are 2048/512, not the card's 256/128:
-  those cost 85 % of prefill at 27k)
-* `./scripts/serve_flint_rec.sh` — the `rec` path, 1.4-1.9x decode and 2.6x
-  prefill over llama.cpp here, matching the vendor's own 1.4-2.6x claim. It is
-  the faster choice for **one** agent; for several concurrent harnesses it
-  queues one generation at a time (30.5 s against 2.2 s of turn-level TTFT at
-  four sessions), so the llama.cpp path with `NP=N` takes over there
+* `./scripts/build_flint.sh` + `./scripts/serve_flint.sh` — the serving path,
+  `-np 8` slots and `-b 4096 -ub 512` by default. Draft-free n-gram speculation
+  is lossless and worth +66-72 % on copy-heavy text at one slot, so
+  `SPEC=ngram-mod` is the single-slot default; at `NP>1` it is off, where it
+  measured neutral-to-negative with the drafter's table shared across sequences.
+  The card's batch values (256/128) cost 85 % of prefill at 27k, and 4096 is
+  worth ~+13 % aggregate over 2048 once several slots prefill at once.
 
 [`FLINT.md`](FLINT.md) has the full picture: the roofline (llama.cpp sustains
 193-220 GB/s of the 510-530 GB/s this machine delivers, flat across depth),
@@ -370,8 +366,10 @@ pointing at Qwen.
 Its base URL is `http://127.0.0.1:8091/v1` — `serve_flint.sh`'s port, distinct
 from `serve.sh`'s 8090, so both models can be up at once — and the model id is
 llama-server's `--alias flint`. `contextWindow` mirrors the *per-slot* context
-(`CTX`, default 131072): with `NP=4` a session that outgrows its slot is
-truncated rather than borrowing a neighbour's, so keep the two in step.
+(`CTX`, default 131072): with `NP=8` slots a session that outgrows its slot is
+truncated rather than borrowing a neighbour's, so keep the two in step. The
+slot count is sized for the fleet (`NP=8`, one per concurrent harness) --
+FLINT.md, "A fleet of harnesses", has the measured reason and the RAM table.
 
 Unlike the Qwen entries, `supportsDeveloperRole: true`: the Flint chat template
 defines a `<|developer|>` role and llama-server passes it through — verified by
