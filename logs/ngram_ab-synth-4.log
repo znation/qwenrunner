@@ -1,3 +1,0 @@
-0.00.046.017 W srv  llama_server: security: no API key is set and CORS allows all origins (see https://github.com/ggml-org/llama.cpp/pull/25655)
-0.02.055.440 W spec common_specu: synthetic speculative acceptance is enabled for benchmarking; generated output is not valid
-0.02.060.543 W srv          init: chat template supports preserving reasoning, it is enabled by default (may use more tokens, disable via --no-reasoning-preserve)

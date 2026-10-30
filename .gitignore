@@ -13,7 +13,7 @@ __pycache__/
 *.pyo
 
 # Rewritten on every ./serve.sh run, and any snapshot taken of one mid-session
-# (e.g. logs/serve.flint.8091.log.pre-fa-patch).
+# (e.g. logs/serve.8090.log.pre-fa-patch).
 logs/serve*.log
 logs/serve*.log.*
 logs/serve*.err

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Streaming benchmark against any OpenAI-compatible endpoint.
 
-Why this exists next to scripts/ngram_ab.py: llama-server reports a `timings`
+Why this exists: llama-server reports a `timings`
 block, but not every OpenAI-compatible server does, and server-reported fields
 are not a fair way to compare two stacks anyway. This measures whatever is
 served the same way -- from the wire:
@@ -98,11 +98,11 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--base-url", required=True,
-                    help="e.g. http://127.0.0.1:8091/v1")
-    ap.add_argument("--model", default="flint")
+                    help="e.g. http://127.0.0.1:8090/v1")
+    ap.add_argument("--model", default="qwen3.8-27b")
     ap.add_argument("--api-key", default="")
     ap.add_argument("--label", default="", help="name for this arm in the output")
-    ap.add_argument("--prompt-file", default="data/flint_agentic_30k.txt")
+    ap.add_argument("--prompt-file", default="data/prompt_30k.txt")
     ap.add_argument("--chat", action="store_true", default=True)
     ap.add_argument("--raw", dest="chat", action="store_false",
                     help="use /completions (raw prompt) instead of /chat/completions")

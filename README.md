@@ -17,39 +17,6 @@ discarded and why.
 > carries that configuration. On Apple Silicon the problem is different and
 > much smaller: one Metal device, one memory pool, and the entire model fits.
 
-## Second model: Flint
-
-A second model lives in this repo, and on this machine it is the faster one:
-**Recursive Flint** (39.8 B total / ~2.5 B active MoE, Apache-2.0). ~5x this
-Qwen configuration's throughput, because 2.5 B parameters are read per token
-instead of 27 B. It is served by llama.cpp, defaulted for the fleet this repo
-points at it (`NP=8`, one slot per concurrent harness):
-
-| workload (streamed, same harness, one slot) | llama.cpp | llama.cpp + n-gram |
-| :---- | ---: | ---: |
-| copy-heavy prompt, 4.1k, temp 0 | 121.6 | **200.7** |
-| markdown document, 30k, temp 0, chat | 80.0-95.5 | 72.7-96.4 |
-| agentic chat, 27k, temp 1 | 93.4 | 97.3 |
-| markdown continuation, 100k, temp 1 | 49.4-62.5 | 56.0-62.5 |
-| prefill 27k / 100k, TTFT | 13.2 s / 77 s | - |
-
-* `./scripts/build_flint.sh` + `./scripts/serve_flint.sh` — the serving path,
-  `-np 8` slots and `-b 4096 -ub 512` by default. Draft-free n-gram speculation
-  is lossless and worth +66-72 % on copy-heavy text at one slot, so
-  `SPEC=ngram-mod` is the single-slot default; at `NP>1` it is off, where it
-  measured neutral-to-negative with the drafter's table shared across sequences.
-  The card's batch values (256/128) cost 85 % of prefill at 27k, and 4096 is
-  worth ~+13 % aggregate over 2048 once several slots prefill at once. The Metal
-  4 tensor path stays on: only its flash-attention kernel is wrong in this
-  revision, so `scripts/patches/0001-metal-flash-attn-disable-tensor-path.patch`
-  sends FA to the half8x8 kernels and leaves `mul_mm` on the tensor path, worth
-  +34-52 % prefill over the all-or-nothing `GGML_METAL_TENSOR_DISABLE=1`.
-
-[`FLINT.md`](FLINT.md) has the full picture: the roofline (llama.cpp sustains
-193-220 GB/s of the 510-530 GB/s this machine delivers, flat across depth),
-why the MoE matvec has no tensor-op path below 32 rows, the speculation results
-by workload with their protocols, and what was deliberately not done.
-
 ## Result
 
 | lever | setting | evidence |
@@ -341,10 +308,6 @@ through pi's `models.json`).
 | pi | `~/.pi/agent/models.json` | provider `qwenrunner`, model `qwen3.8-27b`, cost 0 |
 | omp | `~/.omp/agent/models.yml` | same provider and model |
 
-`~/tumwater/tumwater.json` no longer names this provider: its `model.default`
-is Flint and its `strong` tier is DeepSeek V4-Flash-0731 — see
-[Flint](#flint) below.
-
 Two properties are load-bearing:
 
 * **It must price at zero.** tumwater's budget gate refuses a priced fallback
@@ -358,41 +321,6 @@ Two properties are load-bearing:
 * **`reasoning: true`** — the model emits `reasoning_content` before its answer
   (verified on `/v1/chat/completions`), so a small `max_tokens` can be consumed
   entirely by thinking and return empty `content`.
-
-### Flint
-
-Flint is wired into the same two catalogs as a second local provider,
-`flintrunner`, so a harness can pick it per task — and `~/tumwater/tumwater.json`
-runs its `default` tier on it, so `./scripts/serve_flint.sh` must be up for the
-authoring roles (and the `small`-tier readme) to run at all. The `strong` tier
-stays on the paid DeepSeek model: plan, director, the reviewer and the conflict
-resolver.
-
-| client | file | entry |
-|---|---|---|
-| pi | `~/.pi/agent/models.json` | provider `flintrunner`, model `flint`, cost 0, `contextWindow` 131072 |
-| omp | `~/.omp/agent/models.yml` | same provider and model |
-| tumwater | `~/tumwater/tumwater.json` | `model.default` `flintrunner/flint` (default tier), `model.strong` `huggingface/deepseek-ai/DeepSeek-V4-Flash-0731:deepinfra` |
-
-No `fallback` is configured, so at the daily cap every tier resolves to pause
-and the team holds — the free default tier included — until local midnight or
-the cap moves. Declaring `"fallback": "flintrunner/flint"` would keep the
-authoring roles running then, at the price of dropping the `strong` seams to
-Flint too (they borrow the default tier's pair rather than pausing).
-
-Flint's base URL is `http://127.0.0.1:8091/v1` — `serve_flint.sh`'s port, distinct
-from `serve.sh`'s 8090, so both models can be up at once — and the model id is
-llama-server's `--alias flint`. `contextWindow` mirrors the *per-slot* context
-(`CTX`, default 131072): with `NP=8` slots a session that outgrows its slot is
-truncated rather than borrowing a neighbour's, so keep the two in step. The
-slot count is sized for the fleet (`NP=8`, one per concurrent harness) --
-FLINT.md, "A fleet of harnesses", has the measured reason and the RAM table.
-
-Unlike the Qwen entries, `supportsDeveloperRole: true`: the Flint chat template
-defines a `<|developer|>` role and llama-server passes it through — verified by
-sending a `developer` message, which returns a normal answer (and an
-`openai-completions` tool call verified separately: `finish_reason: tool_calls`,
-`read_file({"path": "/etc/hosts"})`).
 
 ## Harness
 

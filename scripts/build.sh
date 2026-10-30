@@ -14,11 +14,10 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-# Source checkout, build directory and log directory are all overridable so a
-# second configuration (scripts/build_flint.sh: same flags, different llama.cpp
-# revision) can reuse this script instead of copying the flag list. The defaults
-# are the pinned checkout this repo's numbers were measured on, and the tracked
-# logs/ path those numbers cite.
+# Source checkout, build directory and log directory are all overridable so an
+# alternate configuration can reuse this script instead of copying the flag
+# list. The defaults are the pinned checkout this repo's numbers were measured
+# on, and the tracked logs/ path those numbers cite.
 LLAMA_DIR="${LLAMA_DIR:-$ROOT/third_party/llama.cpp}"
 BUILD_DIR="${BUILD_DIR:-$ROOT/build}"
 LOG_DIR="${LOG_DIR:-$ROOT/logs}"

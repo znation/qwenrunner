@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Agentic turn-loop benchmark: N concurrent sessions, each with a growing transcript.
 
-What this models, and why the other harnesses here don't: `ngram_ab.py` sends one
-fixed prompt per arm, and `openai_stream_bench.py --concurrency N` sends N copies
-of one prompt. A real coding harness does neither. It holds a transcript, sends
-it every turn, gets back reasoning + a patch/tool call, appends both, and does it
+What this models, and why a simpler harness doesn't: `openai_stream_bench.py
+--concurrency N` sends N copies of one prompt. A real coding harness does not.
+It holds a transcript, sends it every turn, gets back reasoning + a patch/tool
+call, appends both, and does it
 again -- so every turn is a *different* prompt, sharing a prefix with the previous
 turn, with a short output. That is the workload the slot and prefill behaviour
 has to be judged on.
@@ -167,9 +167,9 @@ def pct(vals, q):
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--base-url", required=True, help="e.g. http://127.0.0.1:8091/v1")
+    ap.add_argument("--base-url", required=True, help="e.g. http://127.0.0.1:8090/v1")
     ap.add_argument("--api-key", default="")
-    ap.add_argument("--model", default="flint")
+    ap.add_argument("--model", default="qwen3.8-27b")
     ap.add_argument("--label", default="")
     ap.add_argument("--sessions", type=int, default=4)
     ap.add_argument("--turns", type=int, default=6)
