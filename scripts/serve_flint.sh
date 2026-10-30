@@ -37,7 +37,7 @@
 # the pin did not move.
 #
 # Overridable via env:
-#   MODEL CTX NP INSTANCES PORT HOST THREADS NGL LM BATCH UBATCH CTK CTV FA CRAM ALIAS SWAPCAP
+#   MODEL CTX NP INSTANCES PORT HOST THREADS NGL LM BATCH UBATCH CTK CTV FA TENSOR CRAM ALIAS SWAPCAP
 #
 #   ./scripts/serve_flint.sh                  # one full-context slot on 8091
 #   NP=4 ./scripts/serve_flint.sh             # four harnesses, -14 GiB KV
@@ -179,6 +179,18 @@ CTK="${CTK:-f16}"
 CTV="${CTV:-f16}"
 FA="${FA:-on}"
 
+# Metal 4 tensor API off by default: in this build its flash-attention kernel is
+# wrong for prompt batches, and every prompt past a few dozen tokens decodes as
+# word salad (2026-10-30: a 19-token question answered "Columbia", the same
+# question behind a 97-token paragraph returned gibberish, idle server and raw
+# llama-completion at temp 0 alike). llama.cpp's own check agrees:
+# `test-backend-ops test -b MTL0 -o FLASH_ATTN_EXT -p 'hsk=128,hsv=128'` fails
+# 41/558 with ERR = inf, all at nb >= 64, and passes 558/558 with this set.
+# FA=off also fixes the output; this keeps FA on. TENSOR=1 restores the tensor
+# path -- check the op test first.
+TENSOR="${TENSOR:-0}"
+if [ "$TENSOR" = 0 ]; then export GGML_METAL_TENSOR_DISABLE=1; fi
+
 # Server prompt cache in host RAM (--cache-ram). Default 0. Note what 0 does
 # *not* disable -- a slot still reuses its own KV prefix, so an appending
 # transcript prefills only the delta; CRAM only covers a conversation *displaced*
@@ -306,7 +318,7 @@ KV_MIB=$(python3 -c "print(int($CTX*$BYTES/1048576))")
 SWA_MIB=$(python3 -c "print(int(35*513*4*128*2*($(kv_bytes_per_tok "$CTK")+$(kv_bytes_per_tok "$CTV"))/2/1048576))")
 
 echo "serve: model=$(basename "$MODEL") alias=$ALIAS ctx=$CTX/slot slots=$NP instances=$INSTANCES threads=$THREADS"
-echo "serve: -ngl $NGL -lm $LM -b $BATCH -ub $UBATCH -ctk $CTK -ctv $CTV -fa $FA"
+echo "serve: -ngl $NGL -lm $LM -b $BATCH -ub $UBATCH -ctk $CTK -ctv $CTV -fa $FA metal-tensor=$TENSOR"
 echo "serve: speculative=${SPEC}${NMATCH:+ n_match=$NMATCH n_min=$NMIN n_max=$NMAX}"
 echo "serve: kv≈${KV_MIB} MiB/slot + swa ${SWA_MIB} MiB/slot -> weights 24.21 GiB shared + ${INSTANCES} server(s) x ${NP} slot(s) x (${KV_MIB} MiB kv)"
 echo "serve: kv=$CTK/$CTV  prompt-cache=${CRAM}MiB  swap-cap=${SWAPCAP}MiB  http://$HOST:$PORT..$((PORT + INSTANCES - 1))  logs: $ROOT/logs/serve.flint.$PORT.log"
