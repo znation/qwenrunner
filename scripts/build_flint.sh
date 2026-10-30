@@ -55,6 +55,22 @@ if [ "$have" != "$REV" ]; then
   git -C "$WORKTREE" checkout --detach "$REV"
 fi
 
+# Local patches. The worktree is a pinned upstream revision, so anything this repo
+# needs on top of it lives as a tracked patch in scripts/patches/ and is applied
+# here, idempotently: a worktree that already carries a patch is left alone.
+for patch in "$ROOT"/scripts/patches/*.patch; do
+  [ -e "$patch" ] || continue
+  if git -C "$WORKTREE" apply --reverse --check "$patch" 2>/dev/null; then
+    echo "build_flint: already applied $(basename "$patch")"
+  elif git -C "$WORKTREE" apply --check "$patch" 2>/dev/null; then
+    git -C "$WORKTREE" apply "$patch"
+    echo "build_flint: applied $(basename "$patch")"
+  else
+    echo "build_flint: cannot apply $(basename "$patch") -- worktree is dirty or the pin moved?" >&2
+    exit 1
+  fi
+done
+
 echo "build_flint: llama.cpp at $(git -C "$WORKTREE" log --oneline -1)"
 # Build logs go inside the (gitignored) build directory on purpose: logs/ is
 # tracked in this repo as measurement evidence, and logs/build.log documents the

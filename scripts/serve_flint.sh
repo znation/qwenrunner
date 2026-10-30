@@ -179,16 +179,19 @@ CTK="${CTK:-f16}"
 CTV="${CTV:-f16}"
 FA="${FA:-on}"
 
-# Metal 4 tensor API off by default: in this build its flash-attention kernel is
-# wrong for prompt batches, and every prompt past a few dozen tokens decodes as
-# word salad (2026-10-30: a 19-token question answered "Columbia", the same
-# question behind a 97-token paragraph returned gibberish, idle server and raw
-# llama-completion at temp 0 alike). llama.cpp's own check agrees:
-# `test-backend-ops test -b MTL0 -o FLASH_ATTN_EXT -p 'hsk=128,hsv=128'` fails
-# 41/558 with ERR = inf, all at nb >= 64, and passes 558/558 with this set.
-# FA=off also fixes the output; this keeps FA on. TENSOR=1 restores the tensor
-# path -- check the op test first.
-TENSOR="${TENSOR:-0}"
+# Metal 4 tensor API on by default. It is worth ~2x on prefill at depth -- pp512
+# @d20000 measures 1431-1591 t/s on it against 701-836 with
+# GGML_METAL_TENSOR_DISABLE=1 -- and in this revision the one consumer that is
+# wrong is the tensor-API flash-attention kernel: `test-backend-ops test -b MTL0
+# -o FLASH_ATTN_EXT -p 'hsk=128,hsv=128'` fails 41/558 with ERR = inf at nb >= 64
+# (and a model that reaches it decodes word salad from the prompt), while MUL_MAT
+# passes with the same path on. scripts/patches/0001-metal-flash-attn-disable-
+# tensor-path.patch sends FA to the half8x8 kernels and leaves mul_mm on the
+# tensor path, which is why this script no longer exports the variable: the old
+# disable was all-or-nothing, so it spent the whole ~2x to avoid a path worth
+# ~3.4% (d20000 against d20032, FLINT.md). Rebuild with scripts/build_flint.sh
+# after touching that patch. TENSOR=0 restores the old global disable.
+TENSOR="${TENSOR:-1}"
 if [ "$TENSOR" = 0 ]; then export GGML_METAL_TENSOR_DISABLE=1; fi
 
 # Server prompt cache in host RAM (--cache-ram). Default 0. Note what 0 does

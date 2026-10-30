@@ -12,6 +12,12 @@ __pycache__/
 *.pyc
 *.pyo
 
-# Rewritten on every ./serve.sh run.
+# Rewritten on every ./serve.sh run, and any snapshot taken of one mid-session
+# (e.g. logs/serve.flint.8091.log.pre-fa-patch).
 logs/serve*.log
+logs/serve*.log.*
 logs/serve*.err
+
+# Ad-hoc session captures -- op checks and one-off benches whose numbers are
+# quoted in the docs. The docs carry the result, so these are not tracked.
+logs/fa-tensor-patch-optest.log

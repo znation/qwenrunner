@@ -39,7 +39,11 @@ points at it (`NP=8`, one slot per concurrent harness):
   `SPEC=ngram-mod` is the single-slot default; at `NP>1` it is off, where it
   measured neutral-to-negative with the drafter's table shared across sequences.
   The card's batch values (256/128) cost 85 % of prefill at 27k, and 4096 is
-  worth ~+13 % aggregate over 2048 once several slots prefill at once.
+  worth ~+13 % aggregate over 2048 once several slots prefill at once. The Metal
+  4 tensor path stays on: only its flash-attention kernel is wrong in this
+  revision, so `scripts/patches/0001-metal-flash-attn-disable-tensor-path.patch`
+  sends FA to the half8x8 kernels and leaves `mul_mm` on the tensor path, worth
+  +34-52 % prefill over the all-or-nothing `GGML_METAL_TENSOR_DISABLE=1`.
 
 [`FLINT.md`](FLINT.md) has the full picture: the roofline (llama.cpp sustains
 193-220 GB/s of the 510-530 GB/s this machine delivers, flat across depth),

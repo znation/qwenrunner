@@ -308,15 +308,33 @@ a prefill token are limited by different things:
   kv=32768) and is reverted; the threadgroup-memory budget does not allow Q=64
   with the 64-row chunk, and the smaller chunk costs more than the wider tile
   wins.
-* **The tensor API is not a switch left unflipped here.** On M5 the Metal
-  backend routes both plain matmuls and `mul_mat_id` through the Metal 4 tensor
-  path already: `GGML_METAL_TENSOR_DISABLE=1` measures pp512 at d20000 at
-  701-836 t/s against 1431-1591 with it on, i.e. ~2x. The `ne11 % 64` condition
-  that sends non-multiple-of-64 KV lengths to the half8x8 kernel is real in the
-  microbenchmark (8.15 against 70.70 TFLOPS at nb=512) but costs only 3.4 % at
-  the model level (d20000 against d20032): the graph hands FA a KV length the
-  backend can use, so the microbenchmark overstates what the fallback costs in
-  the model.
+* **The tensor API is not a switch left unflipped here, and only one of its two
+  consumers is wrong.** In this revision `has_tensor` reaches exactly two places:
+  `ggml_metal_library_get_pipeline_mul_mm` (the dense GEMM -- the two dense
+  layers, the 94 shared-expert matrices, `output.weight`) and the
+  flash-attention gate in `ggml-metal-ops.cpp`. `mul_mat_id` never consults it,
+  which is why the MoE check passes either way. The whole-path cost is real --
+  `GGML_METAL_TENSOR_DISABLE=1` measures pp512 at d20000 at 701-836 t/s against
+  1431-1591 with it on, ~2x in that interleaved window. But the tensor-API
+  *flash-attention* kernel is wrong for prompt batches:
+  `test-backend-ops test -b MTL0 -o FLASH_ATTN_EXT` fails 41/558 at nb >= 64 with
+  ERR = inf, and a model that reaches it decodes word salad from the prompt --
+  while FA is worth only ~3.4 % of a prefill token at depth. The `ne11 % 64`
+  condition that sends non-multiple-of-64 KV lengths to the half8x8 kernel is
+  real in the microbenchmark (8.15 against 70.70 TFLOPS at nb=512) but costs
+  only 3.4 % at the model level (d20000 against d20032). So the env var is the
+  wrong lever: it spends the whole ~2x to avoid a path worth ~3.4 %.
+  `scripts/patches/0001-metal-flash-attn-disable-tensor-path.patch` routes FA to
+  the half8x8 kernels and leaves `mul_mm` on the tensor path, which is what
+  `serve_flint.sh` now defaults to (`metal-tensor=1`, variable not exported).
+  Measured paired A-B-A-B on a fleet-free box, r=3, pp512 @ d20000: **1337.19 ±
+  8.76 and 1173.93 ± 47.25 t/s** patched against **876.77 ± 27.46 and 880.23 ±
+  11.60** with the disable, i.e. +34 % to +52 % of prefill recovered. With the
+  patch the filtered and full `FLASH_ATTN_EXT` suites and `MUL_MAT` all pass with
+  the tensor path on, and a live patched server answers a 19-token question
+  (Bogotá) and recovers a needle from 222- and 1073-token prompts. The earlier
+  in-tree figures for tensor-on prefill (1589 t/s at 30k in the
+  `serve_flint.sh` header) describe this patched shape, not the disabled one.
 * **Backend switches are noise.** Paired pp512 at d20032 with
   `GGML_METAL_CONCURRENCY_DISABLE`, `GGML_METAL_FUSION_DISABLE`,
   `GGML_METAL_GRAPH_OPTIMIZE_DISABLE` and `GGML_OP_OFFLOAD_MIN_BATCH=1` all land
@@ -486,6 +504,7 @@ default.
 
 ```bash
 ./scripts/build_flint.sh                     # llama.cpp with Flint support (PR #30928)
+                                             # + scripts/patches/*.patch, applied there
 hf download RecursiveSI/flint-int4-gguf flint-int4-q4_1.gguf --local-dir models
 
 # speculative A/B by workload (interleaved arms, one instance at a time)

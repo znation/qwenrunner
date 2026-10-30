@@ -1,0 +1,26 @@
+diff --git a/ggml/src/ggml-metal/ggml-metal-ops.cpp b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+index fc856b5b2..cd212c0cb 100644
+--- a/ggml/src/ggml-metal/ggml-metal-ops.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+@@ -3135,6 +3135,21 @@ static bool ggml_metal_op_flash_attn_ext_use_kv_f16(const ggml_tensor * op) {
+ static bool ggml_metal_op_flash_attn_ext_use_tensor(const ggml_tensor * op, bool has_tensor) {
+     assert(op->op == GGML_OP_FLASH_ATTN_EXT);
+ 
++    // Local patch -- scripts/patches/0001-metal-flash-attn-disable-tensor-path.patch
++    //
++    // The Metal 4 tensor-API flash-attention kernel in this revision is wrong for
++    // prompt batches. `test-backend-ops test -b MTL0 -o FLASH_ATTN_EXT` fails
++    // 41/558 at nb >= 64 with ERR = inf, and a model that reaches it decodes as
++    // word salad from the first token (97..1567-token probes, idle server, raw
++    // llama-completion at temp 0 alike). GGML_METAL_TENSOR_DISABLE=1 fixes the
++    // output, but it is all-or-nothing: it also switches the tensor path off for
++    // mul_mm, and that is where the ~2x prefill lives -- pp512 at d20000 measures
++    // 701-836 t/s with the variable set against 1431-1591 without it, while FA
++    // itself is worth ~3.4% there (d20000 against d20032). So keep the tensor API
++    // and send FA to the half8x8 kernels instead. The original gate stays below so
++    // that this patch reverts cleanly (`git apply -R`) once upstream fixes it.
++    return false;
++
+     if (!has_tensor || ggml_metal_op_flash_attn_ext_use_vec(op)) {
+         return false;
+     }
