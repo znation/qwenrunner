@@ -315,8 +315,8 @@ back, `THREADS=8` is the untested knob.
 
 `serve.sh` advertises the model as **`qwen3.8-27b`** (llama-server's `--alias`,
 overridable with `ALIAS`). Without an alias the server reports the GGUF's own
-name, which changes with the file, so every client would have to track it — the
-three configs below all name this string.
+name, which changes with the file, so every client would have to track it — both
+catalogs below name this string.
 
 The API is OpenAI-compatible at `http://127.0.0.1:8090/v1`; the API key is a
 placeholder that llama-server ignores.
@@ -329,21 +329,24 @@ service, and a liveness probe on that port cannot tell "up" from "forwarded".
 While the server runs, its specific `127.0.0.1` bind wins and requests reach it,
 so nothing was broken by 8080; the move makes the down case honest. Any port the
 local cluster does not publish works — `PORT` overrides it, and the two
-catalogs below must move with it (tumwater's entry names no URL: it routes
+catalogs below must move with it (tumwater names no URL of its own: it routes
 through pi's `models.json`).
 
 | client | file | entry |
 |---|---|---|
 | pi | `~/.pi/agent/models.json` | provider `qwenrunner`, model `qwen3.8-27b`, cost 0 |
 | omp | `~/.omp/agent/models.yml` | same provider and model |
-| tumwater | `~/tumwater/tumwater.json` | `fallbackModel: { provider: qwenrunner, model: qwen3.8-27b }` |
+
+`~/tumwater/tumwater.json` no longer names this provider: its `model.default`
+is Flint and its `strong` tier is DeepSeek V4-Flash-0731 — see
+[Flint](#flint) below.
 
 Two properties are load-bearing:
 
 * **It must price at zero.** tumwater's budget gate refuses a priced fallback
   (it would spend past the cap), so the catalog entries carry
   `cost: {input: 0, output: 0, ...}` like the other local providers. Verified
-  with the harness's own doctor:
+  with the harness's own doctor while this pair was tumwater's fallback:
   `ok fallback — qwenrunner/qwen3.8-27b — priced at zero (cost n/a), serving not verified`.
   "Serving not verified" is the doctor's normal wording for a free pair: only the
   fallback's own ticks can prove the backend answers, and **the server must be
@@ -355,15 +358,25 @@ Two properties are load-bearing:
 ### Flint
 
 Flint is wired into the same two catalogs as a second local provider,
-`flintrunner`, so a harness can pick it per task; tumwater's fallback is left
-pointing at Qwen.
+`flintrunner`, so a harness can pick it per task — and `~/tumwater/tumwater.json`
+runs its `default` tier on it, so `./scripts/serve_flint.sh` must be up for the
+authoring roles (and the `small`-tier readme) to run at all. The `strong` tier
+stays on the paid DeepSeek model: plan, director, the reviewer and the conflict
+resolver.
 
 | client | file | entry |
 |---|---|---|
 | pi | `~/.pi/agent/models.json` | provider `flintrunner`, model `flint`, cost 0, `contextWindow` 131072 |
 | omp | `~/.omp/agent/models.yml` | same provider and model |
+| tumwater | `~/tumwater/tumwater.json` | `model.default` `flintrunner/flint` (default tier), `model.strong` `huggingface/deepseek-ai/DeepSeek-V4-Flash-0731:deepinfra` |
 
-Its base URL is `http://127.0.0.1:8091/v1` — `serve_flint.sh`'s port, distinct
+No `fallback` is configured, so at the daily cap every tier resolves to pause
+and the team holds — the free default tier included — until local midnight or
+the cap moves. Declaring `"fallback": "flintrunner/flint"` would keep the
+authoring roles running then, at the price of dropping the `strong` seams to
+Flint too (they borrow the default tier's pair rather than pausing).
+
+Flint's base URL is `http://127.0.0.1:8091/v1` — `serve_flint.sh`'s port, distinct
 from `serve.sh`'s 8090, so both models can be up at once — and the model id is
 llama-server's `--alias flint`. `contextWindow` mirrors the *per-slot* context
 (`CTX`, default 131072): with `NP=8` slots a session that outgrows its slot is
