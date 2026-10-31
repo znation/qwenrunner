@@ -315,8 +315,9 @@ pair, with no error in the server log. Do not mix. [INFERENCE: whether the
 mixed pair hits a degenerate kernel path or an unbounded dequant loop is not
 established — nothing in the log says, and this was not bisected.]
 
-**This changed the shipped default twice.** The default is now `NP=4 CTK=q4_0
-CTV=q4_0 CRAM=4096`, because this machine shares its 128 GB with the user's
+**This changed the shipped default twice.** The dtype default is now `CTK=q4_0
+CTV=q4_0 CRAM=4096` (with `NP=4` at the time; the slot count was later
+raised to 8 for the fleet -- "The fleet shape"), because this machine shares its 128 GB with the user's
 other workloads (local Kubernetes clusters) and the KV cache is the part of the
 footprint that has to give: four q4_0 slots reserve 8 GiB of KV where four f16
 slots reserved 32, and the cache ceiling drops from 24 GiB to 4. Paired in one
@@ -636,18 +637,28 @@ continuation) concurrency costs; where it is not (lower acceptance, more
 compute per token) concurrency *adds* until the GPU saturates. Both are real,
 and which one you get depends on the traffic.
 
-**Recommendation.** `serve.sh` defaults to `NP=4 CTK=CTV=q4_0 CRAM=4096` and
-`INSTANCES=1`: four concurrent agent sessions at the RAM-first dtype, which is
-the configuration the user chose once q4_0 made the KV cheap. Note the per-slot
-cost is *not* the 2 GiB of KV — each slot also carries Metal compute and draft
-buffers, and the measured all-in cost is ~5 GiB per extra slot, paired in one
-session with `CRAM=4096`: `NP=2` 32.4 GiB free, `NP=3` 28.1, `NP=4` 22.6. So
-`NP=2 ./serve.sh` buys 10 GiB back at half the concurrency, and `NP=1
-CRAM=8192 ./serve.sh` is the minimal-footprint configuration.
+**Recommendation.** `serve.sh` defaults to `NP=8 CTK=CTV=q4_0 MTP=0 CRAM=4096`
+and `INSTANCES=1`: one slot per harness for tumwater's `maxConcurrent: 8`, at
+the RAM-first dtype, speculation off — "The fleet shape" below is the
+measurement behind both. The slot count is the memory knob: a slot carries
+Metal compute buffers and the model's per-sequence state as well as its 2 GiB
+of 128k KV, so the all-in cost is ~3 GiB per slot at 64k/slot and ~4 at 128k
+(`-np 8` measured 39.4 GiB summed at 64k/slot, 41.5 GiB at `CTX=131072` with
+22k-token transcripts). `NP=2 ./serve.sh` gives ~19 GiB back at two sessions;
+`NP=1 MTP=1 ./serve.sh` is the single interactive stream, where speculation is
+worth +180 % on patterned text.
 For N concurrent clients: `NP=N` (one port, one process, cheapest memory, most
 slots) or `INSTANCES=N` (N ports, separate processes, marginally better measured
 per-stream at N=4 but half the headroom and a hard ceiling at 4). Pick slots for
 capacity, processes for isolation.
+
+**For the fleet this repo serves**, N is tumwater's `maxConcurrent` — 8 — and the
+fleet measurement ("The fleet shape", below) settles the shape: one process with
+`NP=8 MTP=0` measures 37.7-48.0 t/s at TTFT p50 2.2 s and 39 GiB, against
+34.8-39.9 t/s at 3.6-3.9 s and 54-56 GiB for `INSTANCES=2 NP=4`, and 27.6-28.7
+t/s at 6.1-7.0 s and 83-85 GiB for `INSTANCES=4 NP=2`. The `NP=4` default above
+is four sessions' worth of slots; eight sessions on four slots is the failure
+mode in that section, not a smaller version of the same thing.
 
 ### The N=4 gap is real but small, and it is confounded
 
@@ -669,6 +680,138 @@ get their own `-t 4` CPU thread pool (16 threads total), while `-np 4` shares
 one `-t 4` pool across all four slots. The measured 8 % may be CPU scheduling
 for the sampling and SSM steps rather than anything about batching. Raising
 `THREADS` for the slot configuration is the obvious test and was not run.
+
+## The fleet shape — N harnesses, one transcript each
+
+Every table above feeds the server one prompt, N copies of one prompt, or a
+progression of depths. The shape this repo actually serves is a *fleet*: N
+harnesses, each holding its own transcript, each firing a turn when its own tool
+call returns. `scripts/turn_loop_bench.py` is that workload (N sessions, one
+corpus slice each as the "repo" they are working on, then turns of generate ->
+append the assistant text -> append a tool observation), and `scripts/fleet_ab.py`
+drives it against interleaved server configurations -- one server at a time, arm
+order reversed every rep, each arm's window characterised by load average, GPU
+peak and RSS.
+
+The fleet is tumwater's, and its own session logs say what to size against: 31
+sessions and 3 915 turns give transcript p50 **30.7k** tokens (p90 80.6k, max
+135k), per-turn *uncached* input p50 **1.0k** (p90 4.8k), output p50 198 (p90
+1 360), and `maxConcurrent: 8` (five feature + three bugfix instances, the
+periodic roles sharing the cap).
+
+Measured 2026-10-30, 8 sessions, 4 turns, card sampling, `CTX=65536`, `q4_0` KV,
+summed RSS over the server processes (weights counted in each), ambient load
+0.9-5.5; `results/fleet_qwen.jsonl` and `results/fleet_qwen.sweep1.jsonl`.
+**The two tables are separate interleaved windows; compare within one.**
+
+Slots vs sessions, and one process vs several (all MTP off, three reps for the
+first three rows -- two of them interleaved in one window -- and two for the
+rest):
+
+| serving shape | aggregate out | prefill | TTFT p50 | turn wall p50 | summed RSS |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| **one process, `-np 8`** (8 slots / 8 sessions) | **37.7 / 43.4 / 46.4 t/s** | 946 / 994 / 1019 | **2.17 / 2.26 / 2.30 s** | 41.3 / 34.3 / 34.1 s | **39.4 GiB** |
+| 2 processes, `INSTANCES=2 -np 4` | 38.4 / 39.9 / 34.8 t/s | 905 / 907 / 812 | 3.93 / 3.86 / 3.64 s | 42.0 / 41.2 / 42.9 s | 54.0-56.1 GiB |
+| 4 processes, `INSTANCES=4 -np 2` | 28.7 / 27.8 / 27.6 t/s | 672 / 678 / 630 | 6.15 / 6.46 / 6.97 s | 60.9 / 60.6 / 63.1 s | 83.1-85.2 GiB |
+| one process, `-np 4`, `CRAM=4096` (4 slots / 8 sessions) | 21.9 / 21.7 t/s | 503 / 477 | 49.7 / 62.6 s | 83.2 / 91.4 s | 28.5 GiB |
+| one process, `-np 4`, `CRAM=0` (4 slots / 8 sessions) | 20.0 / 18.7 t/s | 439 / 433 | 63.2 / 64.0 s | 100.5 / 103.4 s | 22.2 GiB |
+
+The knobs a fleet touches, in one window (`-np 8`, 8 sessions, two reps each,
+arm order reversed on the second rep):
+
+| config | aggregate out | prefill | TTFT p50 | turn wall p50 | summed RSS |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| **MTP off** | **46.6 / 48.0 t/s** | 1044 / 1088 | **2.24 / 2.18 s** | **34.0 / 32.6 s** | **38.5 GiB** |
+| MTP on (`NMAX=6`, the former default) | 33.2 / 32.2 t/s | 729 / 736 | 4.35 / 4.02 s | 53.9 / 53.5 s | 55.1 GiB |
+| MTP on, `BATCH=4096` | 32.6 / 33.6 t/s | 739 / 738 | 4.73 / 5.92 s | 54.1 / 56.4 s | 55.8 GiB |
+| `-np 12`, MTP on -- 12 slots for 8 sessions | 30.0 / 32.1 t/s | 672 / 722 | 4.60 / 4.90 s | 55.0 / 52.7 s | 65.3 GiB |
+
+**One slot per harness is the whole design.** A turn from a conversation that
+still holds its slot prefills only its delta: TTFT p50 2.2 s, turn wall 34 s,
+aggregate 46 t/s at 39 GiB. Take the slots away and the same eight
+conversations cost their whole transcript *every turn* -- TTFT p50 39-77 s per
+turn at `-np 4`, aggregate down to 22 t/s, and the server log confirms it
+(`prompt eval time = 13 556 ms / 7066 tokens`, a full-length prefill on each
+turn rather than the ~1k-token delta). That is 18-35x the steady-state
+first-token latency for half the throughput.
+
+**More processes do not buy the slots back.** `INSTANCES=2 -np 4` is level with
+`-np 8` on aggregate within the noise (38.4/39.9/34.8 against 37.7/43.4/46.4,
+and it lost both paired reps of the second window), costs 1.7 s more TTFT, and
+15-17 GiB more RAM. `INSTANCES=4 -np 2` loses on all three axes at once: 28 t/s,
+6.5 s TTFT, 84 GiB. Each process carries its own row budget -- the same 8 slots
+spread over 4 processes means 2 rows per decode step instead of 8 -- plus its own
+copy of the compute buffers and its own weight working set.
+
+**Slots beyond the fleet's concurrency are wasted memory.** `-np 12` at 8
+sessions measures the same as `-np 8` (30.0/32.1 against 33.2/32.2 with MTP on,
+both windows) for +10 GiB. `NP` is sized to `maxConcurrent`, not to a round
+number.
+
+**MTP costs 45 % at eight slots and is the wrong default for this workload.**
+Same window, one arm apart: MTP off 46.6/48.0 t/s and TTFT 2.18-2.24 s against
+33.2/32.2 t/s and 4.02-4.35 s with the shipped `NMAX=6`, at +16.6 GiB of
+draft/verify buffers. The mechanism is the draft head running *per sequence*
+while the main model's batch already carries eight rows: the server logs draft
+acceptance of 0.27-0.39 at its own sampling defaults (`serve.sh` passes no
+`--temp`/`--top-k`, so turns are sampled, not greedy), so each verify batch is
+mostly discarded work that the other seven slots wait on. Speculation pays on a
+single stream and stops paying the moment the GPU is saturated by other
+conversations -- the same result the fleet sweep found for n-gram speculation on
+the previous model, and the same rule: it is a workload choice, not a constant.
+
+**The RAM cache does not give the slots back.** The two `-np 4` rows of the
+first table *are* the cache doing its job: `CRAM=4096` buys 21.9/21.7 t/s against
+20.0/18.7 with `CRAM=0`, and TTFT p50 49.7/62.6 s against 63.2/64.0 s -- a
+10-15 % improvement on a shape whose first token arrives 23-29x later than one
+slot per harness's. The reason is the price of an entry, which llama.cpp logs
+itself when it makes room:
+
+| conversation | logged `prompt state size` | `--cache-ram 512` |
+| ---: | ---: | :--- |
+| 1.9-2.6k tokens | **637-820 MiB** | `exceeds cache size limit 512.000 MiB, skipping` |
+| 7.1-7.8k tokens | **1 140-1 150 MiB** | saved, then evicted |
+| ~9.0k tokens | **762-934 MiB** | `exceeds cache size limit 512.000 MiB, skipping` |
+
+A 2.6k-token conversation holds 40 MiB of q4_0 attention KV. Its cached state
+measures 650 MiB, so ~0.6 GiB of it is *not* that conversation's KV -- it is the
+hybrid model's per-sequence state, which the README's "constant ~10 MiB of
+SSM/conv state per sequence" understates by ~60x. (That guess is also why the
+old sizing rule -- "entries are cut to the conversation's actual length", 13.5k
+tokens ~ 0.6 GiB -- looked right: the 0.65 GiB per entry was measured correctly,
+and attributed to the wrong term. It is roughly 0.65 GiB *regardless* of the
+conversation's length at these sizes.) Two consequences:
+
+* `CRAM=4096` holds 3-6 entries. Eight conversations on four slots need four of
+  them alive at once, so the cache thrashes -- 17 `removing oldest entry` lines
+  in one 4-turn run -- and every turn re-prefills the whole transcript anyway.
+* The budget is `(sessions - slots) x ~1 GiB` at this transcript size, not
+  `(sessions - slots) x KV-per-conversation`. For eight sessions on four slots
+  that is `CRAM=8192`, and the prediction holds: at `8192` the same shape
+  measures **31.7 t/s, TTFT p50 24.2 s, 37.1 GiB** with 5 evictions instead of
+  17, against 21.9/21.7 t/s and 49.7/62.6 s at `4096` and 20.0/18.7 t/s and
+  63.2/64.0 s at `0`. The cache recovers **69 % of the throughput** of one slot
+  per harness at 94 % of its RAM -- but not the latency: 24.2 s of TTFT against
+  2.2 s, because half the fleet still waits for a slot before it can start.
+
+**At the fleet's real depth.** The tables above open each transcript at ~3.4k
+tokens; tumwater's p50 is 30.7k. Re-run with 22k-token openings, `CTX=131072`,
+two turns, one rep, ambient load 7-10 (not a clean window -- read the shape, not
+the digits):
+
+| | turn 0: the cold wave (8 x 22k = 176k tokens) | turn 1: the delta (~1k tokens) |
+| --- | --- | --- |
+| one process, `-np 8` | TTFT spread **44-339 s** across the eight sessions | **TTFT 2-3 s**, decode 6-11 t/s |
+| `INSTANCES=2 -np 4` | TTFT spread **84-308 s** | TTFT 3-4 s, decode 5-7 t/s |
+
+The first turn is the same 176k tokens of prefill in both shapes -- slots change
+only how many of the eight ride it at once, which is the 2x on the wall clock,
+not on the work. Every turn after that is the delta the design exists for, and
+at 22k depth a delta still costs 2-3 s of TTFT against 2.2 s at 3.4k: the
+*prefill* cost of a turn barely moves with depth, which is why one slot per
+harness survives the fleet's real transcript sizes. Decode is what depth costs
+(6-11 t/s at 22k against 25-45 t/s shallow, consistent with the depth curve
+above).
 
 ## The prefill cache — the knob that matters most for agentic use
 
@@ -726,7 +869,8 @@ at q4_0 (64 KiB/token and down; the load footprints above confirm the f16 figure
 — `NP=4` f16 is weights 14.3 + 4x8 KV + ~4 compute = 50.3). So `CRAM=65536` at
 f16 would commit 50 + 64 = 114 GiB on top of the 39 GiB other tenants hold, i.e.
 153 GiB on a 128 GB machine: it does not fit. **The shipped default is now `q4_0/q4_0` with
-`CRAM=4096` at `NP=4`**, chosen by the user after the f16 default (`NP=2`, 128k,
+`CRAM=4096` at `NP=8`** (4 when this was measured; the slot count moved with the
+fleet -- "The fleet shape"), chosen by the user after the f16 default (`NP=2`, 128k,
 `CRAM=24576`) measured 106.2 GiB used / 21.5 GiB free while serving and left
 less room than local Kubernetes clusters need. The q4_0 four-slot default
 measures 105.0 / 22.6, and drops to 95.9 / 32.4 at `NP=2` and 99.8 / 28.1 at

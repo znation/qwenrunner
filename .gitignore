@@ -21,3 +21,8 @@ logs/serve*.err
 # Ad-hoc session captures -- op checks and one-off benches whose numbers are
 # quoted in the docs. The docs carry the result, so these are not tracked.
 logs/fa-tensor-patch-optest.log
+
+# Per-arm server traces: guard.py's per-request log, one file per port per arm.
+# The arm's own stdout (serve.sh's header + guard's JSON summary) stays tracked
+# as logs/fleet_ab.<arm>.log; these are the raw timings the docs quote.
+logs/fleet_ab.*/

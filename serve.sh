@@ -24,14 +24,13 @@
 #
 # Overridable via env (anything unset is derived):
 #   MODEL CTX NP INSTANCES PORT THREADS HOST NGL LM BATCH UBATCH CTK CTV FA
-#   MTP MD NGLD NMAX CRAM SLOT_SAVE ALIAS SWAPCAP
+#   MTP MD NGLD NMAX CRAM SLOT_SAVE ALIAS SWAPCAP LOG_DIR
 #
-#   ./serve.sh                          # 4 agent slots at q4_0, 4 GiB cache, NMAX=6
-#   NP=2 ./serve.sh                     # +9 GiB of free RAM, two sessions
+#   ./serve.sh                          # the fleet default: 8 slots, MTP off
+#   NP=1 MTP=1 ./serve.sh               # one interactive stream (MTP pays there)
+#   NP=2 ./serve.sh                     # +19 GiB of free RAM, two sessions
 #   CTK=f16 CTV=f16 CRAM=8192 ./serve.sh # +20 t/s at depth, at -12 GiB of free RAM
-#   NP=1 CRAM=8192 ./serve.sh           # single session, minimal footprint
-#   INSTANCES=4 ./serve.sh              # four servers, ports 8090-8093
-#   MTP=0 ./serve.sh                    # no speculative decoding
+#   INSTANCES=4 NP=2 ./serve.sh         # four servers, ports 8090-8093
 # Extra args are appended verbatim to every llama-server command line.
 set -euo pipefail
 
@@ -60,15 +59,19 @@ INSTANCES="${INSTANCES:-1}"
 # allocations) -- see RESULTS.md, "Parallel prompts". -c is the total, so it
 # scales with NP to keep every slot at full CTX.
 #
-# Default 4: one slot per concurrent agent session, which is what this repo is
-# for. With the q4_0 KV default the *cache* side is nearly free -- 2 GiB of KV
-# per 128k slot -- but a slot also carries its own Metal compute and draft
-# buffers, and the measured all-in cost is ~5 GiB per extra slot, not 2. Paired
-# in one session, CRAM=4096: NP=2 32.4 GiB free, NP=3 28.1, NP=4 22.6. So four
-# slots still leave more headroom than the f16 configuration did (21.5), for
-# four slots instead of two; NP=2 buys another 9 GiB back at half the
-# concurrency.
-NP="${NP:-4}"
+# Default 8: tumwater's `maxConcurrent` -- one slot per harness, which is what
+# this repo serves. The count is not a preference: eight appending transcripts
+# on four slots re-prefill in full on every turn (TTFT p50 49.7-62.6 s against
+# 2.2 s, aggregate output 22 against 46 t/s), and slots beyond the fleet buy
+# nothing (-np 12 at 8 sessions measures the same as -np 8 for +10 GiB).
+# `-c` is the total, so it scales with NP to keep every slot at full CTX.
+#
+# Cost, at the q4_0 KV default: a slot is not just its 2 GiB of 128k KV -- it
+# carries Metal compute buffers and the model's per-sequence state too -- so
+# budget ~3 GiB per slot at 64k/slot and ~4 at 128k. Measured `-np 8` summed
+# RSS: 39.4 GiB at 64k/slot, 41.5 GiB at CTX=131072 with 22k-token transcripts.
+# Set NP to the fleet's concurrency; above it is RAM nobody reads.
+NP="${NP:-8}"
 TOTAL_CTX=$(( CTX * NP ))
 # 8090, not llama-server's 8080. On this machine Rancher Desktop's Lima port
 # forwarder holds a *wildcard* *:8080 on the host, so a request to
@@ -144,12 +147,16 @@ CTK="${CTK:-q4_0}"
 CTV="${CTV:-q4_0}"
 FA="${FA:-on}"
 
-# MTP speculation: the biggest single lever on the Intel host (+97.8 %) and it
-# is cheaper here, because the draft head is offloaded to the GPU too (-ngld
-# 99) instead of running on the CPU. Default draft file is the sidecar when it
-# is present; otherwise the main GGUF's own blk.64.nextn.* tensors are used by
-# `--spec-type draft-mtp` with no -md.
-MTP="${MTP:-1}"
+# MTP speculation. Off by default, because of the shape this server is sized
+# for: at eight live slots the draft head runs *per sequence* while the main
+# batch already carries eight rows, and it measured 33.2/32.2 t/s against
+# 46.6/48.0 with it off, at +16.6 GiB of draft/verify buffers (RESULTS.md, "The
+# fleet shape"). It is a single-stream lever -- `NP=1 MTP=1 ./serve.sh` -- worth
+# +180 % on patterned text (markdown/code/JSON, 99 % draft acceptance) and -11 %
+# on free-form prose, and 28.2 against 15.2 t/s at 98.6k depth. The default
+# draft file is the sidecar when it is present; otherwise the main GGUF's own
+# blk.64.nextn.* tensors are used by `--spec-type draft-mtp` with no -md.
+MTP="${MTP:-0}"
 MD="${MD:-$ROOT/models/mtp-Qwen3.8-27B-Q4_0.gguf}"
 NGLD="${NGLD:-99}"
 # Depth of speculation. 6, because this repo serves agent/code traffic and that
@@ -275,12 +282,12 @@ else
     echo "serve: mtp=off"
 fi
 echo "serve: kv≈${KV_MIB} MiB/slot -> weights 15.4 GB shared + ${INSTANCES} server(s) x ${NP} slot(s) x (${KV_MIB} MiB kv)"
-echo "serve: kv=$CTK/$CTV  prompt-cache=${CRAM}MiB${SLOT_SAVE:+  disk-tier=$SLOT_SAVE}  swap-cap=${SWAPCAP}MiB  http://$HOST:$PORT..$((PORT + INSTANCES - 1))  logs: $ROOT/logs/serve.$PORT.log"
+echo "serve: kv=$CTK/$CTV  prompt-cache=${CRAM}MiB${SLOT_SAVE:+  disk-tier=$SLOT_SAVE}  swap-cap=${SWAPCAP}MiB  http://$HOST:$PORT..$((PORT + INSTANCES - 1))  logs: ${LOG_DIR:-$ROOT/logs}/serve.$PORT.log"
 
 for i in $(seq 0 $((INSTANCES - 1))); do
     port=$((PORT + i))
     python3 "$ROOT/scripts/guard.py" --swap-cap-mib "$SWAPCAP" \
-        --log "$ROOT/logs/serve.$port.log" -- \
+        --log "${LOG_DIR:-$ROOT/logs}/serve.$port.log" -- \
         "$SERVER" \
         -m "$MODEL" --alias "$ALIAS" -ngl "$NGL" -c "$TOTAL_CTX" -np "$NP" -t "$THREADS" \
         -lm "$LM" -b "$BATCH" -ub "$UBATCH" \
@@ -291,6 +298,9 @@ for i in $(seq 0 $((INSTANCES - 1))); do
 done
 
 # Ctrl-C must reach every server: kill the whole group, which lets each guard
-# forward the signal to its own child.
-trap 'kill 0' INT TERM
+# forward the signal to its own child. Disarm first -- the trap runs again on the
+# second signal (one from the group, one from `kill 0`), and llama.cpp's Metal
+# teardown asserts if it is signalled twice mid-shutdown, which leaves an
+# aborting server still holding the port.
+trap 'trap - INT TERM; kill 0' INT TERM
 wait

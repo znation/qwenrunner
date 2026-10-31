@@ -114,7 +114,7 @@ def chunker(text, want_chars):
             i = 0
 
 
-def session_loop(sid, slice_text, args, records, errors):
+def session_loop(sid, slice_text, url, args, records, errors):
     try:
         obs_gen = chunker(slice_text, args.obs_chars)
         start = slice_text[:args.initial_chars]
@@ -124,9 +124,10 @@ def session_loop(sid, slice_text, args, records, errors):
                      "Summarise what it does, then suggest one concrete improvement."
                      % (sid, start)}]
         for turn in range(args.turns):
-            r = stream_chat(args.base_url, args.api_key, args.model, messages,
+            r = stream_chat(url, args.api_key, args.model, messages,
                             args.max_tokens, args.temperature)
             rec = {
+                "label": args.label,
                 "session": sid, "turn": turn, "ttft_s": r["ttft_s"], "wall_s": r["wall_s"],
                 "decode_s": r["decode_s"], "n_out": r["n_out"],
                 "prompt_tokens": r["prompt_tokens"],
@@ -168,6 +169,9 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--base-url", required=True, help="e.g. http://127.0.0.1:8090/v1")
+    ap.add_argument("--base-urls", default=None,
+                    help="comma-separated endpoints for INSTANCES>1; sessions are "
+                         "dealt round-robin across them, overriding --base-url")
     ap.add_argument("--api-key", default="")
     ap.add_argument("--model", default="qwen3.8-27b")
     ap.add_argument("--label", default="")
@@ -186,15 +190,17 @@ def main(argv=None):
     args = ap.parse_args(argv)
 
     corpus = open(os.path.join(ROOT, args.corpus)).read()
-    args.base_url = args.base_url.rstrip("/") + "/chat/completions"
+    urls = [u.strip().rstrip("/") + "/chat/completions"
+            for u in (args.base_urls.split(",") if args.base_urls else [args.base_url])]
     size = len(corpus) // args.sessions
     slices = [corpus[i * size:(i + 1) * size + args.initial_chars] for i in range(args.sessions)]
     print("%s: %s sessions=%d turns=%d max_tokens=%d corpus=%s (%.1fk chars/session)"
-          % (args.label or "turn-loop", args.base_url, args.sessions, args.turns,
+          % (args.label or "turn-loop", ",".join(urls), args.sessions, args.turns,
              args.max_tokens, os.path.basename(args.corpus), size / 1000))
 
     records, errors = [], []
-    threads = [threading.Thread(target=session_loop, args=(i, slices[i], args, records, errors))
+    threads = [threading.Thread(target=session_loop,
+                                args=(i, slices[i], urls[i % len(urls)], args, records, errors))
                for i in range(args.sessions)]
     t0 = time.time()
     for t in threads:

@@ -1,0 +1,7 @@
+serve: model=Qwen3.8-27B-UD-Q4_K_S.gguf alias=qwen3.8-27b ctx=65536/slot slots=4 instances=2 threads=4
+serve: -ngl 99 -lm mmap -b 1024 -ub 256 -ctk q4_0 -ctv q4_0 -fa on
+serve: mtp=off
+serve: kv≈1024 MiB/slot -> weights 15.4 GB shared + 2 server(s) x 4 slot(s) x (1024 MiB kv)
+serve: kv=q4_0/q4_0  prompt-cache=4096MiB  swap-cap=0MiB  http://127.0.0.1:8090..8091  logs: /Users/zach/qwenrunner/logs/fleet_ab.i2np4nm_rep2/serve.8090.log
+{"bg_cpu_pct": 3.8, "cpu_busy_pct": 4.4, "exit_code": -6, "gpu_busy_pct_peak": 100, "gpu_mem_peak_mib": 42834.2, "log": "/Users/zach/qwenrunner/logs/fleet_ab.i2np4nm_rep2/serve.8090.log", "mem_peak_mib": 58175.0, "rss_peak_mib": 26983.6, "samples": 210, "signals": [15, 15], "swap_baseline_mib": 0.0, "swap_delta_mib": 0.0, "swap_peak_mib": 0.0, "swap_violation": false, "timed_out": false, "tree_cpu_pct": 0.6, "wall_s": 222.767}
+{"bg_cpu_pct": 3.8, "cpu_busy_pct": 4.4, "exit_code": -6, "gpu_busy_pct_peak": 100, "gpu_mem_peak_mib": 42834.2, "log": "/Users/zach/qwenrunner/logs/fleet_ab.i2np4nm_rep2/serve.8091.log", "mem_peak_mib": 58173.5, "rss_peak_mib": 29064.3, "samples": 210, "signals": [15, 15], "swap_baseline_mib": 0.0, "swap_delta_mib": 0.0, "swap_peak_mib": 0.0, "swap_violation": false, "timed_out": false, "tree_cpu_pct": 0.7, "wall_s": 222.767}
