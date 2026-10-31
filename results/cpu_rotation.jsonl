@@ -1,0 +1,5 @@
+{"req": "A", "prompt_n": 2175, "prompt_ms": 56457.3, "predicted_n": 4, "wall_s": 60.67, "slot_cache": [null, 0], "np": "2", "mtp": "1"}
+{"req": "B", "prompt_n": 2177, "prompt_ms": 65825.7, "predicted_n": 4, "wall_s": 68.75, "slot_cache": [0, 0], "np": "2", "mtp": "1"}
+{"req": "C", "prompt_n": 2179, "prompt_ms": 65164.9, "predicted_n": 4, "wall_s": 74.2, "slot_cache": [0, 0], "np": "2", "mtp": "1"}
+{"req": "A", "prompt_n": 4, "prompt_ms": 5270.1, "predicted_n": 4, "wall_s": 11.24, "slot_cache": [0, 0], "np": "2", "mtp": "1"}
+{"req": "B", "prompt_n": 4, "prompt_ms": 5454.6, "predicted_n": 4, "wall_s": 11.43, "slot_cache": [0, 0], "np": "2", "mtp": "1"}

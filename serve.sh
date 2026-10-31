@@ -60,6 +60,9 @@ MMPROJ_OFFLOAD="${MMPROJ_OFFLOAD:-0}"
 # CTX to buy depth back (CTX = NP * the slot size you want) — at the cost of
 # layers — or lower it to buy layers back if generation speed matters more.
 CTX="${CTX:-131072}"
+# Re-measured on the shipped 0/66-layer path (-ngl 0, -lm mmap, depth 0):
+# 8 -> 42.72 pp / 1.40 tg, 12 -> 41.93 / 1.54, 16 -> 35.08 / 0.90. All-CPU does
+# not change the conclusion the split reached: 4-12 are equivalent, 16 is worse.
 THREADS="${THREADS:-8}"
 HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-8080}"
@@ -116,6 +119,14 @@ DCTV="${DCTV:-q4_0}"
 DNMAX="${DNMAX:-6}"
 DPMIN="${DPMIN:-0.5}"
 
+# NP=2 is the measured ceiling on both paths. Without the eGPU a second slot
+# buys total throughput — 1.02 -> 1.47/1.52 t/s generation on prose, each stream
+# down to ~0.8 of solo (results/cpu_concurrency.jsonl) — where the split
+# measured slots as fairness only (91.4 s serialised vs 100.0 s concurrent).
+# -np 4 is worse on both axes (total 1.67 vs 1.97, per stream 0.42 vs 0.98,
+# prefill 7-9 vs 33 t/s) for half the slot, so do not raise NP to add sessions:
+# a third session round-trips through two slots and resumes from the host prompt
+# cache in ~5 s instead of a ~60 s re-prefill (results/cpu_rotation.jsonl).
 NP="${NP:-2}"
 CTX_SLOT=$(( CTX / NP ))
 if [ $(( CTX % NP )) -ne 0 ]; then
@@ -190,6 +201,11 @@ fi
 #
 # So the pin is left off: 2 layers is ~1 % of the model and the rungs that
 # matter breach the cap. NGL= pins it anyway if a workload wants the layers.
+# Re-measured on the Vega-only path with a desktop holding ~4.1 GB of the Vega:
+# NGL=2 is killed at load (system peak 5774.9 MiB, exit -9) against --fit's
+# 5190.4 MiB, so the pin is not merely marginal here, it does not fit. Only a
+# desktop down near ~1.5 GB would leave room, and what those layers are worth
+# with the trunk fully on the CPU has not been measured.
 FIT_ON=1
 FIT_ARGS=(--fit on)
 if [ "$EGPU" = 1 ]; then
@@ -229,6 +245,10 @@ fi
 # MemAvailable drop. Budget RAM from MemAvailable, never from RSS.
 LM="${LM:-mmap}"
 # Measured at depth 4096: the llama-server default 2048/512 is fastest on prompt.
+# -ub 2048 is another 12 % of prompt throughput at -ngl 0, and unusable: the
+# micro-batch also sizes the draft's buffers, which live on the Vega, so the
+# guarded peak went to 5649 MiB of the 5500 cap and the run was killed
+# (client 2650.7 vs 2095.7 MiB at 512). -ub 1024 measures 63.60 vs 63.85 t/s.
 BATCH="${BATCH:-2048}"
 UBATCH="${UBATCH:-512}"
 # Measured: KV dtype is free at depth 0 and worth ~9.6 % generation at depth

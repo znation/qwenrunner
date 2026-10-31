@@ -1048,33 +1048,34 @@ because the fit already sees the desktop's usage in `free`.
 
 `serve.sh` runs `llama-server` under `guard.py`, which polls system-wide
 VRAM every 50 ms and `SIGKILL`s the process group above `CAP` (default
-5000 MiB), so the display GPU is protected by measurement rather than by
-arithmetic. It serves one model split across both GPUs — `-dev CUDA0,Vulkan0
--sm layer` — and **requires the eGPU**: without `/dev/nvidia0` or a CUDA build
-it exits 1 instead of degrading to a configuration the watchdog would kill.
+5500 MiB) and when `MemAvailable` falls below `MIN_AVAIL` (2048 MiB), so the
+display GPU and the box are protected by measurement rather than arithmetic.
+The eGPU is optional: with `/dev/nvidia0` bound and a CUDA0 backend built the
+model is split `-dev CUDA0,Vulkan0 -sm layer`; without it the device list is
+`-dev Vulkan0`, `--fit` converges to `offloaded 0/66` (see the block at `FIT_ON`
+in `serve.sh`) and the Vega runs only the MTP draft.
 
-Defaults: `-a Qwen3.8-27B -ts 6,1 -ngl 26 -np 2 -t 8 -lm dio -b 2048 -ub 512 -ctk q4_0
--ctv q4_0 -fa on`, plus MTP with the draft head **on the Vega 10**
-(`--spec-type draft-mtp -md models/mtp-Qwen3.8-27B-Q4_0.gguf -devd Vulkan0
--ngld 99 -ctkd q4_0 -ctvd q4_0 --spec-draft-n-max 6 --spec-draft-p-min 0.5`). `-c`
-is the shared pool — `CTX=131072` with
-`-np 2` is **65536 per slot**, so a client's `contextWindow` must say 65536
-(pi's `~/.pi/agent/models.json` does) — and `-ngl` is derived from the pool
-(`32 - (CTX-32768)/16384` with MTP, `40 - (CTX-8192)/15360` without) with `-ts`
-from whether the draft is resident; `MTP=0` disables speculation, `NGL=`,
-`TS=`, `NP=`, `DEVD=`, `NGLD=`, `DNMAX=`, `DPMIN=` override. `FIT=1` replaces the formula with
-llama.cpp's own `--fit` (`-fitt "$FITT_CUDA,$(vram_total - CAP)"`, default
-`256,3176`), which re-derives `-ngl` and the split from live free VRAM — 28-30
-layers at a 128k pool with `-np 1`, **26 with `-np 2`** (it accounts for the
-second sequence's compute buffers: CUDA0 6876 MiB used, 472 free, client 3284) —
-at the cost of the formula's reserve (see "`--fit`: the runtime derives the layer
-budget itself"). Setting `NGL=` or `TS=` forces the fit off, because it aborts
-rather than honour either. `serve.sh` prints the live display baseline and warns
-when it is above the ~1216 MiB this config was measured to survive — and, if
-`FIT` is unset, auto-falls back to `--fit` on that same condition, so a heavy
-desktop gives up layers instead of tripping the watchdog (an explicit `FIT=0`
-pins the formula) — then forwards `SIGINT`/`SIGTERM` to the child, so Ctrl-C
+Defaults: `-a Qwen3.8-27B -c 131072 -np 2 -t 8 -dev <...> -sm layer --fit on
+-lm mmap -b 2048 -ub 512 -ctk q4_0 -ctv q4_0 -fa on`, plus MTP with the draft
+head **on the Vega 10** (`--spec-type draft-mtp -md
+models/mtp-Qwen3.8-27B-Q4_0.gguf -devd Vulkan0 -ngld 99 -ctkd q4_0 -ctvd q4_0
+--spec-draft-n-max 6 --spec-draft-p-min 0.5`). `-c` is the shared pool —
+`CTX=131072` with `-np 2` is **65536 per slot**, so a client's `contextWindow`
+must say 65536 (pi's `~/.pi/agent/models.json` does). `MTP=0` disables
+speculation; `NGL=`, `TS=`, `NP=`, `DEVD=`, `NGLD=`, `DNMAX=`, `DPMIN=`,
+`CTX=`, `LM=`, `THREADS=` override. `--fit` is **always on** and re-derives
+`-ngl` and the split from live free VRAM against a `-fitt "$FITT_CUDA,$VEGA_MARGIN"`
+margin (`VEGA_MARGIN` = `vram_total - FIT_CAP`, i.e. 3576 MiB at the shipped
+`FIT_CAP=4600`): 28-30 layers at a 128k pool with `-np 1` and the eGPU,
+**26 with `-np 2`** (it accounts for the second sequence's compute buffers:
+CUDA0 6876 MiB used, 472 free, client 3284), 0 without the eGPU. Setting
+`NGL=` or `TS=` turns the fit off, because it aborts rather than honour
+either. `serve.sh` forwards `SIGINT`/`SIGTERM` to the child, so Ctrl-C
 actually stops the server.
+
+The smoke tests below were taken on the eGPU path before the `--fit`/`mmap`
+cutover, when `CAP` was 5000 MiB and the layer count came from a formula
+rather than from the fit; they are kept for the teardown and client numbers.
 
 ```
 ./serve.sh                       # → http://127.0.0.1:8080, 128k context + MTP
@@ -1095,10 +1096,11 @@ Qwen-3.8-27B is a thinking model, so a `max_tokens` smaller than the reasoning
 trace returns an **empty `content`** with everything in `reasoning_content` —
 budget for the trace or the visible answer is truncated away.
 
-`FIT=1` on the same host instead picked **30 layers** (25/5): health 16.1 s,
-`pong`, 4.634 t/s, 20/33 accepted, peak **4738.3 MiB**, client 3648.2, NVIDIA
-7479.3, no violation. Faster, and 262 MiB closer to the cap — the trade the
-section above measures.
+With the fit granted a wider margin on the same host it picked **30 layers**
+(25/5): health 16.1 s, `pong`, 4.634 t/s, 20/33 accepted, peak **4738.3 MiB**,
+client 3648.2, NVIDIA 7479.3, no violation. Faster, and 262 MiB closer to the
+cap — the trade the section above measures. The knobs are now `FIT_CAP`
+(what the fit is allowed to use) and `FITT_CUDA` (the eGPU's own margin).
 
 Smoke-tested again at the shipped `-np 2` default, this time through the real
 client rather than curl: `/health` ok after 12.4 s, `/props` reports
@@ -1120,9 +1122,94 @@ trap above.
 `start_new_session=True`, so before the fix a Ctrl-C on `serve.sh` killed only
 the guard and **orphaned `llama-server` holding ~3 GB of the 5 GB budget**.
 
+### Several sessions at once (Vega-only path) **[clean]**
+
+The box was serving without the eGPU for these runs, i.e. the shipped
+`offloaded 0/66` path with the whole trunk on the CPU. `results/
+cpu_concurrency.jsonl` and `results/cpu_rotation.jsonl`, one server per NP
+value, `-np 2` unless stated. Host load drifted (loadavg 3-13 across the runs,
+the desktop and a user job on the CPU), so arms were interleaved within one
+server and the ratios are the number to trust.
+
+Throughput that is *not* concurrency-related, measured at `-ngl 0` (`llama-bench
+-lm mmap`, depth 0, `-p 256 -n 32 -r 1`):
+
+| arm | pp t/s | tg t/s |
+|---|---|---|
+| `-t 8` (shipped) | 42.72 | 1.40 |
+| `-t 12` | 41.93 | 1.54 |
+| `-t 16` | 35.08 | 0.90 |
+| `-b 2048 -ub 2048`, `-p 2048` | **71.24** | — |
+| `-b 2048 -ub 512` (shipped), `-p 2048` | 63.85 | — |
+| `-ub 1024`, `-p 2048` | 63.60 | — |
+| Q3_K_XL, `-t 8` | 53.46 | 1.54 |
+| Q2_K_XL, `-t 8` | 59.26 | 1.77 |
+
+* **`-t 8` stands, `-t 16` is still −36 %**, as on the split: the all-CPU path
+  does not change the thread conclusion.
+* **`-ub 2048` is not usable through `serve.sh` even though it is 12 % faster in
+  `llama-bench`.** The micro-batch also sizes the *draft's* buffers, and the
+  draft runs on the Vega: with `UBATCH=2048` the guarded run peaked at
+  **5649 MiB of the 5500 MiB cap** and was `SIGKILL`ed (`exit_code -9`,
+  `vram_violation: true`, client 2650.7 MiB against 2095.7 at `-ub 512`).
+  `-ub 1024` buys nothing measurable and would spend the same headroom.
+* **A smaller quant is a smaller win without the GPU**: Q3_K_XL +10 %
+  generation / +25 % prompt, Q2_K_XL +26 % / +39 %, against +13.7 % / +61.3 %
+  perplexity ([Quant comparison](#quant-comparison-clean)). Offloading is what
+  made a smaller quant worth +52 % on the split; here it only shrinks the bytes
+  the CPU streams.
+
+Concurrency, realistic prose (a 3.6 k-char excerpt continued for 48 tokens,
+`cache_prompt: false`, draft acceptance 41-59 %):
+
+| arm | total gen t/s | per-stream gen t/s |
+|---|---|---|
+| C=1 | 1.022 | 1.022 |
+| C=2 | **1.515** | 0.88 |
+| C=1 (repeat) | 1.056 | 1.056 |
+| C=2 (repeat) | **1.467** | 0.81 |
+
+Concurrency on 100 %-acceptance filler, which is where MTP lives:
+
+| arm | total gen t/s | per-stream |
+|---|---|---|
+| MTP on, C=1 | 4.28 | 4.28 |
+| MTP on, C=2 | 2.75 | 1.38 |
+| MTP off, C=1 | 1.28 | 1.28 |
+| MTP off, C=2 | 1.97 | 0.98 |
+| MTP off, `-np 4`, C=4 | 1.67 | 0.42 |
+
+* **A second session buys total throughput on this path** — ×1.4-1.5 on
+  realistic content, where the split measured slots as fairness only (91.4 s
+  serialized vs 100.0 s concurrent). Batching two sequences per step amortizes
+  the weight stream, which is the CPU's cost.
+* **It is not ×2**: each stream drops to ~0.8 of solo. Two streams ≈ 1.5 t/s
+  total on prose.
+* **MTP's per-stream win shrinks under concurrency.** With drafts that always
+  land, one stream is 4.28 t/s and two are 2.75 in total — a second stream is
+  *worse* than one speculated stream. Drafting is per-slot and serial, so the
+  batching bonus mostly pays for the drafts. On low-acceptance content the two
+  configurations tie (1.515 vs 1.467).
+* **`-np 4` is worse than `-np 2` on both axes** (total 1.67 vs 1.97, per
+  stream 0.42 vs 0.98, prefill 7-9 t/s against 33) *and* it halves the slot to
+  32768. Do not raise `-np` to add sessions.
+* **A third session does not pay a re-prefill.** Three unrelated 2.1 k-token
+  transcripts rotating through the two slots: the returning sessions resumed
+  with `prompt_n = 4` in **5.3 s / 5.4 s**, against 56.5-65.8 s for the first
+  full prefill — llama-server keeps the evicted slot's state in the host prompt
+  cache (`--cache-ram`, 8192 MiB by default). So N sessions round-trip through
+  2 slots at the cost of a state restore; the 8 GiB cache is what bounds how
+  many, and on this box it competes with the 16.4 GB of mmap'd weights.
+* The shipped config on this path sits at **client 2095.7 MiB** of the 5500 MiB
+  cap and **7971 MiB** of `MemAvailable` (`results`-side guard summary), i.e.
+  `NEED_MIB` 10240 is the right pre-flight. Pinning layers instead of letting
+  the fit decide is unaffordable at the current desktop baseline: `NGL=2` was
+  **killed at load** (system peak 5774.9 MiB, `exit_code -9`) where `--fit`
+  peaked at 5190.4 MiB.
+
 ## Agentic-coding profile: growth, compaction, slots **[clean]**
 
-At the shipped defaults (128k, `-ngl 28 -ts 6,1 -np 1`, MTP on the Vega), driving
+On the eGPU path at 128k (`-ngl 28 -ts 6,1 -np 1`, MTP on the Vega), driving
 `/completion` with `cache_prompt: true` on `data/long_prompt.txt` (4000 chars ≈
 1546 tokens), `n_predict` 4:
 
