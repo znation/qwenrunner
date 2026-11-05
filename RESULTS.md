@@ -637,14 +637,15 @@ continuation) concurrency costs; where it is not (lower acceptance, more
 compute per token) concurrency *adds* until the GPU saturates. Both are real,
 and which one you get depends on the traffic.
 
-**Recommendation.** `serve.sh` defaults to `NP=8 CTK=CTV=q4_0 MTP=0 CRAM=4096`
-and `INSTANCES=1`: one slot per harness for tumwater's `maxConcurrent: 8`, at
-the RAM-first dtype, speculation off — "The fleet shape" below is the
-measurement behind both. The slot count is the memory knob: a slot carries
+**Recommendation.** `serve.sh` defaults to `NP=2 CTK=CTV=q4_0 MTP=0 CRAM=4096`
+and `INSTANCES=1`: two slots — the RAM-first choice — with the prompt cache
+sized to keep a four-session fleet warm (2 resident, 2 cached), speculation off.
+"The fleet shape" below is the measurement behind the slot cost. A slot carries
 Metal compute buffers and the model's per-sequence state as well as its 2 GiB
 of 128k KV, so the all-in cost is ~3 GiB per slot at 64k/slot and ~4 at 128k
 (`-np 8` measured 39.4 GiB summed at 64k/slot, 41.5 GiB at `CTX=131072` with
-22k-token transcripts). `NP=2 ./serve.sh` gives ~19 GiB back at two sessions;
+22k-token transcripts). `NP=8 ./serve.sh` buys the larger fleet's throughput
+back (`-np 8`: 37.7-48.0 t/s at TTFT p50 2.2 s) for ~10 GiB of RAM;
 `NP=1 MTP=1 ./serve.sh` is the single interactive stream, where speculation is
 worth +180 % on patterned text.
 For N concurrent clients: `NP=N` (one port, one process, cheapest memory, most
@@ -656,9 +657,10 @@ capacity, processes for isolation.
 fleet measurement ("The fleet shape", below) settles the shape: one process with
 `NP=8 MTP=0` measures 37.7-48.0 t/s at TTFT p50 2.2 s and 39 GiB, against
 34.8-39.9 t/s at 3.6-3.9 s and 54-56 GiB for `INSTANCES=2 NP=4`, and 27.6-28.7
-t/s at 6.1-7.0 s and 83-85 GiB for `INSTANCES=4 NP=2`. The `NP=4` default above
-is four sessions' worth of slots; eight sessions on four slots is the failure
-mode in that section, not a smaller version of the same thing.
+t/s at 6.1-7.0 s and 83-85 GiB for `INSTANCES=4 NP=2`. The `NP=2` default above
+is two of a four-session fleet's slots, with `CRAM` holding the other two; eight
+sessions on four slots is the failure mode in that section, not a smaller
+version of the same thing.
 
 ### The N=4 gap is real but small, and it is confounded
 
@@ -868,14 +870,16 @@ A 128k conversation costs 8 GiB of cache at f16, ~4.3 GiB at q8_0 and ~2.1 GiB
 at q4_0 (64 KiB/token and down; the load footprints above confirm the f16 figure
 — `NP=4` f16 is weights 14.3 + 4x8 KV + ~4 compute = 50.3). So `CRAM=65536` at
 f16 would commit 50 + 64 = 114 GiB on top of the 39 GiB other tenants hold, i.e.
-153 GiB on a 128 GB machine: it does not fit. **The shipped default is now `q4_0/q4_0` with
-`CRAM=4096` at `NP=8`** (4 when this was measured; the slot count moved with the
-fleet -- "The fleet shape"), chosen by the user after the f16 default (`NP=2`, 128k,
+153 GiB on a 128 GB machine: it does not fit. **The shipped default is now
+`q4_0/q4_0` with `CRAM=4096` at `NP=2`, the cache sized to keep a four-session
+fleet warm** (3 slots before that; the slot count has moved with the fleet —
+"The fleet shape"), chosen by the user after the f16 default (`NP=2`, 128k,
 `CRAM=24576`) measured 106.2 GiB used / 21.5 GiB free while serving and left
-less room than local Kubernetes clusters need. The q4_0 four-slot default
-measures 105.0 / 22.6, and drops to 95.9 / 32.4 at `NP=2` and 99.8 / 28.1 at
-`NP=3`; the cache ceiling falls from 24 GiB to 4 at the same time. At q4_0 those
-4 GiB still hold one full 128k conversation or about ten 30k ones, because
+less room than local Kubernetes clusters need. The q4_0 four-slot configuration
+measures 105.0 / 22.6, and the shipped `NP=2` shape drops to 95.9 / 32.4
+(`NP=3` sits at 99.8 / 28.1); the cache ceiling falls from 24 GiB to 4 at the
+same time. At q4_0 those
+4 GiB still hold about two 128k conversations or four 30k-token ones, because
 entries are cut to the conversation's actual length; the dtype change costs
 decode speed (26.2 against 30.7 at `q8_0` and 46.1 at `f16` t/s at 98.6k), not
 capacity, and the perplexity gate at 65 536 tokens is inside one standard error.

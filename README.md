@@ -28,10 +28,10 @@ discarded and why.
 | KV cache | **`q4_0/q4_0`** (default): 2 GiB per 128k slot, **+12 GiB of free RAM** against f16 | this machine shares its 128 GB with other workloads (local Kubernetes clusters), so the cache is sized by what has to be left over. Paired measurement, same session, `NP=2`/128k/`CRAM=4096`, two requests served: **33.4 GiB free** at q4_0 against 21.5–21.9 at f16, byte-identical output. It is the **slowest** of the three at depth — 26.2 t/s against 30.5 (`q8_0`) and 47.2 (`f16`) at 98.6k with MTP — because the 7-row verify batch dequantizes a quantized cache once per row. Quality gate: perplexity at 65 536 tokens of context is **3.3946 ± 0.0357 against f16's 3.3809 ± 0.0355** (+0.4 %, inside one SE), and 16k agrees (1.9793 vs 1.9780). `CTK=f16 CTV=f16 CRAM=8192` is the speed configuration. Never mix K and V dtypes: all four mixed runs hung past a 1800 s request timeout. See `RESULTS.md`, "KV dtype" |
 | threads | **`-t 4`** | pp 758 vs 716 (t6), 693 (t8), 686 (t12), 529 (t18); generation flat from 4–18. The 12 performance cores cost more in contention than they return |
 | batch | **`-b 1024 -ub 256`** — kept, but its depth justification did not reproduce | the depth case for the small ubatch (generation 37.45 vs 28.52 t/s at 98.6k, one rep per arm) does **not** survive interleaved reps: 30.2 vs 29.8 t/s mean, with ±20 % scatter *inside* a single config. What does reproduce: prefill at depth prefers the **larger** ubatch (−18 % at `-ub 128`; `-ub 512` best), shallow prefill prefers `-b 2048 -ub 512` (709.6 vs 633.3), and shallow generation prefers the small ubatch (28.76 vs 25.54). See `RESULTS.md`, "Batch and threads at the operating point" |
-| MTP | **off** by default; `MTP=1 NMAX=6 ./serve.sh` for one interactive stream | draft on the GPU. **The gain is a property of the text, not the machine**: +180 % on patterned text (markdown/code/JSON, 99 % draft acceptance) and **−11 % on free-form prose** (14 %). It is also a property of the *concurrency*: at the eight slots this server defaults to, the draft head runs per sequence on a GPU the eight rows already saturate, and it measures **46.6/48.0 t/s off against 33.2/32.2 with `NMAX=6`**, at +16.6 GiB of draft/verify buffers (`RESULTS.md`, "The fleet shape"). The draft depth is 6 because the repo serves agent/code traffic, where it is worth +40 % over upstream's 3; prose wants `NMAX=3`. At 98.6k depth, one stream: 28.2 t/s (`NMAX=6`) against 15.2 with `MTP=0` |
+| MTP | **off** by default; `MTP=1 NMAX=6 ./serve.sh` for one interactive stream | draft on the GPU. **The gain is a property of the text, not the machine**: +180 % on patterned text (markdown/code/JSON, 99 % draft acceptance) and **−11 % on free-form prose** (14 %). It is also a property of the *concurrency*: at the eight slots the fleet shape runs on, the draft head runs per sequence on a GPU the eight rows already saturate, and it measures **46.6/48.0 t/s off against 33.2/32.2 with `NMAX=6`**, at +16.6 GiB of draft/verify buffers (`RESULTS.md`, "The fleet shape"); at the two slots the server now defaults to that case is weaker (MTP is a per-sequence lever). The draft depth is 6 because the repo serves agent/code traffic, where it is worth +40 % over upstream's 3; prose wants `NMAX=3`. At 98.6k depth, one stream: 28.2 t/s (`NMAX=6`) against 15.2 with `MTP=0` |
 | context | **128k** (`-c 131072`) | 14.3 t/s generation and 176–231 t/s prefill *at* depth 131072; costs ~8 GiB of KV with f16 |
-| prefill cache | **`--cache-ram` ≥ (sessions − slots) × ~1 GiB** (host RAM) | for agentic use this is the biggest lever there is. A growing transcript re-sent each turn prefills **only the delta**: 19 new tokens cost 0.41 s against 62.9 s cold. Upstream's 8 GiB budget holds exactly *one* 128k f16 conversation — with two, the second evicts the first and every turn silently re-prefills 29 772 tokens (measured: 57.1 s). An entry is **not** a conversation's KV: llama.cpp logs 637-820 MiB for a 2.6k-token conversation and 762-1 150 MiB for 7-9k, so budget ~0.65-1.2 GiB each. One slot per harness displaces nothing — at the default `NP=8`/8 sessions it stays empty and is the safety net for sessions *beyond* the slot count (4096 is ~2 overflow conversations at 30k tokens); a session-starved shape needs more: eight sessions on four slots thrash at 4096 (measured 2026-10-30: 21.9 against 20.0 t/s for `CRAM=0`, and 31.7 at `8192` — throughput back, latency not) |
-| parallel prompts | **one process, `NP` = the fleet's concurrency**, beats **`INSTANCES`** (processes) | 128k per slot: `-np 6` fits in **70.4 GiB** where 6 processes die of a Metal OOM, and loads 2-3x faster. At the fleet shape measured 2026-10-30 (8 harnesses, one appending transcript each, 4 turns): one `-np 8` process **37.7-48.0 t/s at TTFT p50 2.2 s and 39 GiB**, `INSTANCES=2 -np 4` 34.8-39.9 t/s at 3.6-3.9 s and 54-56 GiB, `INSTANCES=4 -np 2` 27.6-28.7 t/s at 6.1-7.0 s and 83-85 GiB. Slots buy concurrency and latency, not throughput |
+| prefill cache | **`--cache-ram` ≥ (sessions − slots) × ~1 GiB** (host RAM) | for agentic use this is the biggest lever there is. A growing transcript re-sent each turn prefills **only the delta**: 19 new tokens cost 0.41 s against 62.9 s cold. Upstream's 8 GiB budget holds exactly *one* 128k f16 conversation — with two, the second evicts the first and every turn silently re-prefills 29 772 tokens (measured: 57.1 s). An entry is **not** a conversation's KV: llama.cpp logs 637-820 MiB for a 2.6k-token conversation and 762-1 150 MiB for 7-9k, so budget ~0.65-1.2 GiB each. At one slot per harness nothing is displaced and the cache stays empty; at the default `NP=2` with up to 4 sessions it carries the two sessions beyond the slots (4096 ≈ two displaced 128k entries or four 30k-token ones at `q4_0`); a session-starved shape needs more: eight sessions on four slots thrash at 4096 (measured 2026-10-30: 21.9 against 20.0 t/s for `CRAM=0`, and 31.7 at `8192` — throughput back, latency not) |
+| parallel prompts | **one process, `NP` = the concurrency you serve**, beats **`INSTANCES`** (processes) | 128k per slot: `-np 6` fits in **70.4 GiB** where 6 processes die of a Metal OOM, and loads 2-3x faster. At the fleet shape measured 2026-10-30 (8 harnesses, one appending transcript each, 4 turns): one `-np 8` process **37.7-48.0 t/s at TTFT p50 2.2 s and 39 GiB**, `INSTANCES=2 -np 4` 34.8-39.9 t/s at 3.6-3.9 s and 54-56 GiB, `INSTANCES=4 -np 2` 27.6-28.7 t/s at 6.1-7.0 s and 83-85 GiB. Slots buy concurrency and latency, not throughput |
 
 **Offload is the lever that no longer exists, and context is the one that
 stopped being expensive.** On the Intel host the whole design was built around
@@ -112,8 +112,8 @@ minute.
 ## Run
 
 ```
-./serve.sh                       # the default: 8 slots, MTP off, q4_0, 4 GiB cache
-NP=2 ./serve.sh                  # +19 GiB of free RAM, two sessions
+./serve.sh                       # the default: 2 slots, MTP off, q4_0, 4 GiB cache
+NP=8 ./serve.sh                  # eight slots: the measured fleet-shape optimum
 CTK=f16 CTV=f16 CRAM=8192 ./serve.sh  # +20 t/s decode at depth, -12 GiB of free RAM
 NP=1 MTP=1 ./serve.sh            # one interactive stream, speculation on
 MTP=1 NMAX=3 ./serve.sh          # prose stream: speculation pays little, 3 deep
@@ -123,18 +123,21 @@ INSTANCES=4 NP=2 ./serve.sh      # four servers, ports 8090-8093
 Never mix `CTK` and `CTV`: every mixed-dtype run hung past a 1800 s request
 timeout on this machine (`RESULTS.md`, "KV dtype").
 
-`serve.sh` defaults: `-ngl 99 -np 4 -c 524288 (4 slots x 128k) -t 4 -b 1024 -ub
-256 -ctk q4_0 -ctv q4_0 -fa on --cache-ram 4096`, plus `--spec-type draft-mtp -md
-models/mtp-Qwen3.8-27B-Q4_0.gguf -ngld 99 --spec-draft-n-max 6`. Every knob is
-an env var (`MODEL CTX NP INSTANCES PORT THREADS NGL LM BATCH UBATCH CTK CTV FA
-MTP MD NGLD NMAX CRAM SWAPCAP`), and extra arguments are appended verbatim to
-each server.
+`serve.sh` defaults: `-ngl 99 -np 2 -c 262144 (2 slots x 128k) -t 4 -b 1024 -ub
+256 -ctk q4_0 -ctv q4_0 -fa on --cache-ram 4096`, with MTP off (`MTP=1` adds
+`--spec-type draft-mtp -md models/mtp-Qwen3.8-27B-Q4_0.gguf -ngld 99
+--spec-draft-n-max 6`). Every knob is an env var (`MODEL CTX NP INSTANCES PORT
+THREADS NGL LM BATCH UBATCH CTK CTV FA MTP MD NGLD NMAX CRAM SWAPCAP`), and extra
+arguments are appended verbatim to each server.
 
-**The default is sized for agentic coding on a shared machine**: four slots at
-`q4_0` reserve 8 GiB of KV, and the loaded server measured **22.6 GiB free** here
-— more than the two-slot f16 configuration had (21.5), with twice the
-concurrency. `NP=2` buys another 9 GiB back (32.4 free); `NP=3` sits at 28.1.
-See the ceiling note in `RESULTS.md` if you plan to fill the prompt cache.
+**The default is sized for agentic coding on a shared machine**: two slots at
+`q4_0` reserve 4 GiB of KV, and the loaded server measured **32.4 GiB free** here
+— more than the four-slot q4_0 configuration's 22.6 and the two-slot f16 one's
+21.5. The 4 GiB prompt cache keeps two more conversations warm, so a four-session
+fleet stays cached without a re-prefill. `NP=8` buys the throughput optimum back
+(`-np 8` measures 37.7-48.0 t/s at TTFT p50 2.2 s at the eight-harness shape) for
+~10 GiB of RAM; `NP=3` sits at 28.1 free. See the ceiling note in `RESULTS.md`
+if you plan to fill the prompt cache.
 
 Servers run under `scripts/guard.py`, which forwards Ctrl-C to the whole
 process group and records memory/CPU/GPU statistics for every run. The one
@@ -148,7 +151,8 @@ inside **one** server (one port, one weight mapping, one set of compute
 buffers); `INSTANCES=N` runs N separate servers on N ports.
 
 ```
-NP=8 ./serve.sh                  # one server, eight parallel 128k slots (the default)
+NP=2 ./serve.sh                  # one server, two parallel 128k slots (the default)
+NP=8 ./serve.sh                  # eight slots: the measured fleet-shape optimum
 INSTANCES=4 NP=2 ./serve.sh      # four servers, ports 8090-8093
 ```
 
@@ -181,14 +185,16 @@ What parallelism does to speed depends on the workload, not the mechanism:
 Neither is the wrong answer: N slots buy concurrency. Use them when N clients
 each idle most of the time; do not expect N times the throughput of one.
 
-`serve.sh` defaults to `NP=8 CTK=CTV=q4_0 MTP=0 CRAM=4096` and `INSTANCES=1`:
-one slot per harness for tumwater's `maxConcurrent: 8`, at the RAM-first dtype,
-speculation off. A slot's KV is only 2 GiB at 128k here, but it also carries its
-own Metal compute buffers and the model's per-sequence state, and the measured
-all-in cost is **~3 GiB per extra slot at 64k/slot and ~4 at 128k** — `-np 8`
-measures 39.4 GiB of summed RSS at 64k/slot and 41.5 GiB at `CTX=131072` with
-22k-token transcripts. `NP=2 ./serve.sh` gives back ~19 GiB at two sessions, and
-`NP=1 MTP=1 ./serve.sh` is the single interactive stream.
+`serve.sh` defaults to `NP=2 CTK=CTV=q4_0 MTP=0 CRAM=4096` and `INSTANCES=1`:
+two slots at the RAM-first dtype, speculation off, with the prompt cache sized
+to keep four concurrent sessions warm (two resident, two cached). A slot's KV is
+only 2 GiB at 128k here, but it also carries its own Metal compute buffers and
+the model's per-sequence state, and the measured all-in cost is **~3 GiB per
+extra slot at 64k/slot and ~4 at 128k** — `-np 8` measures 39.4 GiB of summed RSS
+at 64k/slot and 41.5 GiB at `CTX=131072` with 22k-token transcripts. `NP=8
+./serve.sh` buys the larger fleet's throughput back (37.7-48.0 t/s, TTFT p50
+2.2 s, 39 GiB at the eight-harness shape) for ~10 GiB of RAM, and `NP=1 MTP=1
+./serve.sh` is the single interactive stream.
 
 #### For agentic coding
 
@@ -196,42 +202,48 @@ The workload is a transcript that grows every turn, so the config that matters
 is the one that keeps prefill near zero and gives each concurrent session its
 own cached conversation:
 
-`./serve.sh` with no arguments *is* this configuration — `NP=8 CTK=q4_0 CTV=q4_0
+`./serve.sh` with no arguments *is* this configuration — `NP=2 CTK=q4_0 CTV=q4_0
 MTP=0 CRAM=4096` are the defaults. What each one buys:
 
-* `MTP=0` — off by default, because of the shape this server is sized for. At
-  eight live slots the draft head runs *per sequence* while the main batch
-  already carries eight rows: the same interleaved window measures **46.6 / 48.0
-  t/s with `MTP=0` against 33.2 / 32.2 with `NMAX=6`**, at +16.6 GiB of
-  draft/verify buffers. It is a single-stream lever — `NP=1 MTP=1 ./serve.sh`
-  measured +180 % on patterned text (markdown/code/JSON, 99 % draft acceptance),
-  −11 % on free-form prose, and 28.2 against 15.2 t/s at 98.6k depth — and
-  `NMAX=6` is the depth for code (prose wants 3).
-* `NP=<the fleet's concurrency>` — one slot per concurrent agent session, which
-  for tumwater is its `maxConcurrent: 8`. The count is not a preference: eight
-  appending transcripts on four slots re-prefill in full on every turn (TTFT p50
-  49.7-62.6 s against 2.2 s, aggregate output 22 against 46 t/s), and slots
-  beyond the fleet buy nothing (`-np 12` at 8 sessions measures 30.0/32.1
-  against 33.2/32.2 t/s for +10 GiB). Cost is ~3 GiB per extra slot at 64k/slot
-  and ~4 at 128k with MTP off (`-np 8` measured 38.5-39.4 GiB summed), ~5.6 with
-  MTP on (`RESULTS.md`, "The fleet shape").
+* `MTP=0` — off by default. The measurement that sets it is the eight-slot
+  shape: there the draft head runs *per sequence* while the main batch already
+  carries eight rows, and the same interleaved window measures **46.6 / 48.0 t/s
+  with `MTP=0` against 33.2 / 32.2 with `NMAX=6`**, at +16.6 GiB of draft/verify
+  buffers. At the two slots this server now defaults to that case is weaker —
+  MTP is a per-sequence lever and there is spare batch — so `NP=2 MTP=1` is
+  worth measuring before treating this default as settled at the new shape. It
+  remains a single-stream lever either way: `NP=1 MTP=1 ./serve.sh` measured
+  +180 % on patterned text (markdown/code/JSON, 99 % draft acceptance), −11 % on
+  free-form prose, and 28.2 against 15.2 t/s at 98.6k depth — and `NMAX=6` is
+  the depth for code (prose wants 3).
+* `NP=2` — two live slots, with the prompt cache carrying the rest of the fleet,
+  so up to four concurrent sessions stay warm (two resident, two cached). Slots
+  are the cheap axis and more of them is what a large fleet wants: one slot per
+  session at tumwater's `maxConcurrent: 8` measured 37.7-48.0 t/s at TTFT p50
+  2.2 s and 39 GiB. Too few slots re-prefills in full — eight appending
+  transcripts on four slots measure TTFT p50 49.7-62.6 s against 2.2 s and 22
+  against 46 t/s aggregate — while slots beyond the fleet buy nothing (`-np 12`
+  at 8 sessions measures 30.0/32.1 against 33.2/32.2 t/s for +10 GiB). Cost is
+  ~3 GiB per extra slot at 64k/slot and ~4 at 128k with MTP off (`-np 8`
+  measured 38.5-39.4 GiB summed), ~5.6 with MTP on (`RESULTS.md`, "The fleet
+  shape").
 * `CTK=CTV=q4_0` — the RAM decision: 2 GiB per 128k slot against 8 at f16, worth
   **+12 GiB of free memory** to everything else on the machine, at the cost of
   the slowest decode of the three (26.2 against 30.7 at `q8_0` and 46.1 at f16,
   t/s at 98.6k). Perplexity at 65 536 tokens of context is unchanged within one
   standard error (`RESULTS.md`, "KV dtype").
 * `CRAM=4096` — the prompt cache, sized as `(sessions − slots) × ~1 GiB`; at the
-  default `NP=8` with 8 sessions nothing is ever displaced and it stays empty,
-  so it is the safety net for sessions *beyond* the slot count (4096 is ~2
-  overflow conversations at 30k tokens). Its entries are not a conversation's
-  KV: llama.cpp logs **637-820 MiB for a 2.6k-token conversation and 762-1 150
-  MiB for 7-9k**, so `conversation_tokens × 16 KiB` is the wrong budget. A
-  session-starved shape needs it bigger: eight sessions on four slots thrash at
-  `4096` (17 evictions in one 4-turn run, 21.9 against 20.0 t/s for `CRAM=0`),
-  and `8192` is that shape's floor — it recovers 69 % of one-slot-per-harness
-  throughput (31.7 t/s) but not its latency (TTFT p50 24.2 s against 2.2 s). A
-  cache that is one entry short does not degrade gracefully: it silently
-  re-prefills the whole transcript on every turn.
+  default (`NP=2`, up to 4 sessions) two conversations are displaced, and 4096
+  covers them with headroom for the ~2.1 GiB a 128k `q4_0` entry costs. Its
+  entries are not a conversation's KV: llama.cpp logs **637-820 MiB for a
+  2.6k-token conversation and 762-1 150 MiB for 7-9k**, so `conversation_tokens
+  × 16 KiB` is the wrong budget. A session-starved shape needs it bigger: eight
+  sessions on four slots thrash at `4096` (17 evictions in one 4-turn run, 21.9
+  against 20.0 t/s for `CRAM=0`), and `8192` is that shape's floor — twice the
+  displaced conversations, twice the cache. It recovers 69 % of
+  one-slot-per-harness throughput (31.7 t/s) but not its latency (TTFT p50
+  24.2 s against 2.2 s). A cache that is one entry short does not degrade
+  gracefully: it silently re-prefills the whole transcript on every turn.
 
 Send requests with `"cache_prompt": true` (the default for the OpenAI-compatible
 endpoints) so the server can match the prefix; `scripts/agent_cache_probe.py`
@@ -246,12 +258,12 @@ anyway. It is off by default and documented as unproven, not as a tier —
 
 Two things to know about this default:
 
-* **It is not free.** Eight q4_0 slots reserve 16 GiB of KV at 128k and the
-  loaded server measures **39.4 GiB of summed RSS** at 64k/slot and 41.5 GiB at
-  `CTX=131072` with 22k-token transcripts — per-slot cost is ~3 GiB all-in at
-  64k/slot (~4 at 128k), not the 2 GiB of KV. `CRAM` is a ceiling on top of that
-  and is empty until a displaced conversation needs it. `NP=2 ./serve.sh` gives
-  back ~19 GiB at two sessions; `NP=1 MTP=1 ./serve.sh` is one interactive
+* **It is not free.** Two q4_0 slots reserve 4 GiB of KV at 128k, and a slot
+  costs ~3 GiB all-in at 64k/slot (~4 at 128k), not its 2 GiB of KV — at large
+  `N` that adds up: `-np 8` measures **39.4 GiB of summed RSS** at 64k/slot and
+  41.5 GiB at `CTX=131072` with 22k-token transcripts. `CRAM` is a ceiling on top
+  of that and is empty until a displaced conversation needs it. Raising `NP` to
+  8 costs ~10 GiB of RAM here; `NP=1 MTP=1 ./serve.sh` is one interactive
   session with speculation on.
 * **Overlapping cold prefills hurt.** Slots share one batch, so while one
   session prefills an uncached transcript the others' generation falls to ~3.5
@@ -297,7 +309,7 @@ costs ~15 % of throughput, 1.7 s of TTFT and 16 GiB. With one
 
 ```
 PORT=8090 NP=1 MTP=1 NMAX=6 ./serve.sh &   # one interactive stream: speculation pays
-PORT=8091 ./serve.sh &                      # the fleet default: 8 slots, MTP off
+PORT=8091 ./serve.sh &                      # the fleet default: 2 slots, MTP off
 ```
 
 That is not expressible with `-np`, and it follows directly from the MTP

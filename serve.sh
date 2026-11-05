@@ -26,9 +26,9 @@
 #   MODEL CTX NP INSTANCES PORT THREADS HOST NGL LM BATCH UBATCH CTK CTV FA
 #   MTP MD NGLD NMAX CRAM SLOT_SAVE ALIAS SWAPCAP LOG_DIR
 #
-#   ./serve.sh                          # the fleet default: 8 slots, MTP off
+#   ./serve.sh                          # the default: 2 slots, MTP off, 4 GiB cache
 #   NP=1 MTP=1 ./serve.sh               # one interactive stream (MTP pays there)
-#   NP=2 ./serve.sh                     # +19 GiB of free RAM, two sessions
+#   NP=8 ./serve.sh                     # the measured fleet-shape optimum, +~10 GiB
 #   CTK=f16 CTV=f16 CRAM=8192 ./serve.sh # +20 t/s at depth, at -12 GiB of free RAM
 #   INSTANCES=4 NP=2 ./serve.sh         # four servers, ports 8090-8093
 # Extra args are appended verbatim to every llama-server command line.
@@ -59,19 +59,24 @@ INSTANCES="${INSTANCES:-1}"
 # allocations) -- see RESULTS.md, "Parallel prompts". -c is the total, so it
 # scales with NP to keep every slot at full CTX.
 #
-# Default 8: tumwater's `maxConcurrent` -- one slot per harness, which is what
-# this repo serves. The count is not a preference: eight appending transcripts
-# on four slots re-prefill in full on every turn (TTFT p50 49.7-62.6 s against
-# 2.2 s, aggregate output 22 against 46 t/s), and slots beyond the fleet buy
-# nothing (-np 12 at 8 sessions measures the same as -np 8 for +10 GiB).
-# `-c` is the total, so it scales with NP to keep every slot at full CTX.
+# Default 2: two live slots, with the prompt cache (CRAM, below) carrying the
+# rest of the fleet's conversations so up to four concurrent sessions stay
+# warm -- 2 slots + (4 sessions - 2 slots) x ~1 GiB. Slots are still the cheap
+# axis and a larger fleet measures better on more of them (at the 8-harness
+# shape, one `-np 8` process: 37.7-48.0 t/s at TTFT p50 2.2 s and 39 GiB,
+# against 34.8-39.9 t/s at 3.6-3.9 s for `INSTANCES=2 -np 4`), and too few slots
+# re-prefills in full: eight appending transcripts on four slots measure TTFT
+# p50 49.7-62.6 s against 2.2 s, 22 against 46 t/s aggregate. Two is the
+# RAM-first default for a machine that shares its memory; raise it to the
+# concurrency you actually serve. `-c` is the total, so it scales with NP to
+# keep every slot at full CTX.
 #
 # Cost, at the q4_0 KV default: a slot is not just its 2 GiB of 128k KV -- it
 # carries Metal compute buffers and the model's per-sequence state too -- so
 # budget ~3 GiB per slot at 64k/slot and ~4 at 128k. Measured `-np 8` summed
 # RSS: 39.4 GiB at 64k/slot, 41.5 GiB at CTX=131072 with 22k-token transcripts.
 # Set NP to the fleet's concurrency; above it is RAM nobody reads.
-NP="${NP:-8}"
+NP="${NP:-2}"
 TOTAL_CTX=$(( CTX * NP ))
 # 8090, not llama-server's 8080. On this machine Rancher Desktop's Lima port
 # forwarder holds a *wildcard* *:8080 on the host, so a request to
@@ -219,18 +224,23 @@ SLOT_SAVE="${SLOT_SAVE:-}"
 # this is a *ceiling* that the rest of the budget has to absorb:
 #
 #   host memory measured here, in one session, CRAM=4096, q4_0 KV:
-#     NP=2 (32.4 GiB free) / NP=3 (28.1) / NP=4 (22.6, the default)
+#     NP=2 (32.4 GiB free, the default) / NP=3 (28.1) / NP=4 (22.6)
 #     NP=2 f16 for reference: 21.5-21.9 GiB free
 #
-# Default 4096, deliberately small: this machine hosts other workloads, and the
-# cache is the one part of the footprint that grows without bound. At q4_0 a
-# 128k conversation costs ~2.1 GiB, so 4096 holds one full 128k entry or about
-# ten 30k ones -- entries are cut to the conversation's actual length. Note the
-# cache is empty until it is needed, so it is *not* where the free-RAM problem
-# is; shrinking it buys nothing today and costs a silent full re-prefill (85 s
-# at 30k, ~4.5 min at 128k) the day a displaced conversation returns. Size it to
-# the conversations you keep warm, not below: CRAM=12288 covers six 128k entries
-# at q4_0 for 12 GiB of ceiling.
+# Default 4096, sized for the default shape: two slots plus a cache that keeps
+# four concurrent sessions warm, i.e. (4 sessions - 2 slots) x ~1 GiB with
+# headroom for the ~2.1 GiB a 128k q4_0 entry costs. The 4-slot/8-session
+# shape measured `8192` as its floor (~2 GiB per displaced conversation,
+# RESULTS.md, "The fleet shape"); at half the displaced conversations this is
+# the same size. It is deliberately small -- the cache is the one part of the
+# footprint that grows without bound. At q4_0 a 128k conversation costs ~2.1
+# GiB, so 4096 holds about two 128k entries or the four 30k transcripts of the
+# 2-slot/4-session shape; entries are cut to the conversation's actual length.
+# Note the cache is empty until it is needed, so it is *not* where the free-RAM
+# problem is; shrinking it buys nothing today and costs a silent full re-prefill
+# (85 s at 30k, ~4.5 min at 128k) the day a displaced conversation returns. Size
+# it to the conversations you keep warm, not below: CRAM=12288 covers six 128k
+# entries at q4_0 for 12 GiB of ceiling.
 CRAM="${CRAM:-4096}"
 
 mkdir -p "$ROOT/logs"
