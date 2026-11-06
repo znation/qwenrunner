@@ -139,7 +139,9 @@ def session_loop(sid, slice_text, url, args, records, errors):
             }
             records.append(rec)
             if args.out:
-                with open(os.path.join(ROOT, args.out), "a") as f:
+                path = os.path.join(ROOT, args.out)
+                os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+                with open(path, "a") as f:
                     f.write(json.dumps(rec) + "\n")
             if not (r["text"] or r["reasoning"]):
                 errors.append("session %d turn %d: empty reply (%s)" % (sid, turn, r["finish"]))
@@ -186,7 +188,7 @@ def main(argv=None):
                     help="opening context per session (~3.4k tokens at 3.5 chars/token)")
     ap.add_argument("--obs-chars", type=int, default=2400,
                     help="size of each appended tool observation")
-    ap.add_argument("--out", default="results/turn_loop.jsonl")
+    ap.add_argument("--out", default="logs/turn_loop.jsonl")
     args = ap.parse_args(argv)
 
     corpus = open(os.path.join(ROOT, args.corpus)).read()
@@ -243,7 +245,9 @@ def main(argv=None):
                    "prefill_tps": None if not n_in else round(n_in / wall, 1),
                    "n_out": n_out, "n_in": n_in, "errors": errors,
                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S")}
-        with open(os.path.join(ROOT, args.out), "a") as f:
+        path = os.path.join(ROOT, args.out)
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "a") as f:
             f.write(json.dumps(summary) + "\n")
     return 0
 
