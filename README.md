@@ -63,6 +63,29 @@ OpenAI-compatible at `http://127.0.0.1:8090/v1`; Anthropic Messages at
 
 Env: `MODEL CTX NP PORT HOST MTP KVQ CACHE_MB LOG_DIR`.
 
+## Clients
+
+`pi` and `omp` are pointed at this server from their own configs —
+`~/.pi/agent/models.json` and `~/.omp/agent/models.yml`, provider `qwenrunner`
+— so `pi --provider qwenrunner --model Qwen3.8-27B-MLX-Serve-4bit` and
+`omp --model qwenrunner/Qwen3.8-27B-MLX-Serve-4bit` run on it. Both entries
+carry what the server advertises at `GET /v1/models`:
+
+| field | value | source |
+|---|---|---|
+| model id | `Qwen3.8-27B-MLX-Serve-4bit` | the loaded model's id — re-read it when `MODEL` changes |
+| context / output | 131 072 / 65 536 | `context_length`, `agent_budget.output` |
+| thinking | `minimal … xhigh` effort | the server takes `reasoning_effort`; off sends `"none"` |
+| input | text, image | the pack carries a vision encoder (PNG, WebP, JPEG) |
+| tokens field | `max_tokens` | `compat.maxTokensField`; the server also takes `max_completion_tokens` |
+| system role | `system`, not `developer` | `compat.supportsDeveloperRole: false` |
+
+Both replay `reasoning_content` on assistant history and `omp` also sends
+`chat_template_kwargs.preserve_thinking`, so an appending transcript keeps its
+prompt prefix and re-hits the hot cache instead of re-prefilling. Compaction
+reserves are sized to the window (`compaction.reserveTokens` 16 384,
+`keepRecentTokens` 20 000).
+
 ## Measured
 
 One stream, greedy, 384 max tokens, nonce at the front of the prompt so nothing
