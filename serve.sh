@@ -1,90 +1,116 @@
 #!/usr/bin/env bash
-# serve.sh — launch mlx-serve for Qwen-3.8-27B on Apple Silicon (MLX).
+# serve.sh — serve Qwen-3.8-27B on this M5 Max for the tumwater fleet.
 #
-# The only entry point. OpenAI-compatible on $PORT, 128k context, one process,
-# N concurrent requests, on MLX weights.
+# The only entry point. OpenAI-compatible on $PORT (8090), 128k context, four
+# concurrent sessions.
 #
-# Why this runtime: measured on this machine with scripts/openai_stream_bench.py
-# and scripts/turn_loop_bench.py, same prompts, one stream and four agent
-# sessions. Decode 73.4 t/s at 4k and 76-82 at 30k against llama.cpp's 28.7 and
-# 25.2-25.7; 128k prefill 461 t/s and decode 46.9 t/s against 176-231 and 14.3;
-# four agent sessions 49.9 t/s aggregate at TTFT p50 1.26 s against 37.4 at
-# 2.28 s. The whole gain is speculative decoding (MTP + DFlash2 + PLD), not the
-# MLX kernels: with MTP=0 this server decodes at parity with llama.cpp.
-# RESULTS.md, "MLX engines".
+# Why this engine: measured on this machine by replaying real tumwater pi
+# sessions (scripts/tumwater_replay.py: 4 sessions at once, ~42k-token median
+# request, ~750 new tokens and a few hundred out per turn — the shape of 19k
+# recorded tumwater turns). RESULTS.md, "Engine shoot-out".
 #
-# Overridable via env (anything unset is derived):
-#   MODEL CTX NP PORT HOST MTP KVQ CACHE_MB LOG_DIR
+#   engine (format)                       turns/min  agg out t/s  TTFT p90
+#   Splash 1.6.0 (MLX 4-bit + DFlash2)       15.0       63.8        10.0 s
+#   Kapitsa 0.2.31 (27b 4-bit + DFlash2)     10.7       45.4         4.7 s
+#   mlx-serve 26.11.2, 32 GB prefix cache    10.7       17.3        31.0 s
+#   oMLX 0.7.3 (MLX 4-bit + DFlash2)          6.6       26.1        12.8 s
+#   mlx-serve 26.11.2, as shipped (NP=2)       3.9        6.3       128   s
 #
-#   ./serve.sh                 # the default: 2 concurrent, speculation on
-#   NP=4 ./serve.sh            # the measured agent-fleet optimum
-#   MTP=0 ./serve.sh           # speculation off (parity with llama.cpp)
-#   KVQ=8 ./serve.sh           # 8-bit KV cache: ~2x less KV, ~10% slower
+# The difference is batched speculation: Splash runs its DFlash2 draft/verify
+# cycle across all four lanes at once, so each stream keeps ~29 t/s at depth
+# while three others decode beside it. mlx-serve's speculation is a
+# single-stream win (73 t/s alone) that collapses to ~16 t/s per stream once
+# four sessions overlap, and its default prefix-cache budget holds only one
+# 128k session, so the other three re-prefill 40-55k tokens every turn.
+#
+# Env (anything unset is derived):
+#   ENGINE   splash (default) | mlx-serve (the previous engine, kept runnable)
+#   MODEL    the weights; per-engine default below
+#   CTX      context per session, tokens (default 131072)
+#   NP       concurrent sessions (default 4 — tumwater's fleet). Splash's lane
+#            count is fixed at 4 by the engine; NP>4 queues there. mlx-serve
+#            takes it as --max-concurrent and sizes its prefix cache from it.
+#   PORT HOST LOG_DIR
+#   CACHE_MB mlx-serve only: prefix-cache budget (default: NP sessions x 8 GB)
+#   MTP      mlx-serve only: 0 turns speculation off
+#
+#   ./serve.sh                       # Splash, 4 sessions, 128k, :8090
+#   ENGINE=mlx-serve ./serve.sh      # the previous engine, cache fixed for NP
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
-# The release binary, not a build. `brew install mlx-serve` from the ddalcu tap
-# builds from source (Zig + MLX + llama.cpp, >30 min here); the release tarball
-# is 98 MB and is what these numbers were measured on.
-BIN="${MLX_SERVE_BIN:-$HOME/opt/mlx-serve/mlx-serve-macos-arm64/mlx-serve}"
-if [ ! -x "$BIN" ]; then
-  BIN="$(command -v mlx-serve || true)"
-fi
-if [ -z "$BIN" ] || [ ! -x "$BIN" ]; then
-  echo "serve: mlx-serve not found. Install the release binary:" >&2
-  echo "  curl -sL https://github.com/ddalcu/mlx-serve/releases/latest/download/mlx-serve-bin-macos-arm64.tar.gz | tar xz -C ~/opt/mlx-serve" >&2
-  exit 1
-fi
-
-# The pack carries a DFlash2 drafter in its `drafter/` subdirectory, which the
-# server loads with the model. The mlx-community 4-bit build has no drafter and
-# no MTP head, and measures at the no-speculation rate.
-MODEL="${MODEL:-$HOME/.mlx-serve/models/ddalcu/Qwen3.8-27B-MLX-Serve-4bit}"
-
-# 128k is the working context. The model's own limit is 256k;
-# the KV for 128k is ~9.4 GiB at f16 (16 full-attention layers of 64), which is
-# what the server's hot-cache budget sizes itself to.
+ENGINE="${ENGINE:-splash}"
 CTX="${CTX:-131072}"
-
-# Concurrent requests. Continuous batching, so this is a cap, not an
-# allocation: KV is taken as requests arrive. 2 is the RAM-first default; 4
-# measured 49.9 t/s aggregate against 54.7 at 2 on the four-session shape, with
-# a better wall p50 (6.3 s against 10.4 s) because the turns overlap instead of
-# queueing.
-NP="${NP:-2}"
-
+# Four concurrent sessions: tumwater's fleet runs four role instances against
+# this server, and every engine measured here is at its best with one lane per
+# session (fewer lanes queue whole turns behind each other's decode).
+NP="${NP:-4}"
 PORT="${PORT:-8090}"
 HOST="${HOST:-127.0.0.1}"
-
-# Speculation: MTP (the checkpoint's own head, depth 6), DFlash2 (the drafter in
-# the pack) and PLD (prompt lookup). All three are on by default; MTP=0 turns
-# all of them off, which is the apples-to-apples arm against llama.cpp.
-MTP="${MTP:-1}"
-
-# KV cache precision. off = f16. 8 halves it at ~10% decode; 4 quarters it.
-KVQ="${KVQ:-off}"
-
-# Prefix-cache budget. Default is one session at the working context (~9.4 GiB
-# at 128k); raise it to hold more live conversations, which is what keeps an
-# appending transcript from re-prefilling every turn.
-CACHE_MB="${CACHE_MB:-}"
-
 LOG_DIR="${LOG_DIR:-$ROOT/logs}"
 mkdir -p "$LOG_DIR"
+LOG="$LOG_DIR/$ENGINE.$PORT.log"
 
-ARGS=(--model "$MODEL" --serve --host "$HOST" --port "$PORT"
-      --ctx-size "$CTX" --max-concurrent "$NP"
-      --kv-quant "$KVQ"
-      --log-file "$LOG_DIR/mlx-serve.$PORT.log")
+# The id clients send. pi and omp were configured against mlx-serve's id, so
+# Splash announces the short name and still accepts the old one.
+ALIAS="${ALIAS:-Qwen3.8-27B}"
+LEGACY_ID="Qwen3.8-27B-MLX-Serve-4bit"
 
-if [ "$MTP" = "0" ]; then
-  ARGS+=(--no-mtp --no-pld --no-drafter)
-fi
-if [ -n "$CACHE_MB" ]; then
-  ARGS+=(--prefix-cache-mem "${CACHE_MB}MB")
-fi
+case "$ENGINE" in
+splash)
+  BIN="$(command -v splash || true)"
+  if [ -z "$BIN" ]; then
+    echo "serve: splash not found. Install it: brew install incoai/tap/splash" >&2
+    exit 1
+  fi
+  # MLX affine 4-bit, group 64 (16.1 GB). The GGUF UD-Q4_K_M build measured the
+  # same on this engine (14.7 vs 15.0 turns/min); see RESULTS.md for mxfp4.
+  # Splash pairs it with the incoai DFlash2 drafter by itself and downloads
+  # both on first start.
+  MODEL="${MODEL:-mlx-community/Qwen3.8-27B-4bit}"
+  if [ "$NP" -gt 4 ]; then
+    echo "serve: note: Splash decodes 4 requests at once; NP=$NP queues the rest" >&2
+  fi
+  # --idle-release off: the default unwires the weights after 10 idle minutes,
+  #   which makes the next tumwater turn after a quiet spell pay a reload.
+  # --max-context: per conversation; Splash's own default is the model's 256k
+  #   window when memory holds it, which tumwater does not need.
+  ARGS=(serve --model "$MODEL" --host "$HOST" --port "$PORT"
+        --max-context "$(( CTX / 1024 ))K" --no-webui --idle-release off
+        --served-model-name "$ALIAS" --served-model-name "$LEGACY_ID"
+        --announce-served-name)
+  echo "serve: splash model=$MODEL ctx=$CTX lanes=4 alias=$ALIAS (+$LEGACY_ID)"
+  echo "serve: http://$HOST:$PORT/v1  log: $LOG"
+  exec "$BIN" "${ARGS[@]}" "$@" > >(tee -a "$LOG") 2>&1
+  ;;
 
-echo "serve: model=$(basename "$MODEL") ctx=$CTX concurrent=$NP mtp=$MTP kv=$KVQ"
-echo "serve: http://$HOST:$PORT/v1  logs: $LOG_DIR/mlx-serve.$PORT.log"
-exec "$BIN" "${ARGS[@]}"
+mlx-serve)
+  BIN="${MLX_SERVE_BIN:-$HOME/opt/mlx-serve/mlx-serve-macos-arm64/mlx-serve}"
+  [ -x "$BIN" ] || BIN="$(command -v mlx-serve || true)"
+  if [ -z "$BIN" ] || [ ! -x "$BIN" ]; then
+    echo "serve: mlx-serve not found (see README, 'Install')" >&2
+    exit 1
+  fi
+  MODEL="${MODEL:-$HOME/.mlx-serve/models/ddalcu/Qwen3.8-27B-MLX-Serve-4bit}"
+  MTP="${MTP:-1}"
+  # The prefix cache must hold every live session, or sessions evict each
+  # other and re-prefill their whole transcript. A session at ~55k tokens is
+  # ~4.8 GB here (KV + GDN snapshots), so 8 GB each leaves room to grow; the
+  # shipped one-session budget (9.4 GB) measured 3.9 turns/min against 10.7.
+  CACHE_MB="${CACHE_MB:-$(( NP * 8192 ))}"
+  ARGS=(--model "$MODEL" --serve --host "$HOST" --port "$PORT"
+        --ctx-size "$CTX" --max-concurrent "$NP"
+        --prefix-cache-mem "${CACHE_MB}MB" --log-file "$LOG")
+  if [ "$MTP" = "0" ]; then
+    ARGS+=(--no-mtp --no-pld --no-drafter)
+  fi
+  echo "serve: mlx-serve model=$(basename "$MODEL") ctx=$CTX concurrent=$NP cache=${CACHE_MB}MB mtp=$MTP"
+  echo "serve: http://$HOST:$PORT/v1  log: $LOG"
+  exec "$BIN" "${ARGS[@]}" "$@"
+  ;;
+
+*)
+  echo "serve: unknown ENGINE=$ENGINE (splash | mlx-serve)" >&2
+  exit 1
+  ;;
+esac

@@ -13,3 +13,6 @@ logs/mlx-serve*.log.*
 
 # Harness output (scripts/turn_loop_bench.py --out default).
 logs/turn_loop.jsonl
+
+# Benchmark run logs and server logs (results/replay.jsonl is the record).
+logs/

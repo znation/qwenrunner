@@ -1,138 +1,188 @@
 # qwenrunner
 
 A local inference stack for **Qwen-3.8-27B** on an **Apple M5 Max with 128 GB**
-of unified memory, built around [`mlx-serve`](https://github.com/ddalcu/mlx-serve)
-on MLX weights.
+of unified memory, tuned for one workload: the [tumwater](../tumwater) agent
+fleet, **four pi sessions at once** against one server. It runs
+[Splash](https://github.com/incoai/splash) on MLX 4-bit weights with a DFlash2
+drafter.
 
 The model is a hybrid: 64 blocks, only 16 of them full attention, the rest
-linear-attention/SSM. That is why 128k of context is cheap here — the KV cache
-grows in 16 layers, not 64 — and why the numbers below hold up at depth.
+linear-attention (Gated DeltaNet). That is why 128k of context is cheap here:
+the KV cache grows in 16 layers, not 64.
 
 ## Result
 
+Measured by replaying real tumwater sessions against each engine:
+`scripts/tumwater_replay.py`, 4 sessions at once, 16 scored turns each at
+25-55k tokens of depth. Two reps per arm (Splash's default has three). Full
+table and method in [`RESULTS.md`](RESULTS.md), "Engine shoot-out".
+
+| engine (weights) | turns/min | aggregate out t/s | per-stream t/s | TTFT p50 / p90 |
+|---|---:|---:|---:|---:|
+| **Splash 1.6.0 (MLX 4-bit + DFlash2)**, `./serve.sh` | **15.0-16.0** | **64-72** | 27-34 | 2.2-3.4 / 10-14 s |
+| Kapitsa 0.2.31 (`27b` 4-bit + DFlash2, 4 slots) | 10.7-11.2 | 45-47 | 15 | 1.7-2.1 / 4.6 s |
+| mlx-serve 26.11.2, `NP=4`, 32 GB prefix cache | 10.7-11.3 | 17-19 | 16-18 | 6.6-8.3 / 21-31 s |
+| oMLX 0.7.3 (MLX 4-bit + DFlash2) | 6.6 | 26 | 9 | 5.7 / 12.8 s |
+| mlx-serve 26.11.2, as previously shipped (`NP=2` cache budget) | 3.9 | 6 | 18 | 11.5 / 128 s |
+
+**This is 4.1× the previous default's turn rate and ~10× its output
+throughput** on the same machine and the same model.
+
 | lever | setting | evidence |
 |---|---|---|
-| runtime | **`mlx-serve` 26.11.2** — `./serve.sh` | Zig server linking MLX + mlx-lm, no Python. Fastest engine measured that runs MLX-format weights; see `RESULTS.md`, "Engine survey" |
-| model | `ddalcu/Qwen3.8-27B-MLX-Serve-4bit` — 4-bit affine, 16.95 GB | ships a DFlash2 drafter in its `drafter/` subdirectory, which the server loads with the model. The `mlx-community` 4-bit build has no drafter and no MTP head and measures at the no-speculation rate |
-| speculation | **on** — MTP (depth 6) + DFlash2 + PLD | the entire win over a plain decode path: **73.4 t/s at 4k and 76-82 at 30k** with it, **28.4-34.0 and 26.8-30.9** without. 4.1 tokens accepted per verify pass at 27.5 % per-draft. `MTP=0` turns all three off |
-| context | **128k** (`CTX=131072`) | 461 t/s prefill and 46.9 t/s decode *at* 130 747 tokens; the hot-cache holds that prefix in 9 366 MB, inside its 9 389 MB default budget. The model's own limit is 256k |
-| concurrency | **`NP=2`** default, `NP=4` for a fleet | continuous batching, not fixed slots: `NP` is a cap and KV is taken as requests arrive. Four agent sessions: 54.7 t/s aggregate at TTFT p50 1.28 s with `NP=2`, 49.9 at 1.26 s and wall p50 6.3 s (against 10.4 s) with `NP=4` |
-| KV cache | **f16** (`KVQ=off`) | `KVQ=8` halves it at ~10 % decode; `KVQ=4` quarters it. Not needed at 128 GB |
-| prefix cache | **on**, budget = one session at the working context | what makes an appending agent transcript cost 1.3 s of TTFT instead of a re-prefill. `CACHE_MB` raises the budget to hold more live conversations |
+| runtime | **Splash 1.6.0** (`ENGINE=splash`, default) | the only engine measured here whose speculative decoding stays on while four requests decode: its DFlash2 draft/verify cycle runs batched across all four lanes, so each stream keeps ~29 t/s at 40k depth beside three others. mlx-serve's speculation is a single-stream win (73 t/s alone) that falls to ~16 t/s per stream once sessions overlap; oMLX's batched DFlash runs at ~9 |
+| weights | **`mlx-community/Qwen3.8-27B-4bit`** (affine 4-bit, 16.1 GB) | mxfp4 (15.2 GB) and GGUF UD-Q4_K_M measure the same on Splash: 16.3/15.6 and 14.7/15.7 turns/min against 15.0/15.7. Format is not a lever on this engine, so the affine build is kept |
+| drafter | `incoai/Qwen3.8-27B-DFlash2` | picked and downloaded by Splash itself |
+| concurrency | **4** (`NP=4`) | tumwater's fleet size. Splash decodes 4 lanes at once by design; a fifth request queues |
+| context | **128k** per session | tumwater's runs peak around 64-80k; recorded request p90 is 81k |
+| prefix cache | Splash's own, plus a 32 GB SSD tier | 96.6 % of prompt tokens served from cache on the replay, the same as every other engine once it is sized for four sessions |
+| idle release | **off** | Splash unwires the weights after 10 idle minutes by default, so the next turn after a quiet spell would pay a reload |
+
+**The previous default lost most of its speed to its prefix cache, not its
+kernels.** mlx-serve sized the cache for *one* 128k session (9.4 GB). Four
+tumwater sessions at ~55k tokens are ~4.8 GB each, so they evicted each other,
+and a quarter of all prompt tokens were re-prefilled: turns at 40-55k depth waited
+100-410 s for a first token. Raising the budget to 32 GB alone took it from 3.9 to
+10.7 turns/min. `ENGINE=mlx-serve` keeps that engine runnable, with the cache
+now sized from `NP`.
 
 ## Hardware
 
 | | |
 |---|---|
 | CPU | Apple M5 Max, 18 cores (6 super + 12 performance) |
-| GPU | integrated, `MTLGPUFamilyMetal4`, simdgroup matrix mul + tensor ops, unified memory |
+| GPU | integrated, 40 cores, `MTLGPUFamilyMetal4`, unified memory |
 | RAM | 128 GB unified (`recommendedMaxWorkingSetSize` ≈ 112 GiB) |
 | OS | macOS 27 |
 
 ## Install
 
-`mlx-serve` is not in Homebrew core, and the tap builds from source (Zig + MLX +
-llama.cpp, over 30 minutes here). Use the release binary — it is what every
-number in this repo was measured on:
+```bash
+brew tap incoai/tap
+brew install incoai/tap/splash
+```
+
+On its first start `serve.sh` downloads the weights (16.1 GB) and the DFlash2
+drafter (3.8 GB) into Splash's own store
+(`~/Library/Application Support/Splash/models`).
+
+The previous engine stays available as `ENGINE=mlx-serve`. To install it, use
+its release binary; the Homebrew tap builds from source, which takes over 30
+minutes:
 
 ```bash
 mkdir -p ~/opt/mlx-serve && cd ~/opt/mlx-serve
 curl -sL https://github.com/ddalcu/mlx-serve/releases/latest/download/mlx-serve-bin-macos-arm64.tar.gz | tar xz
-```
-
-Then pull the weights (16.95 GB, into `~/.mlx-serve/models`):
-
-```bash
 ~/opt/mlx-serve/mlx-serve-macos-arm64/mlx-serve pull ddalcu/Qwen3.8-27B-MLX-Serve-4bit
 ```
-
-`serve.sh` finds the binary at `~/opt/mlx-serve/...` or on `PATH`, and
-`MLX_SERVE_BIN` overrides both.
 
 ## Run
 
 ```bash
-./serve.sh                  # 2 concurrent, speculation on, 128k, port 8090
-NP=4 ./serve.sh             # the measured fleet setting
-MTP=0 ./serve.sh            # speculation off (the apples-to-apples arm)
-KVQ=8 CACHE_MB=16384 ./serve.sh
+./serve.sh                       # Splash, 4 sessions, 128k, port 8090
+ENGINE=mlx-serve ./serve.sh      # the previous engine (NP=4, 32 GB prefix cache)
+MODEL=mlx-community/Qwen3.8-27B-mxfp4 ./serve.sh
 ```
 
-OpenAI-compatible at `http://127.0.0.1:8090/v1`; Anthropic Messages at
-`http://127.0.0.1:8090`. Logs go to `logs/mlx-serve.8090.log`.
+OpenAI-compatible at `http://127.0.0.1:8090/v1`. Logs go to
+`logs/<engine>.8090.log`.
 
-Env: `MODEL CTX NP PORT HOST MTP KVQ CACHE_MB LOG_DIR`.
+Env: `ENGINE MODEL CTX NP PORT HOST ALIAS LOG_DIR`, plus `CACHE_MB MTP` for
+mlx-serve.
 
 ## Clients
 
-`pi` and `omp` are pointed at this server from their own configs —
-`~/.pi/agent/models.json` and `~/.omp/agent/models.yml`, provider `qwenrunner`
-— so `pi --provider qwenrunner --model Qwen3.8-27B-MLX-Serve-4bit` and
-`omp --model qwenrunner/Qwen3.8-27B-MLX-Serve-4bit` run on it. Both entries
-carry what the server advertises at `GET /v1/models`:
+`pi` and `omp` are pointed at this server from their own configs:
+`~/.pi/agent/models.json` and `~/.omp/agent/models.yml`, provider `qwenrunner`,
+model id `Qwen3.8-27B-MLX-Serve-4bit`. The switch to Splash needs **no client
+change**. `serve.sh` announces the model as `Qwen3.8-27B` and also accepts the
+old id. This matters because Splash rejects a model name it does not serve, with
+`model_not_found`.
 
-| field | value | source |
-|---|---|---|
-| model id | `Qwen3.8-27B-MLX-Serve-4bit` | the loaded model's id — re-read it when `MODEL` changes |
-| context / output | 131 072 / 65 536 | `context_length`, `agent_budget.output` |
-| thinking | `minimal … xhigh` effort | the server takes `reasoning_effort`; off sends `"none"` |
-| input | text, image | the pack carries a vision encoder (PNG, WebP, JPEG) |
-| tokens field | `max_tokens` | `compat.maxTokensField`; the server also takes `max_completion_tokens` |
-| system role | `system`, not `developer` | `compat.supportsDeveloperRole: false` |
+Checked against Splash with the old id (`scripts/toolcall_smoke.py`):
 
-Both replay `reasoning_content` on assistant history and `omp` also sends
-`chat_template_kwargs.preserve_thinking`, so an appending transcript keeps its
-prompt prefix and re-hits the hot cache instead of re-prefilling. Compaction
-reserves are sized to the window (`compaction.reserveTokens` 16 384,
-`keepRecentTokens` 20 000).
+| field | value |
+|---|---|
+| tool calls | streamed `delta.tool_calls` with JSON arguments; parallel calls work; `finish_reason: tool_calls` |
+| reasoning | in a separate `reasoning_content` field, never inline `<think>`, so pi's strip-thinking sees it |
+| `reasoning_effort` | `none`, `minimal`, `low`, `medium`, `high`, `xhigh` and `max` are all accepted; `none` turns thinking off |
+| context | 131 072 per conversation (`context_length` at `GET /v1/models`) |
+| input | text, image, PDF |
+
+For tumwater, the fleet's `maxConcurrent` plus the director should not exceed
+the server's 4 lanes. A fifth request queues behind a whole turn rather than
+joining the batch.
 
 ## Measured
 
-One stream, greedy, 384 max tokens, nonce at the front of the prompt so nothing
-is cached, warmup discarded (`scripts/openai_stream_bench.py`):
+### The tumwater shape
 
-| prompt | decode t/s | TTFT |
+Workload, from 19 358 recorded tumwater turns (508 pi sessions):
+
+| | p50 | p90 |
 |---|---:|---:|
-| 4k (`data/long_prompt.txt`) | 64.0-75.2 (median 73.4) | 6.5-7.1 s |
-| 30k (`data/prompt_30k.txt`) | 61.7-82.0 | 41.7-42.2 s |
-| 128k (`data/prompt_128k.txt`) | 46.9 | 283.5 s |
+| request prompt | 39.5k tokens | 81k |
+| new tokens per turn | 747 | 3.2k |
+| output tokens per turn | 333 | 2.2k |
+| turns per session | 29 | 78 |
 
-Four agent sessions, four turns each, 256 max tokens
-(`scripts/turn_loop_bench.py`):
+About one turn in 23 carries a context edit: tumwater's context-shake elides an
+old tool output in place, which invalidates the cached prefix from that point
+on. The replay reproduces those edits where they happened.
 
-| `NP` | aggregate out t/s | prefill t/s | TTFT p50 | TTFT p90 | wall p50 |
-|---:|---:|---:|---:|---:|---:|
-| 2 | 54.7 | 1 493 | 1.28 s | 15.8 s | 10.4 s |
-| 4 | 49.9 | 1 773 | 1.26 s | 14.9 s | 6.3 s |
+So a turn decodes a few hundred tokens at 20-80k depth after prefilling ~750
+new ones, with four sessions at once. What decides it is batched decode at
+depth, and a prefix cache that holds all four sessions.
 
-`NP=4` reads lower aggregate only because the model stopped early on more turns
-(2 481 output tokens against 3 253); its wall p50 is 6.3 s against 10.4 s, so 4
-is the better fleet setting and 2 the RAM-first default.
+### Single stream (previous engine, for reference)
+
+`mlx-serve` alone, one request, nothing cached (`scripts/openai_stream_bench.py`):
+73.4 t/s decode at 4k, 61.7-82.0 at 30k, 46.9 at 128k, and 461 t/s prefill at
+128k. That single-stream lead is real. It just does not survive four
+overlapping sessions.
 
 ## Harnesses
 
-Both are stdlib-only and drive any OpenAI-compatible endpoint, so they work
-against this server unchanged:
+All stdlib-only, and all drive any OpenAI-compatible endpoint:
 
 ```bash
-python3 scripts/openai_stream_bench.py --base-url http://127.0.0.1:8090/v1 \
-    --model Qwen3.8-27B-MLX-Serve-4bit --prompt-file data/prompt_30k.txt \
-    --max-tokens 384 --reps 4 --nonce --warmup
+# tumwater replay: extract a fixture from the local pi session store (keep it
+# out of the repo: it is real transcript content), then replay it
+python3 scripts/tumwater_replay.py extract --out /tmp/tumwater_replay.json
+python3 scripts/tumwater_replay.py run --base-url http://127.0.0.1:8090/v1 \
+    --model Qwen3.8-27B --fixture /tmp/tumwater_replay.json --label my-arm -v
 
-python3 scripts/turn_loop_bench.py --base-url http://127.0.0.1:8090/v1 \
-    --model Qwen3.8-27B-MLX-Serve-4bit --sessions 4 --turns 4 --max-tokens 256
+# one arm end to end: start a server, wait for it, replay, stop that process
+FIXTURE=/tmp/tumwater_replay.json scripts/bench_arm.sh my-arm 8100 \
+    mlx-community/Qwen3.8-27B-4bit -- splash serve --model mlx-community/Qwen3.8-27B-4bit \
+    --port 8100 --max-context 128K --no-webui --idle-release off --offline
+
+python3 scripts/replay_table.py                 # results/replay.jsonl -> table
+python3 scripts/toolcall_smoke.py --base-url http://127.0.0.1:8090/v1 --model Qwen3.8-27B
+
+python3 scripts/openai_stream_bench.py ...      # one stream at a fixed depth
+python3 scripts/turn_loop_bench.py ...          # synthetic N-session loop
 ```
 
 ## Caveats
 
-* **The win is speculation, not the MLX kernels.** With `MTP=0` the server
-  decodes at 28.4-34.0 t/s at 4k — parity with a plain llama.cpp Metal path.
-  Everything above the parity line comes from MTP + DFlash2 + PLD.
-* **One quant, not a sweep.** 4-bit affine at 16.95 GB. No 6-bit or 8-bit
-  comparison has been run on this machine.
-* **The engine ordering is vendor-published.** `mlx-serve` was chosen from a
-  cross-engine table its own author did not write, but that table is
-  vendor-run; only `mlx-serve` itself was measured here. `RESULTS.md`,
-  "Engine survey", has the sources and the caveat.
-* **No 8-session fleet run.** The agent shape above is four sessions. The
-  previous llama.cpp work measured eight; that has not been repeated here.
+* **The replay is real input but not real output.** Each turn sends the
+  recorded transcript (thinking stripped, as tumwater does), not the model's
+  own previous answers. Output lengths differ by engine: Splash and Kapitsa ran
+  to the 512-token cap on ~36-41 of 64 turns, mlx-serve on 3. The two headline
+  metrics disagree on which way that cuts. Turns/min favours short answers,
+  and Splash still leads it. Output t/s favours long answers, and it leads
+  that too, by 1.4-4×.
+* **The host was not quiet.** tumwater itself was running (on its API models)
+  throughout, with load average 1-11. Every arm records `loadavg_start/end`;
+  the reps that agree to ~5 % were taken at different loads.
+* **No quality comparison between quants.** Affine 4-bit is the default
+  because mxfp4 and GGUF bought no speed on Splash, not because they were
+  measured worse.
+* **Splash is closed-source** (a Homebrew-distributed binary), with a fixed lane
+  count of 4. More than four concurrent clients queue, and that has not been
+  measured.
+* **Kapitsa has the best tail latency** (TTFT p90 4.6 s vs Splash's 10-14 s) at
+  two-thirds of Splash's throughput. A fleet that cares more about worst-case
+  first-token time than turns per minute could prefer it. It is not wired into
+  `serve.sh`.
