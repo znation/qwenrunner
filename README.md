@@ -4,14 +4,28 @@ A local LLM inference stack for agentic coding on a 2019 Intel iMac (8-core /
 16-thread Core i9, AMD Vega 10 / Radeon Pro Vega 48 with 8 GB — the display
 GPU).
 
-Usage of the display GPU should never, ever exceed 5 GB since that is also the
-desktop.
+The display GPU is shared with the desktop. The 27B path keeps the model
+under 5 GB; the disk-spill default deliberately trades headroom for speed and
+runs at `CAP` 6500 MiB (measured peak ~5.7 GiB with a light desktop), so a
+heavy desktop can push it over — `CAP=` lowers it back.
 
-The default (`./serve.sh`) runs one **Qwen3.8-27B** instance split across the
-GPUs and CPU, fitted by llama.cpp's own `--fit` with a `--fit-target` of
-`vram_total - fit-cap` on the display GPU, so the fit budget holds regardless
-of desktop drift. The device list depends on whether the Thunderbolt eGPU is
-attached:
+The default (`./serve.sh`) runs one **Swift-1.5-Qwen3.8-Flash-Next IQ3_S**
+instance served by **disk spill** (see "Disk-spill MoE" below and
+[`RESULTS.md`](RESULTS.md)): the 83.74 GB of shards cannot fit in RAM+VRAM, so
+`-cmoe` keeps the 512 routed experts on the CPU as `mmap` pages and `-ngl 99`
+puts the non-expert weights on the GPU(s). Measured **5.0-5.2 t/s generation,
+15.3 t/s prompt**; prefill streams the whole file, so budget ~6 min per 5k
+tokens of fresh context. `CAP` is raised to 6500 MiB on this path (measured
+peak 5699-6329 MiB; the shipped 5500 kills it, and `-ub`/`-b`/`-c` reductions
+do not move the peak). No MTP (no Swift draft GGUF) and no mmproj (none
+fetched) — text-only input. `CTX=16384`/`NP=1` → one 16k slot.
+
+The previous default remains available and is selected automatically by
+`MODEL`: `MODEL=models/Qwen3.8-27B-UD-Q4_K_M.gguf ./serve.sh` runs one
+**Qwen3.8-27B** instance split across the GPUs and CPU, fitted by llama.cpp's
+own `--fit` with a `--fit-target` of `vram_total - fit-cap` on the display
+GPU, so the fit budget holds regardless of desktop drift. The device list
+depends on whether the Thunderbolt eGPU is attached:
 
 * **eGPU present** — `-dev CUDA0,Vulkan0 -sm layer`: spread across the GTX 1070
   (eGPU), the Vega 10 (built-in display GPU), and the CPU for the rest.
@@ -22,16 +36,18 @@ attached:
 The built-in display GPU always respects two guards, deliberately different:
 `--fit` packs the model into `FIT_CAP` (default 4600 MiB) via a `-fitt` margin
 of `vram_total - FIT_CAP`, and `scripts/guard.py` only `SIGKILL`s at the higher
-`CAP` (default 5500 MiB). The eGPU drives no display, so it is not capped —
-only a small fit margin (`FITT_CUDA`, default 256 MiB) keeps it from filling
-the card. `guard.py` enforces a second limit on RAM — `MemAvailable` above
-`MIN_AVAIL` (default 2048 MiB) — because there is no swap, no cgroup limit and
-no systemd-oomd here, so the kernel OOM killer is otherwise the only backstop
-and it takes the model. MTP speculation is on by default, its draft head on the
-Vega 10. The 27B is CPU-bound (only a fraction of its 64 layers fit in VRAM),
-so generation is 2-6 t/s — slow, but the 4B that used to be the default was
-hopeless on quality, so the 27B is the model. Everything below is this config's
-measurement history.
+`CAP` (default 5500 MiB; 6500 on the disk-spill path). The eGPU drives no
+display, so it is not capped — only a small fit margin (`FITT_CUDA`, default
+256 MiB) keeps it from filling the card. `guard.py` enforces a second limit on
+RAM — `MemAvailable` above `MIN_AVAIL` (default 2048 MiB) — because there is no
+swap, no cgroup limit and no systemd-oomd here, so the kernel OOM killer is
+otherwise the only backstop and it takes the model. On the 27B path MTP
+speculation is on by default, its draft head on the Vega 10. The 27B is
+CPU-bound (only a fraction of its 64 layers fit in VRAM), so generation is
+2-6 t/s. Everything below is this config's measurement history; the 27B
+remains the better daily driver when prefill latency matters — the Swift
+spill wins on generation speed and parameter count, and loses on every
+context change.
 
 ## Result
 
@@ -41,7 +57,7 @@ including six conclusions that earlier, load-contaminated measurements got wrong
 
 | lever | setting | evidence |
 |---|---|---|
-| runtime | llama.cpp @ `aa5e0092`, Vulkan/RADV | no ROCm/HIP on Vega 10 — Vulkan is the only GPU compute path |
+| runtime | llama.cpp @ `dd099a6` (was `aa5e0092`, upgraded 2026-11-15 for the MoE expert cache), Vulkan/RADV | no ROCm/HIP on Vega 10 — Vulkan is the only GPU compute path |
 | model | **`models/Qwen3.8-27B-UD-Q4_K_M.gguf`** | 16.46 GB. `general.name`/`general.basename` are `Qwen3.8-27B`; llama.cpp prints `qwen35` in benchmark tables because the GGUF's `general.architecture` is the Qwen3.5 one — same architecture, later model. Smaller quants are *faster* — Q2_K_XL offloads 20 layers vs 12 and gains +52 % generation — but cost +61 % perplexity. See `RESULTS.md` |
 | `-lm` | **`mmap`** | `dio` is 46.10 vs 36.15 t/s prompt at 128k, but it puts the CPU-side weights in the Vulkan *host* buffer type (GTT, unreclaimable system RAM): **22.8 GB vs 6.6 GB of `MemAvailable` drop**, 2 interleaved reps each. The old "~40× lighter RSS" reading measured RSS, which cannot see GTT. `LM=dio` restores the prompt throughput when RAM is free |
 | `-ngl` | **fit-derived** (was 10 on the Vega-only path) | ~252 MiB client VRAM per layer; 10 beats 8 on both axes, 2/2. `--fit` picks it from live free VRAM now — but only when there is a second device to fit against: on the Vega-only path it converges to 0 layers, because it counts the Vulkan host buffer the CPU-side weights land in as device memory |
@@ -146,9 +162,10 @@ Three things are deliberately not committed (see `.gitignore`): the model weight
 unpacked shader tooling.
 
 ```
-# 1. pinned llama.cpp
+# 1. pinned llama.cpp (upgraded 2026-11-15 from aa5e0092 for the MoE expert
+#    cache, see RESULTS.md "Disk-spill MoE: Swift IQ3_S")
 git clone https://github.com/ggml-org/llama.cpp third_party/llama.cpp
-git -C third_party/llama.cpp checkout aa5e0092fdb8980b9e89498dfb73049b4fe204c2
+git -C third_party/llama.cpp checkout dd099a6bf30c50627f6ae18915fbb687539a704d
 
 # 2. Vulkan shader tooling, without root — no glslc/libshaderc system-wide
 mkdir -p tools/pkg tools/local && cd tools/pkg
@@ -178,12 +195,14 @@ present. Both backends end up in one binary and `-dev` selects between them.
 ## Run
 
 ```
-./serve.sh                       # Qwen3.8-27B split across the GPUs + CPU (:8080)
-CTX=32768 NP=2 ./serve.sh        # two 16k slots instead of two 64k (parallel subagents)
+./serve.sh                       # Swift IQ3_S disk-spill default (:8080)
+CTX=32768 ./serve.sh             # one 32k slot instead of 16k (deeper context, slower prefill)
+MODEL=models/Qwen3.8-27B-UD-Q4_K_M.gguf ./serve.sh   # the 27B split (previous default)
 ```
 
-Qwen3.8-27B is a VL-class model: the text GGUF carries no vision encoder — it
-ships as a separate projector (`models/mmproj-Qwen3.8-27B-F16.gguf`, fetched by
+The disk-spill default serves text only (no Swift mmproj is fetched). The 27B
+path is a VL-class model: the text GGUF carries no vision encoder — it ships
+as a separate projector (`models/mmproj-Qwen3.8-27B-F16.gguf`, fetched by
 `dl_smaller.sh`), and `serve.sh` serves it by default with the encoder on the
 CPU (`--no-mmproj-offload`). Text-only traffic therefore stays 100 % on the GPU;
 only image input pays a CPU vision-encode. Set `MMPROJ_OFFLOAD=1` to move the
@@ -191,8 +210,10 @@ encoder to the GPU instead. Image input works through the OpenAI-compatible
 `/v1/chat/completions` (`image_url` content parts); set `MMPROJ=` to serve
 text-only.
 
-The server always runs llama.cpp's own `--fit on` with a `--fit-target`
-(`-fitt`) — the layer count is derived from live free VRAM, never by hand. Two
+On the 27B path the server always runs llama.cpp's own `--fit on` with a
+`--fit-target` (`-fitt`) — the layer count is derived from live free VRAM,
+never by hand. (The disk-spill path pins `-ngl 99 -cmoe --fit off` instead:
+the fit cannot see the expert split.) Two
 guards, deliberately different: the fit packs the model into `FIT_CAP` (default
 4600 MiB), so the display GPU leaves `vram_total - FIT_CAP` free (`FITT`,
 3576 MiB here) — because the fit sees the desktop's usage in `free`, that holds
@@ -221,28 +242,31 @@ system RAM. Measured at 128k, `dio` drops `MemAvailable` 22.8 GB against
 `mmap`'s 6.6 GB, for ~21 % more prompt throughput. `LM=dio ./serve.sh` when the
 box has room.
 
-The default is `CTX=131072` with `-np 2` → **two 65536-slots** — the same
-per-slot context the clients already expect (pi `contextWindow` 59392). The 27B
-is CPU-bound (only a fraction of its 64 layers fit in VRAM), so generation is
-2-6 t/s; the desktop baseline sets how many layers the fit can keep on the Vega,
-and the eGPU roughly triples the offloadable layer count (40 vs 12). `NP=2`
-halves the pool per slot but buys fairness for concurrent agents.
+On the 27B path the default is `CTX=131072` with `-np 2` → **two 65536-slots**.
+The 27B is CPU-bound (only a fraction of its 64 layers fit in VRAM), so
+generation is 2-6 t/s; the desktop baseline sets how many layers the fit can
+keep on the Vega, and the eGPU roughly triples the offloadable layer count
+(40 vs 12). `NP=2` halves the pool per slot but buys fairness for concurrent
+agents. On the disk-spill default the pool is `CTX=16384` with `-np 1` → **one
+16384-slot** — a second slot would double the expert working set and thrash
+the page cache, so concurrency is deliberately 1; raise `CTX=` for more depth
+at ~6 min of prefill per 5k fresh tokens.
 
-The local model's entry in both clients is set to **58k of that 64k slot**,
-leaving room for tool-call output: pi in `~/.pi/agent/models.json`
-(`contextWindow: 59392`), and omp in `~/.omp/agent/models.yml`, which needs an
-explicit override because its auto-discovery of `http://127.0.0.1:8080`
+The local model's entry in both clients tracks the serving default: pi in
+`~/.pi/agent/models.json` and omp in `~/.omp/agent/models.yml` now name
+`Swift-1.5-Qwen3.8-Flash-Next` with `contextWindow: 14336` (the 16k slot less
+room for tool-call output, text-only input — no mmproj is served). omp needs
+the explicit override because its auto-discovery of `http://127.0.0.1:8080`
 otherwise takes the server's raw per-slot context as both the window *and* the
-output budget (65536/65536). pi's default is the local model
-(`defaultProvider: "qwenrunner"`, `defaultModel: "Qwen3.8-27B"` in
-`~/.pi/agent/settings.json`); the cloud model
+output budget. The cloud model
 (`huggingface/deepseek-ai/DeepSeek-V4.1-Flash:deepinfra`) remains available via
 `--model`. The two tumwater fleets on this box name it as their free
 `fallback`, which is the pair the docs' backend guide recommends (a budgeted API
 primary, the cost-n/a local model behind it).
-`serve.sh` passes `-a Qwen3.8-27B` so clients see a stable model id instead of
-the .gguf path; the alias is advisory — llama-server ignores the request's
-`model` field, so a client still sending an older id works.
+`serve.sh` passes `-a Swift-1.5-Qwen3.8-Flash-Next` so clients see a stable
+model id instead of the .gguf path; the alias is advisory — llama-server
+ignores the request's `model` field, so a client still sending an older id
+works.
 
 `serve.sh` prints the configuration it picked, including whether the eGPU was
 detected. The eGPU is optional: when `/dev/nvidia0` is present and the binary
@@ -347,6 +371,30 @@ window above 4 GB. Verify: `nvidia-smi` lists the card with 8192 MiB, and
   GT/s is available. This is *not* the bottleneck — per token only ~20 KB crosses
   the CPU↔GPU boundary. The 1070's weaker prefill is simply that the Vega 48 has
   ~2× its FP32 throughput.
+
+## Disk-spill MoE (serving default)
+
+A model far larger than RAM+VRAM can run here by keeping its experts on the
+CPU as `mmap` pages and streaming them from the NVMe — measured, not
+projected: the **IQ3_S tier of
+[ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF)**
+(83.74 GB, ~200B-param MoE, 10+1 of 512 experts active per token) runs at
+**5.0 t/s generation / 15.3 t/s prompt** with `-cmoe -ngl 99 -lm mmap` —
+generation on par with the 27B eGPU split, at 5× the parameters. Prefill is
+the price: the first pass over a context streams the whole 84 GB
+(~15 t/s, i.e. ~6 min per 5k tokens). The new upstream MoE expert cache
+(`--moe-cache-mib`) **hurts** on this host — VRAM pressure and upload churn
+cost more than CPU expert compute saves; do not enable it. Full tables and
+the reproduction script: `RESULTS.md` "Disk-spill MoE", `scripts/bench_iq3s.sh`.
+Shards live in `models/iq3s/` (`scripts/dl_parallel.sh` downloads with
+parallel HTTP ranges). Caveat: the run peaks at ~5.7 GiB of system VRAM with
+a light desktop — ~200 MiB over the shipped 5500 MiB `guard.py` cap, and
+`-ub`/`-b`/`-c` reductions do not fix it (the peak is fixed cost) — so a
+guarded run needs a lighter desktop or `CAP=` raised for this model — which is
+what the serving default now does (`CAP=6500` on the spill path). This is the
+serving default as of 2026-11-15; the 27B remains the better choice when
+prefill latency or image input matters (`MODEL=models/Qwen3.8-27B-UD-Q4_K_M.gguf
+./serve.sh`).
 
 ## Harness
 

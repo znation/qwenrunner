@@ -1,4 +1,4 @@
--- llama.cpp version: 0.6.0-dev
+-- llama.cpp version: 1.0.0-dev
 CMAKE_BUILD_TYPE=Release
 -- sccache found, compilation results will be cached. Disable with GGML_CCACHE=OFF.
 -- CMAKE_SYSTEM_PROCESSOR: x86_64
@@ -6,14 +6,7 @@ CMAKE_BUILD_TYPE=Release
 -- Including CPU backend
 -- x86 detected
 -- Adding CPU backend variant ggml-cpu: -march=native 
--- Found CUDAToolkit: /usr/include (found version "12.4.131")
 -- CUDA Toolkit found
--- The CUDA compiler identification is NVIDIA 12.4.131 with host compiler GNU 13.3.0
--- Detecting CUDA compiler ABI info
--- Detecting CUDA compiler ABI info - done
--- Check for working CUDA compiler: /usr/bin/nvcc - skipped
--- Detecting CUDA compile features
--- Detecting CUDA compile features - done
 -- Using CMAKE_CUDA_ARCHITECTURES=61 CMAKE_CUDA_ARCHITECTURES_NATIVE=61-real
 -- FlashAttention K-V type combinations: f16-f16;q4_0-q4_0;q8_0-q8_0;bf16-bf16
 -- Could NOT find NCCL (missing: NCCL_LIBRARY NCCL_INCLUDE_DIR) 
@@ -29,10 +22,10 @@ CMAKE_BUILD_TYPE=Release
 -- GL_EXT_float_e2m1 not supported by glslc
 -- GL_EXT_float_e4m3 not supported by glslc
 -- Including Vulkan backend
--- ggml version: 0.26.0
--- ggml commit:  aa5e009
+-- ggml version: 1.0.0
+-- ggml commit:  dd099a6
 -- OpenSSL found: 3.5.7
 -- Generating embedded license file for target: llama-app
--- Configuring done (2.8s)
+-- Configuring done (0.9s)
 -- Generating done (0.3s)
 -- Build files have been written to: /home/zach/qwenrunner/build

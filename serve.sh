@@ -1,8 +1,21 @@
 #!/usr/bin/env bash
 # serve.sh — launch llama-server for the local agent stack.
 #
-# DEFAULT (and only mode): one Qwen3.8-27B instance split across the GPUs and
-# CPU, fitted by llama.cpp's own --fit. The device list depends on whether the
+# DEFAULT: one Swift-1.5-Qwen3.8-Flash-Next IQ3_S instance served by disk
+# spill (RESULTS.md "Disk-spill MoE"): the 83.74 GB of shards cannot fit in
+# RAM+VRAM, so -cmoe keeps the 512 routed experts on the CPU as mmap pages
+# and -ngl 99 puts the non-expert weights on the GPU(s). Measured 5.0-5.2 t/s
+# generation, 15.3 t/s prompt; prefill streams the whole file, so budget
+# ~6 min per 5k tokens of fresh context. CAP defaults to 6500 on this path
+# (measured peak 5699-6329 MiB; the shipped 5500 kills it). No MTP (no Swift
+# draft GGUF), no mmproj (none fetched). CTX=16384/NP=1 → one 16k slot.
+#
+# The previous default remains available and is selected automatically by
+# MODEL:   MODEL=models/Qwen3.8-27B-UD-Q4_K_M.gguf ./serve.sh
+# It runs one **Qwen3.8-27B** instance split across the GPUs and CPU, fitted
+# by llama.cpp's own `--fit` with a `--fit-target` of
+# `vram_total - fit-cap` on the display GPU, so the fit budget holds
+# regardless of desktop drift. The device list depends on whether the
 # Thunderbolt eGPU is attached:
 #   * eGPU present: -dev CUDA0,Vulkan0 -sm layer — spread across the GTX 1070
 #     (eGPU), the Vega 10 (built-in display GPU), and the CPU for the rest.
@@ -41,7 +54,28 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export PATH="$ROOT/tools/local/usr/bin:$PATH"
 export LD_LIBRARY_PATH="$ROOT/build/bin:$ROOT/tools/local/usr/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH:-}"
 
-MODEL="${MODEL:-$ROOT/models/Qwen3.8-27B-UD-Q4_K_M.gguf}"
+MODEL="${MODEL:-$ROOT/models/iq3s/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf}"
+# Disk-spill MoE path (RESULTS.md "Disk-spill MoE"): the Swift IQ3_S shards are
+# 83.74 GB — far over RAM+VRAM — so the experts stay on the CPU as mmap pages
+# (-cmoe) and stream from the NVMe. That path disables the 27B machinery below:
+# --fit counts the host expert buffer as device memory and converges to 0
+# layers, there is no Swift MTP draft GGUF, and no Swift vision projector is
+# fetched. Measured: 5.0-5.2 t/s generation, 15.3 t/s prompt (5240-token
+# prefill ~6 min), peak system VRAM 5699-6329 MiB at -ub 512/256 — hence the
+# raised CAP (5500 kills it; -ub/-b/-c reductions do not move the peak).
+case "$(basename "$MODEL")" in
+    Swift*) SPILL=1 ;;
+    *)      SPILL=0 ;;
+esac
+if [ "$SPILL" = 1 ]; then
+    ALIAS="${ALIAS:-Swift-1.5-Qwen3.8-Flash-Next}"
+    MMPROJ="${MMPROJ:-}"
+    MTP="${MTP:-0}"
+    CTX="${CTX:-16384}"
+    NP="${NP:-1}"
+    CAP="${CAP:-6500}"
+    UBATCH="${UBATCH:-256}"
+fi
 # The name the API advertises (/v1/models). Without it llama-server reports the
 # .gguf path, so a client's model id becomes the path. The alias gives both
 # clients one stable id to refer to.
@@ -52,6 +86,10 @@ ALIAS="${ALIAS:-Qwen3.8-27B}"
 # entirely on the GPU and only image input pays the CPU encode. Fetched by
 # scripts/dl_smaller.sh.
 MMPROJ="${MMPROJ:-$ROOT/models/mmproj-Qwen3.8-27B-F16.gguf}"
+if [ "$SPILL" = 1 ]; then
+    # no Swift vision projector is fetched; MMPROJ=<path> adds one explicitly
+    MMPROJ=""
+fi
 MMPROJ_OFFLOAD="${MMPROJ_OFFLOAD:-0}"
 # CTX is the *pool*, and llama-server divides it by NP: the default 131072 with
 # NP=2 is 65536 per slot, which is what a client actually gets and what its
@@ -147,7 +185,11 @@ if ! "$ROOT/build/bin/llama-bench" --list-devices 2>/dev/null | grep -q '^  Vulk
 fi
 if [ ! -f "$MODEL" ]; then
     echo "serve: missing $MODEL" >&2
-    echo "serve: fetch the Qwen3.8-27B GGUF into models/ (see README)" >&2
+    if [ "$SPILL" = 1 ]; then
+        echo "serve: fetch the Swift IQ3_S shards into models/iq3s/ (see README 'Disk-spill MoE')" >&2
+    else
+        echo "serve: fetch the Qwen3.8-27B GGUF into models/ (see README)" >&2
+    fi
     exit 1
 fi
 if [ -n "$MMPROJ" ] && [ ! -f "$MMPROJ" ]; then
@@ -208,7 +250,16 @@ fi
 # with the trunk fully on the CPU has not been measured.
 FIT_ON=1
 FIT_ARGS=(--fit on)
-if [ "$EGPU" = 1 ]; then
+if [ "$SPILL" = 1 ]; then
+    # Disk-spill path: --fit cannot be used (it counts the host expert buffer
+    # as device memory and converges to 0 layers), so the non-expert weights
+    # are pinned to the GPU(s) and the experts stay on the CPU via -cmoe.
+    FIT_ON=0
+    FIT_ARGS=(-ngl 99 -cmoe --fit off)
+    if [ -n "${NGL:-}" ]; then
+        FIT_ARGS=(-ngl "$NGL" -cmoe --fit off)
+    fi
+elif [ "$EGPU" = 1 ]; then
     FIT_ARGS+=( -fitt "$FITT_CUDA,$VEGA_MARGIN")
 else
     FIT_ARGS+=( -fitt "$VEGA_MARGIN")
@@ -216,7 +267,8 @@ fi
 
 # NGL=/TS= override: llama.cpp's fit aborts rather than honour an explicit
 # -ngl/-ts, so setting either turns --fit off and pins the layer count.
-if [ -n "${NGL:-}" ] || [ -n "${TS:-}" ]; then
+# (The spill path handled NGL above and must keep -cmoe, so it skips this.)
+if [ "$SPILL" = 0 ] && [ -n "${NGL:-}" ] || [ "$SPILL" = 0 ] && [ -n "${TS:-}" ]; then
     FIT_ON=0
     FIT_ARGS=()
     [ -n "${NGL:-}" ] && FIT_ARGS+=( -ngl "$NGL")
@@ -274,6 +326,9 @@ if [ "$FIT_ON" = 1 ]; then
     fi
 else
     echo "serve: --fit off (NGL=/TS= set): -ngl ${NGL:-auto} -ts ${TS:-auto}"
+fi
+if [ "$SPILL" = 1 ]; then
+    echo "serve: disk-spill MoE — experts on CPU (mmap, -cmoe), streamed from NVMe; cap=${CAP}MiB"
 fi
 if [ "$MTP" = 1 ]; then
     echo "serve: mtp=on draft=$(basename "$MD") devd=$DEVD ngld=$NGLD ctkd=$DCTK ctvd=$DCTV n-max=$DNMAX p-min=$DPMIN"

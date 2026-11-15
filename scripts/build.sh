@@ -10,7 +10,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LLAMA_DIR="$ROOT/third_party/llama.cpp"
 BUILD_DIR="${BUILD_DIR:-$ROOT/build}"
-PINNED_REV="aa5e0092fdb8980b9e89498dfb73049b4fe204c2"
+PINNED_REV="dd099a6bf30c50627f6ae18915fbb687539a704d"
 JOBS="${JOBS:-$(nproc)}"
 
 export PATH="$ROOT/tools/local/usr/bin:$PATH"

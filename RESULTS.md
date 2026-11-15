@@ -22,10 +22,15 @@ carries most of the weight in this file.
 
 ## Build
 
-llama.cpp pinned at `aa5e0092fdb8980b9e89498dfb73049b4fe204c2`, built with
-Vulkan, `GGML_NATIVE=ON`, `LLAMA_CURL=OFF`. `scripts/build.sh` reproduces it.
-The pinned checkout is never patched; the one missing SPIRV include is worked
-around caller-side with `-isystem tools/local/usr/include`.
+llama.cpp pinned at `dd099a6bf30c50627f6ae18915fbb687539a704d` (upstream
+master, 2026-11-15; upgraded from `aa5e0092` 2026-10-07 for the MoE expert
+cache — 926 commits, all `serve.sh` flags verified present at the new pin,
+and the 27B default re-smoke-tested end to end: load, MTP draft on the Vega,
+4.5 t/s generation with 74–100 % draft acceptance), built with Vulkan **and
+CUDA** (`GGML_CUDA=ON`, sm_61 for the eGPU), `GGML_NATIVE=ON`,
+`LLAMA_CURL=OFF`. `scripts/build.sh` reproduces it. The pinned checkout is
+never patched; the one missing SPIRV include is worked around caller-side
+with `-isystem tools/local/usr/include`.
 
 `glslc` + `libshaderc.so.1` + `spirv-headers` were extracted from Debian
 packages into `tools/local/`.
@@ -1043,6 +1048,90 @@ because the fit already sees the desktop's usage in `free`.
 * **`-sm row`/`-sm tensor` fail on the first device, not the second.** The error
   names `CUDA0`, which reads like a CUDA problem; it is a backend-capability
   check, and Vulkan has the same gap (see "Split modes other than `-sm layer`").
+
+## Disk-spill MoE: Swift-1.5-Qwen3.8-Flash-Next IQ3_S **[clean]**
+
+Can a model far larger than RAM+VRAM run here by spilling experts to the NVMe?
+Yes — measured. [ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF)
+IQ3_S is **83.74 GB** (two shards, SHA256-verified against the repo's
+`SHA256SUMS`) — a ~200B-parameter MoE (512 experts, **10 routed + 1 shared
+active per token**, `moe_intermediate_size` 640, 48 layers, hybrid
+linear/full attention with full attention every 4th layer and 2 KV heads, so
+the KV cache is tiny). Combined memory here is ~55 GB (39 GiB RAM + 8176 MiB
+Vega + 8192 MiB eGPU), so no tier of that repo fits — IQ3_S is 29 GB over even
+with the eGPU attached.
+
+The mechanism is llama.cpp's `-cmoe` (`--cpu-moe`): all expert weights stay on
+the CPU as `mmap` file pages, attention/embeddings/output go to the GPU
+(`-ngl 99`), and each token touches only ~11 of 512 experts (~2 MB each at
+3.4 bpw), so the per-token read set is ~2 GB against an 84 GB file. NVMe
+measured **2.3 GB/s** (direct read). `scripts/bench_iq3s.sh` measures it;
+raw per-arm results in `results/iq3s_spill.jsonl`. One 5240-token prompt,
+128 generated tokens, one rep per arm (A repeated twice), desktop light
+(~1.2 GiB of the Vega), **no `guard.py` in the loop** — peak system VRAM is
+sampled by the script instead, so the VRAM column is comparable to the caps
+but nothing was killed at them:
+
+| arm | flags | prompt t/s | gen t/s | peak system VRAM | MemAvailable after |
+|---|---|---:|---:|---:|---:|
+| A | `-cmoe` (demand paging) | 15.34 / 15.24 | **5.08 / 4.95** | 6329 / 5795 MiB | 32.5 / 31.8 GiB |
+| B | + `--moe-cache-mib 3072` | 12.68 | 2.51 | 8161 MiB | 30.6 GiB |
+| C | B + `--moe-cache-cpu-share 1.0` | 13.29 | 4.42 | 7978 MiB | 31.1 GiB |
+| A, guard-safe | `-ub 256 -c 6144` | 12.53 | 5.13 | 5699 MiB | 31.9 GiB |
+| A, `-ub 128` | `-ub 128 -c 5632` | 10.02 | 5.25 | 5676 MiB | 31.7 GiB |
+| A, `-b 256` | `-b 256 -ub 256 -c 6144` | 13.00 | 5.22 | 5744 MiB | 32.1 GiB |
+
+Conclusions:
+
+* **Plain demand paging wins and is genuinely usable: 5.0 t/s generation and
+  15.3 t/s prompt for a 200B MoE streamed from disk** — generation on par with
+  the 27B eGPU split (6.2 t/s) and well above the Vega-only 27B path (3.4 t/s),
+  at 5× the parameter count. The 10/512 expert sparsity is what makes it work:
+  generation barely touches the disk (the hot-expert working set fits in the
+  ~30 GiB of page cache, and routing skew concentrates it further), so the
+  earlier I/O-bound estimate (~1–2 t/s) was too pessimistic.
+* **Prefill is the cost.** A batch touches most of the 512 experts, so the
+  first prefill streams the whole 84 GB: 5240 tokens in ~342–414 s
+  (15.3/12.7 t/s). Every context change pays a proportional price; the 27B
+  prefills the same prompt in ~2 min at 42 t/s. Context checkpoints
+  (`-ctxcp`) apply here too and are the mitigation.
+* **The MoE expert cache hurts on this host.** `--moe-cache-mib 3072` (arm B)
+  lost 26 % prompt and half the generation against arm A while peaking at
+  8161 of 8176 MiB — VRAM pressure plus per-layer cache upload/eviction churn
+  costs more than CPU expert compute saves when the host path is already
+  fast. `--moe-cache-cpu-share 1.0` (arm C, misses computed on CPU instead of
+  uploaded) recovers most of it but still loses to plain `-cmoe`. Do not
+  enable the cache for this model here.
+* **The display-GPU cap is the real constraint, not speed.** Arm A peaks at
+  5795–6329 MiB against the 5500 MiB `guard.py` cap (the desktop was light;
+  ~1.2 GiB of the Vega). Shrinking `-ub` 512→256→128 barely moves the peak
+  (6329 → 5699 → 5676 MiB; `-b 256` 5744 MiB) and costs prompt throughput
+  (15.3 → 12.5 → 10.0 t/s; `-b 256` recovers 13.0) while generation stays
+  ~5.1–5.2 t/s — the peak is dominated by fixed
+  costs (non-expert weights, graph, batch buffers), not the micro-batch. At
+  the shipped `CAP=5500` a guarded run of this model needs a lighter desktop
+  or a raised cap; the model+compute footprint itself is ~4.5 GiB.
+* **RAM never binds.** `MemAvailable` stayed ≥ 30.6 GiB in every arm — the
+  mmap'd weights are reclaimable page cache, so `guard.py`'s RAM floor is a
+  non-issue on this path, unlike the 27B's `dio` mode.
+
+Reproduce: `./scripts/bench_iq3s.sh` (arms A/B/C; `ARMS=`, `UB=`, `BATCH=`,
+`CTX=`, `CACHE_MIB=` override). Shards in `models/iq3s/`, downloaded with
+`scripts/dl_parallel.sh` (12 range streams; HF caps ~30 MB/s per IP, so
+parallel streams do not multiply throughput — 84 GB takes ~45 min).
+
+**Cutover (2026-11-15):** this config is now `serve.sh`'s default — `-ngl 99
+-cmoe --fit off`, `CTX=16384`/`NP=1` (one 16k slot), `-ub 256`, `CAP=6500`
+(measured peak 5699–6329 MiB; the shipped 5500 kills it, and `-ub`/`-b`/`-c`
+reductions do not move the peak), `MTP=0` (no Swift draft GGUF) and no mmproj
+(none fetched; text-only). Smoke-tested end to end under `guard.py`: health,
+correct arithmetic answer, 4.5 t/s generation on a short cold prompt. The 27B
+path stays available via `MODEL=models/Qwen3.8-27B-UD-Q4_K_M.gguf ./serve.sh`
+and remains the better choice when prefill latency, image input or >16k
+contexts matter. Both clients' local entries were retargeted
+(`~/.pi/agent/models.json`, `~/.omp/agent/models.yml`:
+`Swift-1.5-Qwen3.8-Flash-Next`, `contextWindow: 14336`, text-only) — those
+files live outside this repo and are not committed.
 
 ## Serving (`llama-server`)
 
