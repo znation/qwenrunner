@@ -1115,23 +1115,64 @@ Conclusions:
   mmap'd weights are reclaimable page cache, so `guard.py`'s RAM floor is a
   non-issue on this path, unlike the 27B's `dio` mode.
 
+### The -ngl ladder and the 128k depth breach **[clean]**
+
+Two constraints surfaced when the spill default was first set to `-ngl 99`:
+
+* **System VRAM grows during deep prefill.** A 128k-context probe
+  (`CTX=131072`, `-ngl 99`, 42k-token prompt built from `long_prompt.txt` ×8)
+  idled at 6981 MiB, read 7005 MiB at 24k depth, and was killed by
+  `guard.py` at **7620 MiB (cap 7600) at 31k depth** — `vram_violation: true`,
+  RAM never below 32.7 GiB available (`results/` guard summary in the run
+  log). The ~650 MiB growth is depth-driven workspace, not context
+  allocation: it appears on the first deep request at any context size
+  (the 8k arms below show +450–550 MiB at 5240 depth). A GPU-resident spill
+  config therefore cannot be *filled* under a display-safe cap, whatever its
+  idle footprint. Prefill degraded 14.3 → 9.6 t/s from 2k to 31k depth.
+* **The fix is `-ngl`, and it is nearly free below 99**
+  (`scripts/bench_ngl_spill.sh`, `results/ngl_spill.jsonl`; CTX 8192,
+  5240-token prompt, 128 gen, one rep, desktop ~1.2–1.5 GiB, measurement cap
+  7000 — not the shipped cap):
+
+| `-ngl` | idle system VRAM | peak | prompt t/s | gen t/s |
+|---|---:|---:|---:|---:|
+| 99 | 5530 | 6450 | 12.28 | 1.52* |
+| 80 | 5593 | 5731 | 13.17 | 5.09 |
+| 60 | 5718 | 5731 | 13.03 | 5.13 |
+| 40 | 4970 | 4985 | 12.49 | 4.70 |
+| 20 | 3419 | 3945 | 11.03 | 4.14 |
+| **0** | **1430** | **1440** | 9.80 | **3.38** |
+
+  *arm 99 ran first on a cold expert page cache (the 84 GB had been evicted by
+  the 128k probes); its true generation is ~5.1 t/s, as arms 80/60 show.
+
+  Below `-ngl 99` the depth-growth step disappears (peak ≈ idle + ≤140 MiB),
+  generation loses ≤8 % down to `-ngl 40`, and `-ngl 0` — pure CPU — leaves
+  the model holding **zero VRAM** (idle = desktop alone) at 3.38 t/s
+  generation, still 2.3× the 27B Vega-only path (1.4 t/s). Context becomes
+  RAM-bound (KV ~14.5 KiB/token measured across the 8k→128k idle delta:
+  5242 → 6981 MiB for 120k tokens) instead of VRAM-bound.
+
+**Cutover (2026-11-15, revised same day):** the spill default is `-ngl 0` —
+`-cmoe --fit off -ngl 0`, `CTX=32768`/`NP=1` (one 32k slot), `-ub 256`,
+`CAP=5500` (the repo-standard kill line; the model holds no VRAM, so the cap
+only backstops), `MTP=0`, no mmproj (text-only). Smoke-tested under
+`guard.py`: health, correct arithmetic (19×27=513), 3.41 t/s generation,
+system VRAM 1439 MiB at idle. The display GPU — including under gaming — is
+never contested: the server is the one process that cannot take VRAM away
+from the desktop. `NGL=80`/`60` restores ~5.1 t/s at ~5.7 GiB system VRAM for
+a light desktop. The 27B path stays available via
+`MODEL=models/Qwen3.8-27B-UD-Q4_K_M.gguf ./serve.sh`. Both clients' local
+entries were retargeted (`~/.pi/agent/models.json`,
+`~/.omp/agent/models.yml`: `Swift-1.5-Qwen3.8-Flash-Next`,
+`contextWindow: 30720`, text-only) — those files live outside this repo and
+are not committed.
+
 Reproduce: `./scripts/bench_iq3s.sh` (arms A/B/C; `ARMS=`, `UB=`, `BATCH=`,
-`CTX=`, `CACHE_MIB=` override). Shards in `models/iq3s/`, downloaded with
+`CTX=`, `CACHE_MIB=` override) and `./scripts/bench_ngl_spill.sh`
+(`NGLS=`, `CTX=` override). Shards in `models/iq3s/`, downloaded with
 `scripts/dl_parallel.sh` (12 range streams; HF caps ~30 MB/s per IP, so
 parallel streams do not multiply throughput — 84 GB takes ~45 min).
-
-**Cutover (2026-11-15):** this config is now `serve.sh`'s default — `-ngl 99
--cmoe --fit off`, `CTX=16384`/`NP=1` (one 16k slot), `-ub 256`, `CAP=6500`
-(measured peak 5699–6329 MiB; the shipped 5500 kills it, and `-ub`/`-b`/`-c`
-reductions do not move the peak), `MTP=0` (no Swift draft GGUF) and no mmproj
-(none fetched; text-only). Smoke-tested end to end under `guard.py`: health,
-correct arithmetic answer, 4.5 t/s generation on a short cold prompt. The 27B
-path stays available via `MODEL=models/Qwen3.8-27B-UD-Q4_K_M.gguf ./serve.sh`
-and remains the better choice when prefill latency, image input or >16k
-contexts matter. Both clients' local entries were retargeted
-(`~/.pi/agent/models.json`, `~/.omp/agent/models.yml`:
-`Swift-1.5-Qwen3.8-Flash-Next`, `contextWindow: 14336`, text-only) — those
-files live outside this repo and are not committed.
 
 ## Serving (`llama-server`)
 

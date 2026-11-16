@@ -4,21 +4,26 @@ A local LLM inference stack for agentic coding on a 2019 Intel iMac (8-core /
 16-thread Core i9, AMD Vega 10 / Radeon Pro Vega 48 with 8 GB — the display
 GPU).
 
-The display GPU is shared with the desktop. The 27B path keeps the model
-under 5 GB; the disk-spill default deliberately trades headroom for speed and
-runs at `CAP` 6500 MiB (measured peak ~5.7 GiB with a light desktop), so a
-heavy desktop can push it over — `CAP=` lowers it back.
+The display GPU is shared with the desktop. The repo's stable cap for it is
+**5000 MiB** system VRAM (RESULTS.md "VRAM policy"; desktop drift measured
+746–2188 MiB/hour from Firefox video and claude-desktop), with `guard.py`
+killing at `CAP` 5500. The disk-spill default holds zero model VRAM, so it
+cannot pressure the desktop at all — under gaming the server is simply the
+one process that never competes for the card.
 
 The default (`./serve.sh`) runs one **Swift-1.5-Qwen3.8-Flash-Next IQ3_S**
 instance served by **disk spill** (see "Disk-spill MoE" below and
 [`RESULTS.md`](RESULTS.md)): the 83.74 GB of shards cannot fit in RAM+VRAM, so
-`-cmoe` keeps the 512 routed experts on the CPU as `mmap` pages and `-ngl 99`
-puts the non-expert weights on the GPU(s). Measured **5.0-5.2 t/s generation,
-15.3 t/s prompt**; prefill streams the whole file, so budget ~6 min per 5k
-tokens of fresh context. `CAP` is raised to 6500 MiB on this path (measured
-peak 5699-6329 MiB; the shipped 5500 kills it, and `-ub`/`-b`/`-c` reductions
-do not move the peak). No MTP (no Swift draft GGUF) and no mmproj (none
-fetched) — text-only input. `CTX=16384`/`NP=1` → one 16k slot.
+`-cmoe` keeps the 512 routed experts on the CPU as `mmap` pages and `-ngl 0`
+runs everything on the CPU — **the model holds zero VRAM**, so the display
+GPU (desktop, video, gaming) is untouched and `CAP` stays at the repo-standard
+5500. Measured **3.38 t/s generation, 9.8 t/s prompt**; prefill streams the
+whole file, so budget ~1 h per 32k tokens of fresh context. Context is
+RAM-bound, not VRAM-bound (KV ~14.5 KiB/token): `CTX=65536` (~0.9 GiB) and
+`CTX=131072` (~1.9 GiB) are safe — the cost is prefill time, not memory.
+No MTP (no Swift draft GGUF) and no mmproj (none fetched) — text-only input.
+`CTX=32768`/`NP=1` → one 32k slot. `NGL=80`/`60` buys back ~5.1 t/s
+generation at ~5.7 GiB of system VRAM — a light-desktop option only.
 
 The previous default remains available and is selected automatically by
 `MODEL`: `MODEL=models/Qwen3.8-27B-UD-Q4_K_M.gguf ./serve.sh` runs one
@@ -195,8 +200,9 @@ present. Both backends end up in one binary and `-dev` selects between them.
 ## Run
 
 ```
-./serve.sh                       # Swift IQ3_S disk-spill default (:8080)
-CTX=32768 ./serve.sh             # one 32k slot instead of 16k (deeper context, slower prefill)
+./serve.sh                       # Swift IQ3_S disk-spill default, CPU-only (:8080)
+CTX=65536 ./serve.sh             # one 64k slot (KV ~0.9 GiB RAM; prefill ~110 min)
+NGL=80 ./serve.sh                # GPU-assisted: ~5.1 t/s gen, ~5.7 GiB system VRAM (light desktop)
 MODEL=models/Qwen3.8-27B-UD-Q4_K_M.gguf ./serve.sh   # the 27B split (previous default)
 ```
 
@@ -379,19 +385,21 @@ CPU as `mmap` pages and streaming them from the NVMe — measured, not
 projected: the **IQ3_S tier of
 [ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF)**
 (83.74 GB, ~200B-param MoE, 10+1 of 512 experts active per token) runs at
-**5.0 t/s generation / 15.3 t/s prompt** with `-cmoe -ngl 99 -lm mmap` —
-generation on par with the 27B eGPU split, at 5× the parameters. Prefill is
-the price: the first pass over a context streams the whole 84 GB
-(~15 t/s, i.e. ~6 min per 5k tokens). The new upstream MoE expert cache
-(`--moe-cache-mib`) **hurts** on this host — VRAM pressure and upload churn
-cost more than CPU expert compute saves; do not enable it. Full tables and
-the reproduction script: `RESULTS.md` "Disk-spill MoE", `scripts/bench_iq3s.sh`.
-Shards live in `models/iq3s/` (`scripts/dl_parallel.sh` downloads with
-parallel HTTP ranges). Caveat: the run peaks at ~5.7 GiB of system VRAM with
-a light desktop — ~200 MiB over the shipped 5500 MiB `guard.py` cap, and
-`-ub`/`-b`/`-c` reductions do not fix it (the peak is fixed cost) — so a
-guarded run needs a lighter desktop or `CAP=` raised for this model — which is
-what the serving default now does (`CAP=6500` on the spill path). This is the
+**3.38 t/s generation / 9.8 t/s prompt** with `-cmoe -ngl 0 -lm mmap` — pure
+CPU inference, 2.3× the 27B Vega-only path's generation, and the model holds
+**zero VRAM**, so the desktop (including gaming) never competes with it.
+Prefill is the price: the first pass over a context streams the whole 84 GB
+(~10-15 t/s, degrading with depth — ~1 h per 32k fresh tokens). The new
+upstream MoE expert cache (`--moe-cache-mib`) **hurts** on this host — VRAM
+pressure and upload churn cost more than CPU expert compute saves; do not
+enable it. GPU layers are available via `NGL=`: 80/60 keep ~5.1 t/s
+generation at ~5.7 GiB of system VRAM (light desktop only — the 128k probe
+also showed system VRAM growing ~650 MiB during deep prefill and breaching a
+7600 MiB cap at 31k depth, so GPU-resident spill configs are capped by the
+display, not by choice). Full tables and the reproduction scripts:
+`RESULTS.md` "Disk-spill MoE", `scripts/bench_iq3s.sh`,
+`scripts/bench_ngl_spill.sh`. Shards live in `models/iq3s/`
+(`scripts/dl_parallel.sh` downloads with parallel HTTP ranges). This is the
 serving default as of 2026-11-15; the 27B remains the better choice when
 prefill latency or image input matters (`MODEL=models/Qwen3.8-27B-UD-Q4_K_M.gguf
 ./serve.sh`).

@@ -1,0 +1,30 @@
+0.00.038.147 E ggml_cuda_init: failed to initialize CUDA: no CUDA-capable device is detected
+0.00.448.743 I srv  llama_server: initializing ...
+0.00.448.752 I cmn  common_param: common_params_print_info: verbosity = 3 (adjust with the `-lv N` CLI arg)
+0.00.449.369 W srv  server_setup: security: no API key is set and CORS allows all origins (see https://github.com/ggml-org/llama.cpp/pull/25655)
+0.00.451.500 I srv    load_model: loading model '/home/zach/qwenrunner/models/iq3s/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf'
+0.00.657.315 W llama_model_loader: tensor overrides to CPU are used with mmap enabled - consider using --load-mode none for better performance
+0.24.487.639 W resolve_fused_ops: layer 3 is assigned to device CPU but fused top-k mask is assigned to device Vulkan0 (usually due to missing support)
+0.24.487.641 W resolve_fused_ops: fused top-k mask not supported, set to disabled
+0.24.516.388 I cmn          init: llama threadpool init, n_threads = 8
+0.27.229.050 I srv    load_model: initializing, n_slots = 1, n_ctx_slot = 8192, kv_unified = 'false'
+0.27.247.891 W srv          init: chat template supports preserving reasoning, it is enabled by default (may use more tokens, disable via --no-reasoning-preserve)
+0.27.248.271 I srv  server_run_i: model loaded
+0.27.248.278 I srv  server_on_li: listening on http://127.0.0.1:8092
+0.42.052.044 I slot       select: id  0 | task -1 | selected slot by LRU, n_tokens = 0, t_last = -1
+0.42.052.113 I slot launch_slot_: id  0 | task 0 | processing task, is_child = 0
+0.59.112.167 I slot print_timing: id  0 | task 0 | prompt processing, n_tokens =     42, progress = 0.01, t =  17.06 s / 2.46 tokens per second
+3.31.133.882 I slot print_timing: id  0 | task 0 | prompt processing, n_tokens =   2090, progress = 0.40, t = 169.08 s / 12.36 tokens per second
+6.34.622.336 I slot print_timing: id  0 | task 0 | prompt processing, n_tokens =   4138, progress = 0.79, t = 352.57 s / 11.74 tokens per second
+8.02.026.255 I slot print_timing: id  0 | task 0 | prompt processing, n_tokens =   4980, progress = 0.95, t = 439.97 s / 11.32 tokens per second
+8.35.750.978 I slot print_timing: id  0 | task 0 | prompt processing, n_tokens =   5236, progress = 1.00, t = 473.70 s / 11.05 tokens per second
+9.01.932.497 I slot print_timing: id  0 | task 0 | n_gen =    100, tg =   3.99 t/s, tg_3s =   4.03 t/s
+9.04.934.140 I slot print_timing: id  0 | task 0 | n_gen =    114, tg =   4.06 t/s, tg_3s =   4.66 t/s
+9.08.010.926 I slot print_timing: id  0 | task 0 | prompt eval time =  475044.64 ms /  5240 tokens (   90.66 ms per token,    11.03 tokens per second)
+9.08.010.932 I slot print_timing: id  0 | task 0 |        eval time =   30914.15 ms /   128 tokens (  243.42 ms per token,     4.11 tokens per second)
+9.08.010.933 I slot print_timing: id  0 | task 0 |       total time =  505958.79 ms /  5368 tokens
+9.08.010.939 I slot print_timing: id  0 | task 0 |    graphs reused =        127
+9.08.010.939 I slot print_timing: id  0 | task 0 |   graph reallocs =         18    /     0        (same size) / (changed size)
+9.08.011.991 I slot      release: id  0 | task 0 | stop processing: n_tokens = 5367, truncated = 0
+9.08.085.304 I srv    operator(): operator(): cleaning up before exit...
+9.08.094.001 W ~llama_context:    Vulkan0 compute buffer size of 515.4631 MiB, does not match expectation of 513.0803 MiB

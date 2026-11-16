@@ -4,11 +4,14 @@
 # DEFAULT: one Swift-1.5-Qwen3.8-Flash-Next IQ3_S instance served by disk
 # spill (RESULTS.md "Disk-spill MoE"): the 83.74 GB of shards cannot fit in
 # RAM+VRAM, so -cmoe keeps the 512 routed experts on the CPU as mmap pages
-# and -ngl 99 puts the non-expert weights on the GPU(s). Measured 5.0-5.2 t/s
-# generation, 15.3 t/s prompt; prefill streams the whole file, so budget
-# ~6 min per 5k tokens of fresh context. CAP defaults to 6500 on this path
-# (measured peak 5699-6329 MiB; the shipped 5500 kills it). No MTP (no Swift
-# draft GGUF), no mmproj (none fetched). CTX=16384/NP=1 → one 16k slot.
+# and -ngl 0 runs everything on the CPU — the model holds zero VRAM, so the
+# display GPU (desktop, video, gaming) is untouched and CAP stays at the
+# repo-standard 5500 as a formality. Measured 3.38 t/s generation, 9.8 t/s
+# prompt; prefill streams the whole file, so budget ~1 h per 32k tokens of
+# fresh context. Context is RAM-bound, not VRAM-bound: KV is ~14.5 KiB per
+# token, so CTX=65536 (~0.9 GiB) and CTX=131072 (~1.9 GiB) are safe — the
+# cost is prefill time, not memory. No MTP (no Swift draft GGUF), no mmproj
+# (none fetched). CTX=32768/NP=1 → one 32k slot.
 #
 # The previous default remains available and is selected automatically by
 # MODEL:   MODEL=models/Qwen3.8-27B-UD-Q4_K_M.gguf ./serve.sh
@@ -71,9 +74,9 @@ if [ "$SPILL" = 1 ]; then
     ALIAS="${ALIAS:-Swift-1.5-Qwen3.8-Flash-Next}"
     MMPROJ="${MMPROJ:-}"
     MTP="${MTP:-0}"
-    CTX="${CTX:-16384}"
+    CTX="${CTX:-32768}"
     NP="${NP:-1}"
-    CAP="${CAP:-6500}"
+    CAP="${CAP:-5500}"
     UBATCH="${UBATCH:-256}"
 fi
 # The name the API advertises (/v1/models). Without it llama-server reports the
@@ -252,10 +255,16 @@ FIT_ON=1
 FIT_ARGS=(--fit on)
 if [ "$SPILL" = 1 ]; then
     # Disk-spill path: --fit cannot be used (it counts the host expert buffer
-    # as device memory and converges to 0 layers), so the non-expert weights
-    # are pinned to the GPU(s) and the experts stay on the CPU via -cmoe.
+    # as device memory and converges to 0 layers), and the default here is
+    # -ngl 0 — pure CPU inference, measured in RESULTS.md "The -ngl ladder":
+    # the model then holds zero VRAM (idle = desktop alone), the ~650 MiB
+    # depth-growth step the -ngl 99 config showed during deep prefill
+    # disappears, and the display GPU — including under gaming — is untouched.
+    # Cost: 3.38 vs 5.08 t/s generation and 9.8 vs 15.3 t/s prompt. NGL=
+    # restores GPU layers (80/60 keep the speed, ~5.1 t/s, but peak ~5.7 GiB
+    # of system VRAM and only fit a light desktop under the cap).
     FIT_ON=0
-    FIT_ARGS=(-ngl 99 -cmoe --fit off)
+    FIT_ARGS=(-ngl 0 -cmoe --fit off)
     if [ -n "${NGL:-}" ]; then
         FIT_ARGS=(-ngl "$NGL" -cmoe --fit off)
     fi

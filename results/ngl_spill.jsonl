@@ -1,0 +1,6 @@
+{"ngl": 99, "ctx": 8192, "idle_system_vram_mib": 5530, "peak_system_vram_mib": 6450, "meas": {"prompt_n": 5240, "prompt_t_ps": 12.28, "predicted_n": 128, "gen_t_ps": 1.522}}
+{"ngl": 80, "ctx": 8192, "idle_system_vram_mib": 5593, "peak_system_vram_mib": 5731, "meas": {"prompt_n": 5240, "prompt_t_ps": 13.17, "predicted_n": 128, "gen_t_ps": 5.085}}
+{"ngl": 60, "ctx": 8192, "idle_system_vram_mib": 5718, "peak_system_vram_mib": 5731, "meas": {"prompt_n": 5240, "prompt_t_ps": 13.03, "predicted_n": 128, "gen_t_ps": 5.129}}
+{"ngl": 40, "ctx": 8192, "idle_system_vram_mib": 4970, "peak_system_vram_mib": 4985, "meas": {"prompt_n": 5240, "prompt_t_ps": 12.49, "predicted_n": 128, "gen_t_ps": 4.699}}
+{"ngl": 20, "ctx": 8192, "idle_system_vram_mib": 3419, "peak_system_vram_mib": 3945, "meas": {"prompt_n": 5240, "prompt_t_ps": 11.03, "predicted_n": 128, "gen_t_ps": 4.14}}
+{"ngl": 0, "ctx": 8192, "idle_system_vram_mib": 1430, "peak_system_vram_mib": 1440, "meas": {"prompt_n": 5240, "prompt_t_ps": 9.8, "predicted_n": 128, "gen_t_ps": 3.378}}
