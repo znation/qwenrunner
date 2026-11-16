@@ -23,7 +23,10 @@ RAM-bound, not VRAM-bound (KV ~14.5 KiB/token): `CTX=65536` (~0.9 GiB) and
 `CTX=131072` (~1.9 GiB) are safe — the cost is prefill time, not memory.
 No MTP (no Swift draft GGUF) and no mmproj (none fetched) — text-only input.
 `CTX=32768`/`NP=1` → one 32k slot. `NGL=80`/`60` buys back ~5.1 t/s
-generation at ~5.7 GiB of system VRAM — a light-desktop option only.
+generation at ~5.7 GiB of system VRAM — a light-desktop option only, and
+*Vega-only*: with the eGPU attached the spill path passes `-dev CUDA0`, so
+those layers land on the 1070 (8 GiB, uncapped, drives no display) and the
+Vega stays desktop-only — unmeasured, verify on first attach.
 
 The previous default remains available and is selected automatically by
 `MODEL`: `MODEL=models/Qwen3.8-27B-UD-Q4_K_M.gguf ./serve.sh` runs one

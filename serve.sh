@@ -207,7 +207,13 @@ if [ "$MTP" = 1 ] && [ ! -f "$MD" ]; then
 fi
 
 if [ "$EGPU" = 1 ]; then
-    DEV="CUDA0,Vulkan0"
+    if [ "$SPILL" = 1 ]; then
+        # Spill path: the Vega is desktop-only by design, so any GPU layers
+        # (NGL=) must land on the eGPU alone — never on the display GPU.
+        DEV="CUDA0"
+    else
+        DEV="CUDA0,Vulkan0"
+    fi
 else
     DEV="Vulkan0"
 fi
@@ -323,7 +329,11 @@ mkdir -p "$ROOT/logs"
 
 echo "serve: model=$(basename "$MODEL") alias=$ALIAS dev=$DEV ctx=$CTX (${CTX_SLOT}/slot x $NP) threads=$THREADS"
 if [ "$EGPU" = 1 ]; then
-    echo "serve: eGPU present — split across CUDA0 (1070) + Vulkan0 (Vega) + CPU"
+    if [ "$SPILL" = 1 ]; then
+        echo "serve: eGPU present — spill path uses CUDA0 (1070) only; the Vega stays desktop-only"
+    else
+        echo "serve: eGPU present — split across CUDA0 (1070) + Vulkan0 (Vega) + CPU"
+    fi
 else
     echo "serve: no eGPU — split across Vulkan0 (Vega) + CPU"
 fi

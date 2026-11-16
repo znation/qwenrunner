@@ -1161,7 +1161,10 @@ only backstops), `MTP=0`, no mmproj (text-only). Smoke-tested under
 system VRAM 1439 MiB at idle. The display GPU — including under gaming — is
 never contested: the server is the one process that cannot take VRAM away
 from the desktop. `NGL=80`/`60` restores ~5.1 t/s at ~5.7 GiB system VRAM for
-a light desktop. The 27B path stays available via
+a light desktop; with the eGPU attached the spill path passes `-dev CUDA0`
+(the 27B path keeps `CUDA0,Vulkan0`), so `NGL=` layers land on the 1070 alone
+and the Vega stays desktop-only — unmeasured, verify on first attach. The 27B
+path stays available via
 `MODEL=models/Qwen3.8-27B-UD-Q4_K_M.gguf ./serve.sh`. Both clients' local
 entries were retargeted (`~/.pi/agent/models.json`,
 `~/.omp/agent/models.yml`: `Swift-1.5-Qwen3.8-Flash-Next`,
