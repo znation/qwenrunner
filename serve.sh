@@ -4,13 +4,14 @@
 # DEFAULT: one Swift-1.5-Qwen3.8-Flash-Next IQ3_S instance served by disk
 # spill (RESULTS.md "Disk-spill MoE"): the 83.74 GB of shards cannot fit in
 # RAM+VRAM, so -cmoe keeps the 512 routed experts on the CPU as mmap pages
-# and -ngl follows the eGPU: without it, -ngl 0 runs everything on the CPU —
-# the model holds zero VRAM, so the display GPU (desktop, video, gaming) is
-# untouched and CAP stays at the repo-standard 5500 as a formality. With the
-# eGPU attached, -ngl 80 runs the non-expert weights on the 1070 alone
+# and -ngl follows the eGPU: without it, -ngl 20 puts 20 layers' attention
+# on the Vega (peak 3945 MiB system VRAM incl. desktop — fits the 5500 cap
+# even at the heavy desktop baseline; under gaming guard.py kills the
+# server, NGL=0 is the gaming-proof rung). With the eGPU attached, -ngl 80
+# runs the non-expert weights on the 1070 alone
 # (-dev CUDA0, uncapped, drives no display; the Vega stays desktop-only) for
 # ~5.1 t/s generation — measured on the Vega-only path, unmeasured on the
-# 1070. Measured CPU-only: 3.38 t/s generation, 9.8 t/s
+# 1070. Measured -ngl 20: 4.14 t/s generation, 11.0 t/s
 # prompt; prefill streams the whole file, so budget ~1 h per 32k tokens of
 # fresh context. Context is RAM-bound, not VRAM-bound: KV is ~14.5 KiB per
 # token, so CTX=65536 (~0.9 GiB) and CTX=131072 (~1.9 GiB) are safe — the
@@ -274,11 +275,17 @@ if [ "$SPILL" = 1 ]; then
     # restores GPU layers (80/60 keep the speed, ~5.1 t/s, but peak ~5.7 GiB
     # of system VRAM and only fit a light desktop under the cap).
     FIT_ON=0
-    # Default -ngl follows the eGPU: without it, pure CPU (zero VRAM); with
-    # it, 80 layers on the 1070 alone (-dev CUDA0, uncapped, drives no
-    # display) for ~5.1 t/s generation — measured on the Vega-only path,
-    # unmeasured on the 1070 (verify on first attach). NGL= overrides both.
-    SPILL_NGL=0
+    # Default -ngl follows the eGPU: without it, 20 layers on the Vega —
+    # measured +22 % generation over pure CPU (4.14 vs 3.38 t/s) at a peak
+    # of 3945 MiB system VRAM incl. the desktop, which fits the 5500 cap
+    # even at the heavy desktop baseline (2188 MiB) with the ~650 MiB
+    # first-deep-request growth step and 150 MiB transient budgeted in.
+    # Under gaming (desktop > ~2.5 GiB) it breaches and guard.py kills the
+    # server — NGL=0 is the gaming-proof rung. With the eGPU attached, 80
+    # layers on the 1070 alone (-dev CUDA0, uncapped, drives no display)
+    # for ~5.1 t/s — measured on the Vega-only path, unmeasured on the
+    # 1070 (verify on first attach). NGL= overrides both.
+    SPILL_NGL=20
     [ "$EGPU" = 1 ] && SPILL_NGL=80
     FIT_ARGS=(-ngl "$SPILL_NGL" -cmoe --fit off)
     if [ -n "${NGL:-}" ]; then

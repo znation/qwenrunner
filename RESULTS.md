@@ -1170,7 +1170,10 @@ entries were retargeted (`~/.pi/agent/models.json`,
 `~/.omp/agent/models.yml`: `Swift-1.5-Qwen3.8-Flash-Next`,
 `contextWindow: 30720`, text-only) — those files live outside this repo and
 are not committed. **Revised:** the spill default's `-ngl` now follows the
-eGPU — `-ngl 0` (pure CPU, zero VRAM) without it, `-ngl 80` on the 1070 alone
+eGPU — `-ngl 20` on the Vega without it (4.14 t/s gen, peak 3945 MiB system
+VRAM incl. desktop; fits the 5500 cap even at the heavy desktop baseline,
+but under gaming guard.py kills the server and `NGL=0` is the gaming-proof
+rung at 3.38 t/s / zero model VRAM), `-ngl 80` on the 1070 alone
 (`-dev CUDA0`, ~5.1 t/s) with it; `NGL=` overrides both. The 80-layer-on-1070
 combination is unmeasured (eGPU unplugged); verify on first attach.
 
