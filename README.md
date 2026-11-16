@@ -14,10 +14,14 @@ one process that never competes for the card.
 The default (`./serve.sh`) runs one **Swift-1.5-Qwen3.8-Flash-Next IQ3_S**
 instance served by **disk spill** (see "Disk-spill MoE" below and
 [`RESULTS.md`](RESULTS.md)): the 83.74 GB of shards cannot fit in RAM+VRAM, so
-`-cmoe` keeps the 512 routed experts on the CPU as `mmap` pages and `-ngl 0`
-runs everything on the CPU — **the model holds zero VRAM**, so the display
-GPU (desktop, video, gaming) is untouched and `CAP` stays at the repo-standard
-5500. Measured **3.38 t/s generation, 9.8 t/s prompt**; prefill streams the
+`-cmoe` keeps the 512 routed experts on the CPU as `mmap` pages and `-ngl`
+follows the eGPU: without it, `-ngl 0` runs everything on the CPU — **the
+model holds zero VRAM**, so the display GPU (desktop, video, gaming) is
+untouched and `CAP` stays at the repo-standard 5500. With the eGPU attached,
+`-ngl 80` runs the non-expert weights on the 1070 alone (`-dev CUDA0`,
+uncapped, drives no display; the Vega stays desktop-only) for ~5.1 t/s —
+measured on the Vega-only path, unmeasured on the 1070. Measured CPU-only:
+**3.38 t/s generation, 9.8 t/s prompt**; prefill streams the
 whole file, so budget ~1 h per 32k tokens of fresh context. Context is
 RAM-bound, not VRAM-bound (KV ~14.5 KiB/token): `CTX=65536` (~0.9 GiB) and
 `CTX=131072` (~1.9 GiB) are safe — the cost is prefill time, not memory.
@@ -203,9 +207,11 @@ present. Both backends end up in one binary and `-dev` selects between them.
 ## Run
 
 ```
-./serve.sh                       # Swift IQ3_S disk-spill default, CPU-only (:8080)
+./serve.sh                       # Swift IQ3_S disk-spill default (:8080)
+                                 #   no eGPU:  -ngl 0, pure CPU, zero model VRAM
+                                 #   eGPU on:  -ngl 80 on the 1070 alone (~5.1 t/s)
 CTX=65536 ./serve.sh             # one 64k slot (KV ~0.9 GiB RAM; prefill ~110 min)
-NGL=80 ./serve.sh                # GPU-assisted: ~5.1 t/s gen, ~5.7 GiB system VRAM (light desktop)
+NGL=0 ./serve.sh                 # force pure CPU even with the eGPU attached
 MODEL=models/Qwen3.8-27B-UD-Q4_K_M.gguf ./serve.sh   # the 27B split (previous default)
 ```
 

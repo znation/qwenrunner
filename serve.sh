@@ -4,9 +4,13 @@
 # DEFAULT: one Swift-1.5-Qwen3.8-Flash-Next IQ3_S instance served by disk
 # spill (RESULTS.md "Disk-spill MoE"): the 83.74 GB of shards cannot fit in
 # RAM+VRAM, so -cmoe keeps the 512 routed experts on the CPU as mmap pages
-# and -ngl 0 runs everything on the CPU — the model holds zero VRAM, so the
-# display GPU (desktop, video, gaming) is untouched and CAP stays at the
-# repo-standard 5500 as a formality. Measured 3.38 t/s generation, 9.8 t/s
+# and -ngl follows the eGPU: without it, -ngl 0 runs everything on the CPU —
+# the model holds zero VRAM, so the display GPU (desktop, video, gaming) is
+# untouched and CAP stays at the repo-standard 5500 as a formality. With the
+# eGPU attached, -ngl 80 runs the non-expert weights on the 1070 alone
+# (-dev CUDA0, uncapped, drives no display; the Vega stays desktop-only) for
+# ~5.1 t/s generation — measured on the Vega-only path, unmeasured on the
+# 1070. Measured CPU-only: 3.38 t/s generation, 9.8 t/s
 # prompt; prefill streams the whole file, so budget ~1 h per 32k tokens of
 # fresh context. Context is RAM-bound, not VRAM-bound: KV is ~14.5 KiB per
 # token, so CTX=65536 (~0.9 GiB) and CTX=131072 (~1.9 GiB) are safe — the
@@ -270,7 +274,13 @@ if [ "$SPILL" = 1 ]; then
     # restores GPU layers (80/60 keep the speed, ~5.1 t/s, but peak ~5.7 GiB
     # of system VRAM and only fit a light desktop under the cap).
     FIT_ON=0
-    FIT_ARGS=(-ngl 0 -cmoe --fit off)
+    # Default -ngl follows the eGPU: without it, pure CPU (zero VRAM); with
+    # it, 80 layers on the 1070 alone (-dev CUDA0, uncapped, drives no
+    # display) for ~5.1 t/s generation — measured on the Vega-only path,
+    # unmeasured on the 1070 (verify on first attach). NGL= overrides both.
+    SPILL_NGL=0
+    [ "$EGPU" = 1 ] && SPILL_NGL=80
+    FIT_ARGS=(-ngl "$SPILL_NGL" -cmoe --fit off)
     if [ -n "${NGL:-}" ]; then
         FIT_ARGS=(-ngl "$NGL" -cmoe --fit off)
     fi
@@ -344,7 +354,11 @@ if [ "$FIT_ON" = 1 ]; then
         echo "serve: --fit on, margin ${VEGA_MARGIN} MiB (fit-cap=${FIT_CAP}MiB) cap=${CAP}MiB — no eGPU, fits 0 layers"
     fi
 else
-    echo "serve: --fit off (NGL=/TS= set): -ngl ${NGL:-auto} -ts ${TS:-auto}"
+    if [ "$SPILL" = 1 ]; then
+        echo "serve: --fit off: -ngl ${NGL:-$SPILL_NGL} -cmoe (spill path)"
+    else
+        echo "serve: --fit off (NGL=/TS= set): -ngl ${NGL:-auto} -ts ${TS:-auto}"
+    fi
 fi
 if [ "$SPILL" = 1 ]; then
     echo "serve: disk-spill MoE — experts on CPU (mmap, -cmoe), streamed from NVMe; cap=${CAP}MiB"

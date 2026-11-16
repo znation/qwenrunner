@@ -1169,7 +1169,10 @@ path stays available via
 entries were retargeted (`~/.pi/agent/models.json`,
 `~/.omp/agent/models.yml`: `Swift-1.5-Qwen3.8-Flash-Next`,
 `contextWindow: 30720`, text-only) — those files live outside this repo and
-are not committed.
+are not committed. **Revised:** the spill default's `-ngl` now follows the
+eGPU — `-ngl 0` (pure CPU, zero VRAM) without it, `-ngl 80` on the 1070 alone
+(`-dev CUDA0`, ~5.1 t/s) with it; `NGL=` overrides both. The 80-layer-on-1070
+combination is unmeasured (eGPU unplugged); verify on first attach.
 
 Reproduce: `./scripts/bench_iq3s.sh` (arms A/B/C; `ARMS=`, `UB=`, `BATCH=`,
 `CTX=`, `CACHE_MIB=` override) and `./scripts/bench_ngl_spill.sh`
