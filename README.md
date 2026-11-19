@@ -1,14 +1,20 @@
 # qwenrunner
 
-A local inference stack for **Qwen-3.8-27B** on an **Apple M5 Max with 128 GB**
-of unified memory, tuned for one workload: the [tumwater](../tumwater) agent
-fleet, **four pi sessions at once** against one server. It runs
-[Splash](https://github.com/incoai/splash) on MLX 4-bit weights with a DFlash2
-drafter.
+A local inference stack for **Qwen3.8-Flash-Next** on an **Apple M5 Max with
+128 GB** of unified memory, tuned for one workload: the [tumwater](../tumwater)
+agent fleet, **four pi sessions at once** against one server. It runs
+[Splash](https://github.com/incoai/splash) on the GSQ-RCO GGUF at IQ3_S (83.6
+GB) with a Flash-Next DFlash2 drafter and vision on.
 
-The model is a hybrid: 64 blocks, only 16 of them full attention, the rest
-linear-attention (Gated DeltaNet). That is why 128k of context is cheap here:
-the KV cache grows in 16 layers, not 64.
+Flash-Next is the 125B-A6B `qwen4_exp` preview: 48 layers of Gated DeltaNet +
+Qwen Sparse Attention feeding a 512-expert MoE (6B active per token), plus a 51B
+n-gram embedding table. Splash holds the ~49 GB of routed experts resident and
+streams the n-gram table and long-request KV from the SSD, which is how 83.6 GB
+of weights and 4 × 128k sessions fit in ~112 GiB of working set (93 GiB peak).
+
+The previous default, **Qwen3.8-27B** (a hybrid: 64 blocks, only 16 of them full
+attention, the rest Gated DeltaNet), is kept runnable via
+`MODEL=mlx-community/Qwen3.8-27B-4bit`.
 
 ## Result
 
@@ -19,11 +25,18 @@ table and method in [`RESULTS.md`](RESULTS.md), "Engine shoot-out".
 
 | engine (weights) | turns/min | aggregate out t/s | per-stream t/s | TTFT p50 / p90 |
 |---|---:|---:|---:|---:|
-| **Splash 1.6.0 (MLX 4-bit + DFlash2)**, `./serve.sh` | **15.0-16.0** | **64-72** | 27-34 | 2.2-3.4 / 10-14 s |
+| **Flash-Next IQ3_S (Splash 1.7.0 + DFlash2)**, `./serve.sh` | **16.6-17.7** | **92-101** | 119-127 | 7-7.6 / 20-21 s |
+| Splash 1.6.0 (Qwen3.8-27B MLX 4-bit + DFlash2), previous default | 15.0-16.0 | 64-72 | 27-34 | 2.2-3.4 / 10-14 s |
 | Kapitsa 0.2.31 (`27b` 4-bit + DFlash2, 4 slots) | 10.7-11.2 | 45-47 | 15 | 1.7-2.1 / 4.6 s |
 | mlx-serve 26.11.2, `NP=4`, 32 GB prefix cache | 10.7-11.3 | 17-19 | 16-18 | 6.6-8.3 / 21-31 s |
 | oMLX 0.7.3 (MLX 4-bit + DFlash2) | 6.6 | 26 | 9 | 5.7 / 12.8 s |
 | mlx-serve 26.11.2, as previously shipped (`NP=2` cache budget) | 3.9 | 6 | 18 | 11.5 / 128 s |
+
+**Flash-Next is now the default** (row above): on the same 4-session, 128k
+tumwater replay it does ~10% more turns/min and ~50% more output t/s than the
+best 27B arm, at the cost of ~2.5× worse first-token time and 2× the memory.
+
+The 27B's own win, for history:
 
 **This is 4.1× the previous default's turn rate and ~10× its output
 throughput** on the same machine and the same model.
@@ -62,8 +75,8 @@ brew tap incoai/tap
 brew install incoai/tap/splash
 ```
 
-On its first start `serve.sh` downloads the weights (16.1 GB) and the DFlash2
-drafter (3.8 GB) into Splash's own store
+On its first start `serve.sh` downloads the Flash-Next weights (83.6 GB at
+IQ3_S) and the Flash-Next DFlash2 drafter into Splash's own store
 (`~/Library/Application Support/Splash/models`).
 
 The previous engine stays available as `ENGINE=mlx-serve`. To install it, use
@@ -79,9 +92,9 @@ curl -sL https://github.com/ddalcu/mlx-serve/releases/latest/download/mlx-serve-
 ## Run
 
 ```bash
-./serve.sh                       # Splash, 4 sessions, 128k, port 8090
-ENGINE=mlx-serve ./serve.sh      # the previous engine (NP=4, 32 GB prefix cache)
-MODEL=mlx-community/Qwen3.8-27B-mxfp4 ./serve.sh
+./serve.sh                       # Splash, Flash-Next IQ3_S, 4 sessions, 128k, :8090
+MODEL=mlx-community/Qwen3.8-27B-4bit ./serve.sh   # the previous 27B default
+ENGINE=mlx-serve ./serve.sh      # the older mlx-serve engine (27B, kept runnable)
 ```
 
 OpenAI-compatible at `http://127.0.0.1:8090/v1`. Logs go to
@@ -94,10 +107,11 @@ mlx-serve.
 
 `pi` and `omp` are pointed at this server from their own configs:
 `~/.pi/agent/models.json` and `~/.omp/agent/models.yml`, provider `qwenrunner`,
-model id `Qwen3.8-27B-MLX-Serve-4bit`. The switch to Splash needs **no client
-change**. `serve.sh` announces the model as `Qwen3.8-27B` and also accepts the
-old id. This matters because Splash rejects a model name it does not serve, with
-`model_not_found`.
+model id `Qwen3.8-27B-MLX-Serve-4bit`. The switch to Flash-Next needs **no
+client change**: `serve.sh` announces `Qwen3.8-Flash-Next` as primary and still
+accepts both old 27B ids. This matters because Splash rejects a model name it
+does not serve, with `model_not_found`. Vision is on (mmproj), so image and PDF
+input work.
 
 Checked against Splash with the old id (`scripts/toolcall_smoke.py`):
 

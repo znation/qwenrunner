@@ -51,9 +51,11 @@ LOG_DIR="${LOG_DIR:-$ROOT/logs}"
 mkdir -p "$LOG_DIR"
 LOG="$LOG_DIR/$ENGINE.$PORT.log"
 
-# The id clients send. pi and omp were configured against mlx-serve's id, so
-# Splash announces the short name and still accepts the old one.
-ALIAS="${ALIAS:-Qwen3.8-27B}"
+# The ids clients send. pi and omp were configured against mlx-serve's id, so
+# Splash announces Flash-Next as the primary and still accepts the old 27B ids
+# the clients currently send, so a restart needs no client change.
+ALIAS="${ALIAS:-Qwen3.8-Flash-Next}"
+OLD_ID="Qwen3.8-27B"
 LEGACY_ID="Qwen3.8-27B-MLX-Serve-4bit"
 
 case "$ENGINE" in
@@ -63,11 +65,15 @@ splash)
     echo "serve: splash not found. Install it: brew install incoai/tap/splash" >&2
     exit 1
   fi
-  # MLX affine 4-bit, group 64 (16.1 GB). The GGUF UD-Q4_K_M build measured the
-  # same on this engine (14.7 vs 15.0 turns/min); see RESULTS.md for mxfp4.
-  # Splash pairs it with the incoai DFlash2 drafter by itself and downloads
-  # both on first start.
-  MODEL="${MODEL:-mlx-community/Qwen3.8-27B-4bit}"
+  # Qwen3.8-Flash-Next, GSQ-RCO GGUF at IQ3_S (83.6 GB). Measured on this
+  # machine: 17.7/16.6 turns/min, 92-101 agg out t/s, 119-127 stream t/s at
+  # 93 GiB peak (RESULTS.md). IQ3_S is task-parity with the unquantised model
+  # (93.3 vs 93.1); the lighter Q2_0 (66.4 GB) costs ~4 points, unnecessary at
+  # 128 GB. Splash pairs it with the incoai Flash-Next DFlash2 drafter and
+  # downloads both on first start. Vision (mmproj) is on by default, which
+  # tumwater needs for image/PDF turns. The previous 27B default was
+  # mlx-community/Qwen3.8-27B-4bit; set MODEL=... to restore it.
+  MODEL="${MODEL:-ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF:IQ3_S}"
   if [ "$NP" -gt 4 ]; then
     echo "serve: note: Splash decodes 4 requests at once; NP=$NP queues the rest" >&2
   fi
@@ -77,9 +83,9 @@ splash)
   #   window when memory holds it, which tumwater does not need.
   ARGS=(serve --model "$MODEL" --host "$HOST" --port "$PORT"
         --max-context "$(( CTX / 1024 ))K" --no-webui --idle-release off
-        --served-model-name "$ALIAS" --served-model-name "$LEGACY_ID"
-        --announce-served-name)
-  echo "serve: splash model=$MODEL ctx=$CTX lanes=4 alias=$ALIAS (+$LEGACY_ID)"
+        --served-model-name "$ALIAS" --served-model-name "$OLD_ID"
+        --served-model-name "$LEGACY_ID" --announce-served-name)
+  echo "serve: splash model=$MODEL ctx=$CTX lanes=4 alias=$ALIAS (+$OLD_ID +$LEGACY_ID)"
   echo "serve: http://$HOST:$PORT/v1  log: $LOG"
   exec "$BIN" "${ARGS[@]}" "$@" > >(tee -a "$LOG") 2>&1
   ;;
