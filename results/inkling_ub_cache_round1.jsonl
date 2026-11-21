@@ -1,0 +1,6 @@
+{"label": "ub256_c1024", "ub": 256, "cache_mib": 1024, "prompt_ts": 38.42, "gen_ts": 2.16, "prompt_n": 901, "peak_vram_mib": 0, "peak_gtt_mib": 0}
+{"label": "ub128_c1024", "ub": 128, "cache_mib": 1024, "prompt_ts": 28.67, "gen_ts": 2.13, "prompt_n": 901, "peak_vram_mib": 0, "peak_gtt_mib": 0}
+{"label": "ub64_c1024", "ub": 64, "cache_mib": 1024, "prompt_ts": 16.61, "gen_ts": 2.13, "prompt_n": 901, "peak_vram_mib": 0, "peak_gtt_mib": 0}
+{"label": "ub128_c0", "ub": 128, "cache_mib": 0, "prompt_ts": 31.55, "gen_ts": 6.46, "prompt_n": 901, "peak_vram_mib": 0, "peak_gtt_mib": 0}
+{"label": "ub64_c0", "ub": 64, "cache_mib": 0, "prompt_ts": 17.94, "gen_ts": 6.19, "prompt_n": 901, "peak_vram_mib": 0, "peak_gtt_mib": 0}
+{"label": "ub32_c1024", "ub": 32, "cache_mib": 1024, "prompt_ts": 9.06, "gen_ts": 2.13, "prompt_n": 901, "peak_vram_mib": 0, "peak_gtt_mib": 0}

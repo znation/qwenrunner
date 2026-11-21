@@ -1,7 +1,26 @@
 #!/usr/bin/env bash
 # serve.sh — launch llama-server for the local agent stack.
 #
-# DEFAULT: one Swift-1.5-Qwen3.8-Flash-Next IQ3_S instance served by disk
+# DEFAULT: one Inkling 2 Mini IQ4_NL instance (ggml-org conversion, 17.6 GB,
+# looped MoE — 24 physical layers, the middle 12 run 3x per token so a token
+# makes 48 layer visits; 128 routed experts per layer, 8 active per visit).
+# The experts (~14.7 GiB of the file) stay in RAM as mmap pages (-cmoe);
+# everything else — attention, convolutions, loop controller, embeddings —
+# follows the eGPU: with the 1070 attached, -ngl 99 puts it there
+# (uncapped, drives no display; UNMEASURED — the looped graph's GPU-assigned
+# ops reserved a 7-8 GiB compute buffer on the Vega, so verify the load on
+# first attach and drop to NGL=0 if it OOMs). Without the eGPU the path is
+# pure CPU (-dev none, zero model VRAM, gaming-proof): measured 5.6 t/s
+# generation, 24.8 t/s prompt at 32k. No DSpark speculation: mainline
+# llama.cpp does not support the drafter yet (#32218 open), so MTP is off
+# on this path. The MoE expert cache (--moe-cache-mib, llama.cpp's own
+# equivalent of Strata's expert cache) is wired up as MOE_CACHE_MIB but
+# defaults to 0 — measured 3x SLOWER generation on this host (2.13 vs
+# 6.13-6.46 t/s), because the Vega's expert matmuls lose to the CPU even
+# with zero upload cost; see README "Inkling 2 Mini".
+#
+# PREVIOUS DEFAULT (selected automatically by MODEL): one
+# Swift-1.5-Qwen3.8-Flash-Next IQ3_S instance served by disk
 # spill (RESULTS.md "Disk-spill MoE"): the 83.74 GB of shards cannot fit in
 # RAM+VRAM, so -cmoe keeps the 512 routed experts on the CPU as mmap pages
 # and -ngl follows the eGPU: without it, -ngl 20 puts 20 layers' attention
@@ -51,6 +70,9 @@
 #   MMPROJ MMPROJ_OFFLOAD (0 = CPU vision encoder, 1 = GPU)
 #   MTP MD DEVD NGLD DCTK DCTV DNMAX DPMIN
 #   LM BATCH UBATCH CTK CTV FA
+#   MOE_CACHE_MIB (Inkling path: hot-expert VRAM cache, MiB; 0 disables)
+#   EFFORT (Inkling path: default reasoning_effort for the chat template;
+#           default low; clients override per request)
 #   FITT_CUDA (eGPU fit margin, MiB)
 #   MIN_AVAIL (RAM floor handed to guard.py, MiB; default 2048)
 #   NEED_MIB (pre-flight MemAvailable requirement, MiB; default MIN_AVAIL+16384)
@@ -62,7 +84,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export PATH="$ROOT/tools/local/usr/bin:$PATH"
 export LD_LIBRARY_PATH="$ROOT/build/bin:$ROOT/tools/local/usr/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH:-}"
 
-MODEL="${MODEL:-$ROOT/models/iq3s/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf}"
+MODEL="${MODEL:-$ROOT/models/Inkling-2-Mini-IQ4_NL.gguf}"
 # Disk-spill MoE path (RESULTS.md "Disk-spill MoE"): the Swift IQ3_S shards are
 # 83.74 GB — far over RAM+VRAM — so the experts stay on the CPU as mmap pages
 # (-cmoe) and stream from the NVMe. That path disables the 27B machinery below:
@@ -71,8 +93,10 @@ MODEL="${MODEL:-$ROOT/models/iq3s/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-o
 # fetched. Measured: 5.0-5.2 t/s generation, 15.3 t/s prompt (5240-token
 # prefill ~6 min), peak system VRAM 5699-6329 MiB at -ub 512/256 — hence the
 # raised CAP (5500 kills it; -ub/-b/-c reductions do not move the peak).
+INKLING=0
 case "$(basename "$MODEL")" in
     Swift*) SPILL=1 ;;
+    Inkling*) SPILL=0 INKLING=1 ;;
     *)      SPILL=0 ;;
 esac
 if [ "$SPILL" = 1 ]; then
@@ -83,6 +107,13 @@ if [ "$SPILL" = 1 ]; then
     NP="${NP:-1}"
     CAP="${CAP:-5500}"
     UBATCH="${UBATCH:-256}"
+fi
+if [ "$INKLING" = 1 ]; then
+    ALIAS="${ALIAS:-Inkling-2-Mini}"
+    MMPROJ="${MMPROJ:-$ROOT/models/mmproj-Inkling-2-Mini-BF16.gguf}"
+    MTP="${MTP:-0}"
+    CTX="${CTX:-32768}"
+    NP="${NP:-1}"
 fi
 # The name the API advertises (/v1/models). Without it llama-server reports the
 # .gguf path, so a client's model id becomes the path. The alias gives both
@@ -120,6 +151,27 @@ CAP="${CAP:-5500}"
 # Margin to leave free on the eGPU; the fit's own default is 1024 MiB, which
 # costs a layer or two. The eGPU is not the display GPU, so 256 is enough.
 FITT_CUDA="${FITT_CUDA:-256}"
+# MoE expert cache (Inkling path, eGPU only): VRAM set aside to hold the
+# most-used routed experts while the full expert set lives in RAM (-cmoe,
+# mmap). Cache hits run on the GPU; misses upload from RAM over PCIe.
+# MEASURED, LOSES on this host: at -ngl 99 on the Vega, cache 1024 MiB gives
+# 2.13 t/s generation against 6.13-6.46 without it — 3x slower — and the
+# result holds with the host experts pinned (-lm none) and with
+# --moe-cache-cpu-share 1.0. The bottleneck is not the upload: the Vega's
+# own expert-matmul throughput is below what the 8-thread CPU delivers, so
+# moving the hits onto the GPU costs more than the saved uploads win. Same
+# conclusion as the Swift spill path (RESULTS.md "Disk-spill MoE": "The MoE
+# expert cache hurts on this host"). Default 0 (disabled); MOE_CACHE_MIB=
+# re-enables it for experiments, and it is the right lever on a GPU whose
+# expert matmuls outpace the CPU.
+MOE_CACHE_MIB="${MOE_CACHE_MIB:-0}"
+# Default reasoning effort handed to the Inkling chat template when the
+# client does not send one (server-side --reasoning-effort). The template's
+# own default is 'high' (0.9), which on this box means short max_tokens
+# budgets can end entirely inside thinking and return empty content —
+# measured on the shipped default. 'low' (0.2) keeps the thinking trace
+# short; clients can still set reasoning_effort per request to override.
+EFFORT="${EFFORT:-low}"
 
 # MTP speculation is ON by default and its draft head runs on the Vega 10, not
 # the CPU: measured +38 % generation over the shipped CPU-draft default at 128k
@@ -195,6 +247,8 @@ if [ ! -f "$MODEL" ]; then
     echo "serve: missing $MODEL" >&2
     if [ "$SPILL" = 1 ]; then
         echo "serve: fetch the Swift IQ3_S shards into models/iq3s/ (see README 'Disk-spill MoE')" >&2
+    elif [ "$INKLING" = 1 ]; then
+        echo "serve: fetch Inkling-2-Mini-IQ4_NL.gguf into models/ (see README 'Inkling 2 Mini')" >&2
     else
         echo "serve: fetch the Qwen3.8-27B GGUF into models/ (see README)" >&2
     fi
@@ -212,15 +266,25 @@ if [ "$MTP" = 1 ] && [ ! -f "$MD" ]; then
 fi
 
 if [ "$EGPU" = 1 ]; then
-    if [ "$SPILL" = 1 ]; then
-        # Spill path: the Vega is desktop-only by design, so any GPU layers
-        # (NGL=) must land on the eGPU alone — never on the display GPU.
+    if [ "$SPILL" = 1 ] || [ "$INKLING" = 1 ]; then
+        # Spill and Inkling paths: the Vega is desktop-only by design, so any
+        # GPU layers (NGL=) must land on the eGPU alone — never on the display GPU.
         DEV="CUDA0"
     else
         DEV="CUDA0,Vulkan0"
     fi
 else
-    DEV="Vulkan0"
+    if [ "$INKLING" = 1 ]; then
+        # Measured (see README "Inkling 2 Mini"): the looped graph's GPU-assigned
+        # ops reserve a 7-8 GiB Vulkan0 compute buffer even at -ngl 0 — the
+        # CPU-only graph needs 839 MiB — so every Vulkan-in-schedule config
+        # breaches the 5500 MiB cap (RADV silently spills the rest into GTT)
+        # and guard.py kills it at load. The only guard-safe Vega-only rung
+        # is pure CPU: -dev none, zero model VRAM, gaming-proof.
+        DEV="none"
+    else
+        DEV="Vulkan0"
+    fi
 fi
 
 # --fit derives -ngl and the tensor split from live free VRAM per device. The
@@ -291,6 +355,28 @@ if [ "$SPILL" = 1 ]; then
     if [ -n "${NGL:-}" ]; then
         FIT_ARGS=(-ngl "$NGL" -cmoe --fit off)
     fi
+elif [ "$INKLING" = 1 ]; then
+    # Inkling path: -cmoe keeps all 24 layers' routed experts (128 per layer,
+    # 8 active per visit) in RAM as mmap pages. --jinja is required: the
+    # model's chat template carries the reasoning_effort system message and
+    # the image tokens; the legacy template path does not know this
+    # architecture. NGL= overrides the layer count.
+    #
+    # eGPU: -ngl 99 puts everything but the experts on the 1070 and
+    # --moe-cache-mib adds the hot-expert VRAM cache (MOE_CACHE_MIB, 0
+    # disables). UNMEASURED on the 1070 — the Vulkan reservation analysis
+    # above does not transfer to CUDA, but the compute buffer measured 7-8 GiB
+    # on the Vega against the 1070's 8192 MiB, so verify on first attach and
+    # drop to NGL=0 if the load OOMs.
+    #
+    # No eGPU: -dev none (set in the DEV block), pure CPU. The MoE cache has
+    # no device to live on, so the flag is omitted on this rung.
+    FIT_ON=0
+    if [ "$EGPU" = 1 ]; then
+        FIT_ARGS=(-ngl "${NGL:-99}" -cmoe --moe-cache-mib "$MOE_CACHE_MIB" --fit off --jinja --reasoning-effort "$EFFORT")
+    else
+        FIT_ARGS=(-ngl "${NGL:-0}" -cmoe --fit off --jinja --reasoning-effort "$EFFORT")
+    fi
 elif [ "$EGPU" = 1 ]; then
     FIT_ARGS+=( -fitt "$FITT_CUDA,$VEGA_MARGIN")
 else
@@ -299,8 +385,9 @@ fi
 
 # NGL=/TS= override: llama.cpp's fit aborts rather than honour an explicit
 # -ngl/-ts, so setting either turns --fit off and pins the layer count.
-# (The spill path handled NGL above and must keep -cmoe, so it skips this.)
-if [ "$SPILL" = 0 ] && [ -n "${NGL:-}" ] || [ "$SPILL" = 0 ] && [ -n "${TS:-}" ]; then
+# (The spill and Inkling paths handled NGL above and must keep -cmoe, so
+# they skip this.)
+if [ "$SPILL" = 0 ] && [ "$INKLING" = 0 ] && { [ -n "${NGL:-}" ] || [ -n "${TS:-}" ]; }; then
     FIT_ON=0
     FIT_ARGS=()
     [ -n "${NGL:-}" ] && FIT_ARGS+=( -ngl "$NGL")
@@ -363,12 +450,21 @@ if [ "$FIT_ON" = 1 ]; then
 else
     if [ "$SPILL" = 1 ]; then
         echo "serve: --fit off: -ngl ${NGL:-$SPILL_NGL} -cmoe (spill path)"
+    elif [ "$INKLING" = 1 ]; then
+        if [ "$EGPU" = 1 ]; then
+            echo "serve: --fit off: -ngl ${NGL:-99} -cmoe --moe-cache-mib ${MOE_CACHE_MIB} (Inkling path, eGPU)"
+        else
+            echo "serve: --fit off: -dev none -ngl 0 -cmoe (Inkling path, pure CPU)"
+        fi
     else
         echo "serve: --fit off (NGL=/TS= set): -ngl ${NGL:-auto} -ts ${TS:-auto}"
     fi
 fi
 if [ "$SPILL" = 1 ]; then
     echo "serve: disk-spill MoE — experts on CPU (mmap, -cmoe), streamed from NVMe; cap=${CAP}MiB"
+fi
+if [ "$INKLING" = 1 ]; then
+    echo "serve: Inkling MoE — experts on CPU (mmap, -cmoe); hot-expert VRAM cache ${MOE_CACHE_MIB} MiB (eGPU only); reasoning_effort=${EFFORT}; cap=${CAP}MiB"
 fi
 if [ "$MTP" = 1 ]; then
     echo "serve: mtp=on draft=$(basename "$MD") devd=$DEVD ngld=$NGLD ctkd=$DCTK ctvd=$DCTV n-max=$DNMAX p-min=$DPMIN"

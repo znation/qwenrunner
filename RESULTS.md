@@ -1867,3 +1867,73 @@ Two `llama-bench` runs SIGKILLed by a command deadline wedged the AMDGPU/TTM
 path (`uvm_va_space_destroy`, D-state, uncancellable) and the GPU needed a
 reboot. `scripts/bench.py` runs its arms under `scripts/guard.py` (clean child
 cleanup) — use it, and give it generous deadlines.
+
+## Inkling 2 Mini IQ4_NL **[clean]**
+
+Switched the serving default to [Inkling 2 Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini)
+(Thinking Machines Lab, 2026-11-20): a **looped MoE** — 24 physical decoder
+layers, the middle 12 run 3× per token (48 visits), 128 routed experts with
+8 active per visit, expert intermediate 1152, hidden 2304, ~26B physical /
+~3B active parameters. Five of six layers are sliding-window (1024) with one
+full-attention layer, so KV is small (q4_0: ~344 MiB at a 32k pool). Runtime
+upgraded `dd099a6` → `46eb174` for the `inkling2_loop` arch (#32694); the
+GGUF is the official ggml-org IQ4_NL (17.6 GB — experts of layers 0–19
+IQ4_NL, all else Q8_0; experts 14.7 GiB, non-expert 1.69 GiB of the file).
+Served with `-cmoe` (experts as mmap pages in RAM) + `--jinja` (the chat
+template carries `reasoning_effort`; the legacy template path does not know
+this arch). No DSpark speculation (#32218 open in mainline). One ~901-token
+prompt, 128 generated tokens, one rep per arm, desktop light (~1.1 GiB of
+the Vega), no `guard.py` in the loop; VRAM/GTT sampled at 0.5 s
+(`scripts/bench_inkling.sh`, raw rows in `results/inkling_ub_cache*.jsonl`):
+
+| arm | prompt t/s | gen t/s | peak system VRAM | peak GTT |
+|---|---:|---:|---:|---:|
+| `-ngl 99 -cmoe` cache 0, ub 256 | 39.90 | 6.13 | 7513 MiB | 5267 MiB |
+| `-ngl 99 -cmoe` cache 0, ub 128 | 30.32 | 6.46 | 7867 MiB | 6085 MiB |
+| `-ngl 99 -cmoe` cache 0, ub 64 | 18.30 | 6.23 | 8135 MiB | 5977 MiB |
+| `-ngl 99 -cmoe` cache 1024, ub 256 | 38.42 | 2.16 | — | — |
+| `-ngl 99 -cmoe` cache 1024, ub 128 | 28.67 | 2.13 | — | — |
+| `-ngl 99 -cmoe` cache 1024, ub 64 | 16.61 | 2.13 | — | — |
+| `-ngl 99 -cmoe` cache 1024, ub 32 | 9.06 | 2.13 | — | — |
+| cache 1024 + `-lm none` (pinned), ub 128 | 28.24 | 2.13 | 7972 MiB | 6085 MiB |
+| cache 1024 + `-lm none` (pinned), ub 64 | 17.52 | 2.23 | 7489 MiB | 5077 MiB |
+| cache 1024 + `-lm none` + `--moe-cache-cpu-share 1.0`, ub 128 | 28.24 | 2.12 | 7972 MiB | 5174 MiB |
+| `-ngl 0 -dev Vulkan0` (all weights CPU), ub 128 | 25.85 | 5.61 | ~7300 MiB | ~6000 MiB |
+| `-dev none` (pure CPU), ub 128 | 24.77 | 5.62 | 1194 MiB (desktop only) | — |
+| `-dev none` (pure CPU), ub 512 | 23.84 | 5.64 | 1194 MiB (desktop only) | — |
+
+Conclusions:
+
+* **The looped graph does not fit the Vega under the cap.** The ops the
+  scheduler assigns to the GPU reserve a **7–8 GiB Vulkan0 compute buffer**:
+  11.2 GiB at `-ub 512`, ~6.6 GiB at `-ub 32`, nearly independent of context
+  (6.64 GiB at ctx 2048 vs 7.62 at 32768) and unchanged by `-fa off`. The
+  same graph scheduled entirely on the CPU needs **839 MiB**
+  (`-dev none`, CPU compute buffer). RADV spills the excess into GTT
+  (5–6 GiB observed), so `-ngl 99` runs but peaks at 7.3–8.1 GiB of system
+  VRAM — every Vulkan-in-schedule config breaches the 5500 MiB cap and
+  `guard.py` kills it at load (observed: killed at 7284.6 MiB on the first
+  `./serve.sh` attempt). Pure CPU is the only guard-safe Vega-only rung and
+  gives up almost nothing: 5.62 vs 6.13–6.46 t/s generation.
+* **The MoE expert cache loses on this host, decisively** — 3× generation
+  (2.13 vs 6.13–6.46 t/s), unchanged by pinning the host experts (`-lm
+  none`) or by `--moe-cache-cpu-share 1.0`. The upload path is not the
+  bottleneck: the Vega's own expert-matmul throughput is below the 8-thread
+  CPU's, so computing cache hits on the GPU costs more than the saved
+  uploads win. Same conclusion as the Swift spill path above. Shipped as
+  `MOE_CACHE_MIB` defaulting to 0 (eGPU rung only).
+* **Generation on the CPU rung is RAM-bandwidth-bound**: ~1.7 GB of expert
+  weights touched per token at 5.6 t/s ≈ 9.5 GB/s. Ubatch is irrelevant
+  (prompt 24.8 at ub 128 vs 23.8 at 512; gen flat).
+* **eGPU rung unmeasured** (`-dev CUDA0 -ngl 99 -cmoe`): the Vulkan
+  reservation analysis does not transfer to CUDA, but 7–8 GiB compute
+  buffer + 1.26 GiB non-expert weights + KV sits at or over the 1070's
+  8192 MiB — verify on first attach, drop to `NGL=0` if the load OOMs.
+* Guarded end-to-end check of the shipped default (`./serve.sh`, `-dev
+  none`): loads clean under `guard.py`, 1194 MiB system VRAM (desktop
+  only), correct completion with `reasoning_effort` honored. The server-side
+  default effort is shipped as `low` (`EFFORT=` env, `--reasoning-effort`):
+  the template's own default `high` made short `max_tokens` budgets end
+  entirely inside thinking and return empty content (observed: 120 tokens,
+  empty content). With the `low` default and no client effort, the same
+  prompt returns content with a short (~336-char) thinking trace.

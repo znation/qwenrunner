@@ -17,13 +17,14 @@ CMAKE_BUILD_TYPE=Release
 -- GL_KHR_cooperative_matrix supported by glslc
 -- GL_NV_cooperative_matrix2 supported by glslc
 -- GL_NV_cooperative_matrix_decode_vector not supported by glslc
+-- GL_EXT_cooperative_matrix_maintenance1 not supported by glslc
 -- GL_EXT_integer_dot_product supported by glslc
 -- GL_EXT_bfloat16 not supported by glslc
 -- GL_EXT_float_e2m1 not supported by glslc
 -- GL_EXT_float_e4m3 not supported by glslc
 -- Including Vulkan backend
 -- ggml version: 1.0.0
--- ggml commit:  dd099a6
+-- ggml commit:  46eb174
 -- OpenSSL found: 3.5.7
 -- Generating embedded license file for target: llama-app
 -- Configuring done (0.9s)

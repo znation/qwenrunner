@@ -11,7 +11,36 @@ killing at `CAP` 5500. The disk-spill default holds zero model VRAM, so it
 cannot pressure the desktop at all — under gaming the server is simply the
 one process that never competes for the card.
 
-The default (`./serve.sh`) runs one **Swift-1.5-Qwen3.8-Flash-Next IQ3_S**
+The default (`./serve.sh`) runs one **Inkling 2 Mini IQ4_NL** instance
+(see "Inkling 2 Mini" below and [`RESULTS.md`](RESULTS.md)): a 26.4B looped
+MoE (5.4B active, 128 experts with 8 active per visit, 24 physical layers
+visited 48 times per token) from Thinking Machines Lab, released 2026-11-20.
+The 14.7 GiB of routed experts stay in RAM as `mmap` pages (`-cmoe`) and the
+rest follows the eGPU: with the 1070 attached, `-ngl 99` puts the non-expert
+weights (1.26 GiB) on it (`-dev CUDA0`, uncapped, drives no display; the
+Vega stays desktop-only) — **unmeasured on the 1070**, verify on first
+attach. Without the eGPU the path is **pure CPU** (`-dev none`, zero model
+VRAM, gaming-proof): measured **5.6 t/s generation, 24.8 t/s prompt** at
+32k. The looped graph's GPU-assigned ops reserve a 7–8 GiB compute buffer
+on the Vega (the CPU-only graph needs 839 MiB), so every
+Vulkan-in-schedule config breaches the 5500 cap and `guard.py` kills it at
+load — pure CPU is the only guard-safe Vega-only rung. Vision input works
+out of the box (`mmproj-Inkling-2-Mini-BF16.gguf`, encoder on the CPU by
+default, `MMPROJ_OFFLOAD=1` moves it to the GPU). Reasoning depth is set by
+the client via `reasoning_effort` (`none`…`max`, default `high`); sampling
+wants temperature 1.0 with no truncation (top-p 1.0, top-k off, min-p 0).
+
+The MoE **expert cache** (`--moe-cache-mib`, llama.cpp's own equivalent of
+[Strata](https://github.com/Niko1221/Strata)'s hot-expert VRAM cache) is
+wired up as `MOE_CACHE_MIB` but defaults to **0**: measured 3× *slower*
+generation on this host (2.13 vs 6.13–6.46 t/s at `-ngl 99` on the Vega),
+because the Vega's expert matmuls lose to the 8-thread CPU even with zero
+upload cost — the same conclusion as the Swift spill path. It is the right
+lever on a GPU whose expert matmuls outpace the CPU.
+
+The previous defaults remain available and are selected automatically by
+`MODEL`: `MODEL=models/iq3s/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf ./serve.sh`
+runs one **Swift-1.5-Qwen3.8-Flash-Next IQ3_S**
 instance served by **disk spill** (see "Disk-spill MoE" below and
 [`RESULTS.md`](RESULTS.md)): the 83.74 GB of shards cannot fit in RAM+VRAM, so
 `-cmoe` keeps the 512 routed experts on the CPU as `mmap` pages and `-ngl`
@@ -34,7 +63,7 @@ generation at ~5.7 GiB of system VRAM — a light-desktop option only, and
 those layers land on the 1070 (8 GiB, uncapped, drives no display) and the
 Vega stays desktop-only — unmeasured, verify on first attach.
 
-The previous default remains available and is selected automatically by
+The 27B remains available and is selected automatically by
 `MODEL`: `MODEL=models/Qwen3.8-27B-UD-Q4_K_M.gguf ./serve.sh` runs one
 **Qwen3.8-27B** instance split across the GPUs and CPU, fitted by llama.cpp's
 own `--fit` with a `--fit-target` of `vram_total - fit-cap` on the display
@@ -71,8 +100,9 @@ including six conclusions that earlier, load-contaminated measurements got wrong
 
 | lever | setting | evidence |
 |---|---|---|
-| runtime | llama.cpp @ `dd099a6` (was `aa5e0092`, upgraded 2026-11-15 for the MoE expert cache), Vulkan/RADV | no ROCm/HIP on Vega 10 — Vulkan is the only GPU compute path |
-| model | **`models/Qwen3.8-27B-UD-Q4_K_M.gguf`** | 16.46 GB. `general.name`/`general.basename` are `Qwen3.8-27B`; llama.cpp prints `qwen35` in benchmark tables because the GGUF's `general.architecture` is the Qwen3.5 one — same architecture, later model. Smaller quants are *faster* — Q2_K_XL offloads 20 layers vs 12 and gains +52 % generation — but cost +61 % perplexity. See `RESULTS.md` |
+| runtime | llama.cpp @ `46eb174` (was `dd099a6`, upgraded 2026-11-20 for Inkling 2 Mini's `inkling2_loop` arch, #32694), Vulkan/RADV | no ROCm/HIP on Vega 10 — Vulkan is the only GPU compute path |
+| model | **`models/Inkling-2-Mini-IQ4_NL.gguf`** (default) | 17.6 GB, `general.architecture` `inkling2_loop` (#32694). 26.4B total / ~3B active per token: 24 physical layers (the middle 12 run 3×, 48 visits), 128 experts × 8 active, expert intermediate 1152. Experts are 14.7 GiB of the file (layers 0–19 IQ4_NL, 20–23 Q8_0), non-expert 1.69 GiB at Q8_0. KL vs BF16 on wikitext-2: 0.0095 (95.5 % same top token). See `RESULTS.md`, "Inkling 2 Mini" |
+| model (27B) | `models/Qwen3.8-27B-UD-Q4_K_M.gguf` | 16.46 GB. `general.name`/`general.basename` are `Qwen3.8-27B`; llama.cpp prints `qwen35` in benchmark tables because the GGUF's `general.architecture` is the Qwen3.5 one — same architecture, later model. Smaller quants are *faster* — Q2_K_XL offloads 20 layers vs 12 and gains +52 % generation — but cost +61 % perplexity. See `RESULTS.md` |
 | `-lm` | **`mmap`** | `dio` is 46.10 vs 36.15 t/s prompt at 128k, but it puts the CPU-side weights in the Vulkan *host* buffer type (GTT, unreclaimable system RAM): **22.8 GB vs 6.6 GB of `MemAvailable` drop**, 2 interleaved reps each. The old "~40× lighter RSS" reading measured RSS, which cannot see GTT. `LM=dio` restores the prompt throughput when RAM is free |
 | `-ngl` | **fit-derived** (was 10 on the Vega-only path) | ~252 MiB client VRAM per layer; 10 beats 8 on both axes, 2/2. `--fit` picks it from live free VRAM now — but only when there is a second device to fit against: on the Vega-only path it converges to 0 layers, because it counts the Vulkan host buffer the CPU-side weights land in as device memory |
 | `--fit` | **on (always)** | llama.cpp's own fitter re-derives `-ngl`/`-ts` from live free VRAM with the cap as a `-fitt` margin: 28-30 layers at 128k, i.e. the shipped config to 2 MiB, or two layers (+4 %) faster — but it spends the ~1120 MiB drift reserve and its choice moves with desktop noise. That trade is why the measured formula used to be the default; with the eGPU optional (and no formula for the Vega-only path) `--fit` is the only strategy that works for both. `NGL=`/`TS=` pins the layer count and turns `--fit` off |
@@ -176,10 +206,11 @@ Three things are deliberately not committed (see `.gitignore`): the model weight
 unpacked shader tooling.
 
 ```
-# 1. pinned llama.cpp (upgraded 2026-11-15 from aa5e0092 for the MoE expert
+# 1. pinned llama.cpp (upgraded 2026-11-20 from dd099a6 for Inkling 2 Mini's
+#    inkling2_loop arch, #32694; the 2026-11-15 upgrade added the MoE expert
 #    cache, see RESULTS.md "Disk-spill MoE: Swift IQ3_S")
 git clone https://github.com/ggml-org/llama.cpp third_party/llama.cpp
-git -C third_party/llama.cpp checkout dd099a6bf30c50627f6ae18915fbb687539a704d
+git -C third_party/llama.cpp checkout 46eb1742db6d2caec1bfa848c5702b1bdcc815e5
 
 # 2. Vulkan shader tooling, without root — no glslc/libshaderc system-wide
 mkdir -p tools/pkg tools/local && cd tools/pkg
@@ -189,7 +220,10 @@ cd ../..
 
 # 3. models
 mkdir -p models
-./scripts/dl_smaller.sh                          # Qwen3.8-27B Q4_K_M (the default) + optional extra quants + the vision projector (mmproj)
+./scripts/dl_smaller.sh                          # Qwen3.8-27B Q4_K_M + optional extra quants + the vision projector (mmproj)
+# the default model:
+./scripts/dl_parallel.sh "https://huggingface.co/ggml-org/Inkling-2-Mini-GGUF/resolve/main/Inkling-2-Mini-IQ4_NL.gguf" models/Inkling-2-Mini-IQ4_NL.gguf 16
+./scripts/dl_parallel.sh "https://huggingface.co/ggml-org/Inkling-2-Mini-GGUF/resolve/main/mmproj-Inkling-2-Mini-BF16.gguf" models/mmproj-Inkling-2-Mini-BF16.gguf 8
 ```
 
 ## Build
@@ -209,12 +243,14 @@ present. Both backends end up in one binary and `-dev` selects between them.
 ## Run
 
 ```
-./serve.sh                       # Swift IQ3_S disk-spill default (:8080)
-                                 #   no eGPU:  -ngl 20 on the Vega (4.14 t/s)
-                                 #   eGPU on:  -ngl 80 on the 1070 alone (~5.1 t/s)
-NGL=0 ./serve.sh                 # pure CPU, zero model VRAM — gaming-proof rung
+./serve.sh                       # Inkling 2 Mini IQ4_NL default (:8080)
+                                 #   no eGPU:  pure CPU, -dev none (5.6 t/s gen, zero model VRAM)
+                                 #   eGPU on:  -ngl 99 -cmoe on the 1070 alone (unmeasured, verify)
+MOE_CACHE_MIB=1024 ./serve.sh    # eGPU only: hot-expert VRAM cache (measured 3x SLOWER on the Vega)
+NGL=0 ./serve.sh                 # (Swift spill path) pure CPU, zero model VRAM — gaming-proof rung
 CTX=65536 ./serve.sh             # one 64k slot (KV ~0.9 GiB RAM; prefill ~110 min)
-MODEL=models/Qwen3.8-27B-UD-Q4_K_M.gguf ./serve.sh   # the 27B split (previous default)
+MODEL=models/iq3s/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf ./serve.sh  # Swift disk-spill (previous default)
+MODEL=models/Qwen3.8-27B-UD-Q4_K_M.gguf ./serve.sh   # the 27B split
 ```
 
 The disk-spill default serves text only (no Swift mmproj is fetched). The 27B
@@ -389,7 +425,82 @@ window above 4 GB. Verify: `nvidia-smi` lists the card with 8192 MiB, and
   the CPU↔GPU boundary. The 1070's weaker prefill is simply that the Vega 48 has
   ~2× its FP32 throughput.
 
-## Disk-spill MoE (serving default)
+## Inkling 2 Mini (default)
+
+[Inkling 2 Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini)
+(Thinking Machines Lab, 2026-11-20, Apache 2.0) is a **looped MoE**: 24
+physical decoder layers where the middle 12 (layers 6–17) run **3× per
+token**, so a token makes 48 layer visits with 24 layers' weights. Each
+visit routes to **8 of 128 experts** (intermediate 1152, hidden 2304);
+~26B physical parameters, ~3B active per token. Five of every six layers
+are sliding-window (1024 tokens) with one full-attention layer, so the KV
+cache is small even at 1M context (the GGUF declares 1048576). Vision
+input ships as a separate projector. The `inkling2_loop` architecture
+landed in mainline llama.cpp in
+[#32694](https://github.com/ggml-org/llama.cpp/pull/32694); the pinned
+runtime was upgraded to `46eb174` for it. The GGUF is the official
+[ggml-org/Inkling-2-Mini-GGUF](https://huggingface.co/ggml-org/Inkling-2-Mini-GGUF)
+IQ4_NL (17.6 GB: experts of layers 0–19 at IQ4_NL, everything else Q8_0;
+KL vs BF16 on wikitext-2 0.0095). The Unsloth root GGUFs use a different
+looped layout that needs Unsloth's own build — not used here.
+
+Measured (Vega-only, 8 threads, ctx 32768, ~900-token prompt, 128
+generated tokens, one rep per arm; raw rows in
+`results/inkling_ub_cache*.jsonl`):
+
+| arm | prompt t/s | gen t/s | model VRAM |
+|---|---:|---:|---|
+| `-ngl 99 -cmoe`, cache 0, ub 256 | 39.9 | 6.13 | ~6.4 GiB + GTT spill |
+| `-ngl 99 -cmoe`, cache 0, ub 128 | 30.3 | 6.46 | ~6.8 GiB + GTT spill |
+| `-ngl 99 -cmoe`, cache 1024, ub 128 | 28.7 | **2.13** | ~6.4 GiB + GTT spill |
+| … cache 1024, `-lm none` (pinned) | 28.2 | 2.13 | ~6.9 GiB |
+| … cache 1024 + `--moe-cache-cpu-share 1.0` | 28.2 | 2.12 | ~6.9 GiB |
+| `-ngl 0 -dev Vulkan0` (all weights CPU) | 25.9 | 5.61 | ~6.0 GiB + GTT spill |
+| **`-dev none` (pure CPU) — shipped default** | 24.8 | 5.62 | **0** |
+
+Conclusions:
+
+* **The looped graph does not fit the Vega.** The ops the scheduler assigns
+  to the GPU reserve a **7–8 GiB Vulkan0 compute buffer** — at `-ub 512`
+  11.2 GiB, at `-ub 32` still ~6.6 GiB, nearly independent of context
+  (6.6 GiB at ctx 2048 vs 7.6 at 32768) and of `-fa` — while the same graph
+  scheduled entirely on the CPU needs **839 MiB**. RADV silently spills the
+  excess into GTT (measured 5–6 GiB of GTT during runs), so the server
+  *works* at `-ngl 99` but peaks at 7.3–8.1 GiB of system VRAM: every
+  Vulkan-in-schedule config breaches the 5500 MiB cap and `guard.py` kills
+  it at load. Pure CPU (`-dev none`) is the only guard-safe Vega-only rung,
+  and it gives up almost nothing: 5.62 vs 6.13–6.46 t/s generation.
+* **The MoE expert cache loses on this host, decisively.** `--moe-cache-mib
+  1024` costs 3× generation (2.13 vs 6.13–6.46 t/s) and the result holds
+  with the host experts pinned (`-lm none`) and with
+  `--moe-cache-cpu-share 1.0`. The upload path is not the bottleneck: the
+  Vega's own expert-matmul throughput is below what the 8-thread CPU
+  delivers, so computing the cache hits on the GPU costs more than the
+  saved uploads win. Same conclusion as the Swift spill path. The cache is
+  the right lever on a GPU whose expert matmuls outpace the CPU (an RTX-class
+  card); here it is wired as `MOE_CACHE_MIB` and defaults to 0.
+* **Generation is RAM-bandwidth-bound on the CPU rung**, as expected for a
+  3B-active MoE: ~1.7 GB of expert weights touched per token at 5.6 t/s ≈
+  9.5 GB/s. Ubatch does not matter (prompt 24.8 at ub 128 vs 23.8 at 512).
+* **eGPU rung unmeasured.** With the 1070 attached the path is
+  `-dev CUDA0 -ngl 99 -cmoe` (uncapped, drives no display). The Vulkan
+  reservation analysis does not transfer to CUDA, but 7–8 GiB of compute
+  buffer + 1.26 GiB of non-expert weights + KV is at or over the 1070's
+  8192 MiB — verify on first attach, drop to `NGL=0` if the load OOMs.
+* No DSpark speculation: mainline llama.cpp does not support the drafter
+  yet ([#32218](https://github.com/ggml-org/llama.cpp/pull/32218) open), so
+  `MTP` is off on this path.
+* The chat template carries `reasoning_effort` (`none`…`max`). The server
+  default is **`low`** (`EFFORT=` env, via `--reasoning-effort`): the
+  template's own default is `high` (0.9), at which short `max_tokens`
+  budgets can end entirely inside thinking and return empty content —
+  measured on the shipped config. Clients override per request; note the
+  per-level behavior was only spot-checked (the `none`/`high` override
+  tests ran under an unrelated heavy compile load and were inconclusive
+  beyond "the override reaches the template"). Sampling wants temperature
+  1.0, no truncation.
+
+## Disk-spill MoE (previous default)
 
 A model far larger than RAM+VRAM can run here by keeping its experts on the
 CPU as `mmap` pages and streaming them from the NVMe — measured, not
