@@ -21,7 +21,10 @@ weights (1.26 GiB) on it (`-dev CUDA0`, uncapped, drives no display; the
 Vega stays desktop-only) — **unmeasured on the 1070**, verify on first
 attach. Without the eGPU the path is **pure CPU** (`-dev none`, zero model
 VRAM, gaming-proof): measured **5.6 t/s generation, 24.8 t/s prompt** at
-32k. The looped graph's GPU-assigned ops reserve a 7–8 GiB compute buffer
+32k on an idle machine, **~3.4 t/s solo / ~2.1–2.7 t/s per stream at
+`-np 2` under the real desktop load** (aggregate throughput is flat in
+`-np` — see "Inkling 2 Mini" below for the team parallelism study). The
+looped graph's GPU-assigned ops reserve a 7–8 GiB compute buffer
 on the Vega (the CPU-only graph needs 839 MiB), so every
 Vulkan-in-schedule config breaches the 5500 cap and `guard.py` kills it at
 load — pure CPU is the only guard-safe Vega-only rung. Vision input works
@@ -244,8 +247,10 @@ present. Both backends end up in one binary and `-dev` selects between them.
 
 ```
 ./serve.sh                       # Inkling 2 Mini IQ4_NL default (:8080)
-                                 #   no eGPU:  pure CPU, -dev none (5.6 t/s gen, zero model VRAM)
+                                 #   team default: -np 2, 64k pool (32k/slot)
+                                 #   no eGPU:  pure CPU, -dev none (3.4 t/s solo under real load)
                                  #   eGPU on:  -ngl 99 -cmoe on the 1070 alone (unmeasured, verify)
+NP=1 ./serve.sh                  # solo rung: one agent at full speed
 MOE_CACHE_MIB=1024 ./serve.sh    # eGPU only: hot-expert VRAM cache (measured 3x SLOWER on the Vega)
 NGL=0 ./serve.sh                 # (Swift spill path) pure CPU, zero model VRAM — gaming-proof rung
 CTX=65536 ./serve.sh             # one 64k slot (KV ~0.9 GiB RAM; prefill ~110 min)
@@ -490,6 +495,20 @@ Conclusions:
 * No DSpark speculation: mainline llama.cpp does not support the drafter
   yet ([#32218](https://github.com/ggml-org/llama.cpp/pull/32218) open), so
   `MTP` is off on this path.
+* **Parallelism does not buy total throughput on the CPU rung.** Measured
+  with interleaved reps under real desktop load
+  (`scripts/bench_inkling_np.py`, RESULTS.md "Inkling 2 Mini:
+  parallelism"): aggregate generation is 2.08 / 2.14 / 2.41 t/s at np
+  1/2/4 — the CPU decode saturates, slots split the total. The shipped
+  team default is therefore **`-np 2` with a 64k pool (32k per slot)**:
+  two agents progress at ~2.1–2.7 t/s each instead of queueing behind one
+  3.4 t/s stream, and the deeper pool is nearly free (KV is tiny — SWA
+  1024 on 40 of 48 visits). np4 splits the same total four ways (~1.35
+  t/s per stream) and was unstable under desktop load spikes. More than
+  2 agents queue for slots; the prompt cache makes a queued agent's
+  resume cheap (~5 s vs a full re-prefill). The real lever for more total
+  throughput is moving the expert matmuls off the CPU (the unmeasured
+  eGPU rung) or a faster host.
 * The chat template carries `reasoning_effort` (`none`…`max`). The server
   default is **`low`** (`EFFORT=` env, via `--reasoning-effort`): the
   template's own default is `high` (0.9), at which short `max_tokens`

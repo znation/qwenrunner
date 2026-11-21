@@ -112,8 +112,17 @@ if [ "$INKLING" = 1 ]; then
     ALIAS="${ALIAS:-Inkling-2-Mini}"
     MMPROJ="${MMPROJ:-$ROOT/models/mmproj-Inkling-2-Mini-BF16.gguf}"
     MTP="${MTP:-0}"
-    CTX="${CTX:-32768}"
-    NP="${NP:-1}"
+    # Team default (RESULTS.md "Inkling 2 Mini: parallelism"): aggregate
+    # token throughput is FLAT in -np on the pure-CPU path (2.08 / 2.14 /
+    # 2.41 t/s at np 1/2/4 — decode saturates the CPU), so slots buy
+    # concurrency, not speed: two agents progress at ~2.1-2.7 t/s each
+    # instead of queueing behind one 3.4 t/s stream. The 64k pool keeps a
+    # full 32k slot per agent; KV for this model is tiny (SWA 1024 on 40 of
+    # 48 visits), so the deeper pool costs ~0.7 GiB of RAM and measured no
+    # throughput penalty. np 4 splits the same total four ways (1.35 t/s
+    # per stream) and was unstable under desktop load spikes.
+    CTX="${CTX:-65536}"
+    NP="${NP:-2}"
 fi
 # The name the API advertises (/v1/models). Without it llama-server reports the
 # .gguf path, so a client's model id becomes the path. The alias gives both

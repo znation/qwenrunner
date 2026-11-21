@@ -1937,3 +1937,62 @@ Conclusions:
   entirely inside thinking and return empty content (observed: 120 tokens,
   empty content). With the `low` default and no client effort, the same
   prompt returns content with a short (~336-char) thinking trace.
+
+### Inkling 2 Mini: parallelism (team serving) **[clean]**
+
+How much concurrency the pure-CPU Inkling path supports, and what it costs.
+Workload per arm: N = np concurrent `/completion` requests, each a DISTINCT
+~900-token prompt (different corpus regions, so expert routing differs
+across streams — identical prompts would share expert reads and flatter
+parallelism), 256 generated tokens, greedy. Server pinned to CPUs 8-15
+(one SMT lane per physical core) via `taskset`; desktop load left running
+deliberately (this is a shared workstation — the numbers are the ones a
+team actually gets). Desktop load varied between arms (loadavg 11-33), so
+the np1/np2/np4 arms were run TWICE in interleaved order (np1, np2, np4,
+np1, np2, np4) to cancel the drift; raw rows in
+`results/inkling_np.jsonl`, driver `scripts/bench_inkling_np.py`. An
+earlier uncontrolled single pass is kept as
+`results/inkling_np_uncontrolled.jsonl` — its np2@c32k arm (0.41 t/s per
+stream) and np2@c64k arm (3.5 t/s per stream) differ only in context and
+differ 8x in speed: a pure load-drift artefact, and the reason for the
+interleaving.
+
+| arm (t8, pinned) | loadavg range | agg gen t/s | per-stream gen t/s | agg prompt t/s |
+|---|---|---:|---|---:|
+| np1, rep 0/1 | 12-18 | 2.08 / 2.08 | 3.39 / 3.38 | 8.6 |
+| np2, rep 0/1 | 11-20 | 2.14 / 2.14 | 2.13-2.65 | 8.6 |
+| np4, rep 0 | 14-19 | 2.41 | ~1.35 | 9.5 |
+| np4, rep 1 | 14-26 | 1.37 | ~0.88 | 5.4 |
+| np1, t16 | 19-24 | 1.25 | 2.06 | 5.2 |
+| np2, t16, 64k pool | 21-33 | 1.54 | 1.56 | 6.2 |
+
+Conclusions:
+
+* **Aggregate token throughput is FLAT in `-np`.** 2.08 → 2.14 → 2.41 t/s
+  across np 1/2/4 (rep 0). The CPU decode path saturates at ~2.1-2.4 t/s
+  total under real desktop load; slots split that total, they do not
+  multiply it. This is a different regime from the 27B Vega-only path,
+  where a second slot bought ×1.4-1.5 total — there the bottleneck was
+  per-stream serial CPU; here the expert matmuls already saturate the
+  cores/RAM at one stream.
+* **So slots buy concurrency, not speed.** np2: two agents progress at
+  ~2.1-2.7 t/s each (−25 % vs solo 3.4) instead of one waiting for the
+  other. np4: four agents at ~1.35 t/s (−60 %) for +16 % total at best —
+  and rep 1 collapsed to 1.37 total when the desktop load spiked to 26,
+  so np4 is fragile on this box.
+* **16 threads is worse** (1.25 vs 2.08 agg at np1) — consistent with the
+  27B finding — with the caveat that the t16 arms ran pinned to 8 CPUs
+  (2 threads per CPU). Not re-swept unpinned; t8 stays the default.
+* **The 64k pool costs nothing measurable** (KV for this model is tiny:
+  SWA 1024 on 40 of 48 visits; ~0.7 GiB at a 64k pool) and keeps a full
+  32k slot per agent at np2. Its throughput rep came from the uncontrolled
+  pass only (2.52 agg, 3.5 per stream — the best np2 numbers), so treat
+  "no penalty" as likely rather than proven.
+* **Pin question left open.** A pin A/B (server on CPUs 8-15 vs unpinned)
+  was confounded: the unpinned arms ran at loadavg 39-45 against 11-20 for
+  every pinned arm, so the comparison is void. serve.sh ships unpinned.
+* **Shipped team default: `-np 2`, 64k pool (32k per slot).** More than 2
+  agents queue for slots; llama.cpp's prompt cache makes a queued agent's
+  resume cheap (~5 s vs a full re-prefill, per the 27B measurements).
+* The real lever for more total throughput is not `-np` — it is moving the
+  expert matmuls off the CPU (the unmeasured eGPU rung) or a faster host.
