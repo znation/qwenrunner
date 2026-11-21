@@ -26,6 +26,7 @@ table and method in [`RESULTS.md`](RESULTS.md), "Engine shoot-out".
 | engine (weights) | turns/min | aggregate out t/s | per-stream t/s | TTFT p50 / p90 |
 |---|---:|---:|---:|---:|
 | **Flash-Next IQ3_S (Splash 1.7.0 + DFlash2)**, `./serve.sh` | **16.6-17.7** | **92-101** | 119-127 | 7-7.6 / 20-21 s |
+| Inkling 2 Mini IQ4_NL (llama.cpp, day 0), `ENGINE=inkling` | 7.3 | 30 | 13 | 5 / 13 s |
 | Splash 1.6.0 (Qwen3.8-27B MLX 4-bit + DFlash2), previous default | 15.0-16.0 | 64-72 | 27-34 | 2.2-3.4 / 10-14 s |
 | Kapitsa 0.2.31 (`27b` 4-bit + DFlash2, 4 slots) | 10.7-11.2 | 45-47 | 15 | 1.7-2.1 / 4.6 s |
 | mlx-serve 26.11.2, `NP=4`, 32 GB prefix cache | 10.7-11.3 | 17-19 | 16-18 | 6.6-8.3 / 21-31 s |
@@ -35,6 +36,16 @@ table and method in [`RESULTS.md`](RESULTS.md), "Engine shoot-out".
 **Flash-Next is now the default** (row above): on the same 4-session, 128k
 tumwater replay it does ~10% more turns/min and ~50% more output t/s than the
 best 27B arm, at the cost of ~2.5× worse first-token time and 2× the memory.
+
+The last row is the day-0 **Inkling 2 Mini** experiment (Thinking Machines'
+looped transformer, 2026-11-20; 26.4B/5.4B active, Apache 2.0): llama.cpp main
++ the official IQ4_NL GGUF, one replay rep. It is ~2.3× slower in turns/min,
+~3.3× slower in aggregate output and ~10× slower per stream than Flash-Next
+(no Metal speculative decoding exists for the looped arch yet), but uses 39 vs
+93 GiB and has better TTFT tails; it is only worth running if Flash-Next
+quality is not needed (it benchmarks at Qwen3.8-27B class) and the memory or
+latency win matters. Full numbers and the MLX day-0 findings in
+[`RESULTS.md`](RESULTS.md), "Inkling 2 Mini day 0".
 
 The 27B's own win, for history:
 
@@ -95,6 +106,7 @@ curl -sL https://github.com/ddalcu/mlx-serve/releases/latest/download/mlx-serve-
 ./serve.sh                       # Splash, Flash-Next IQ3_S, 4 sessions, 128k, :8090
 MODEL=mlx-community/Qwen3.8-27B-4bit ./serve.sh   # the previous 27B default
 ENGINE=mlx-serve ./serve.sh      # the older mlx-serve engine (27B, kept runnable)
+ENGINE=inkling ./serve.sh        # Inkling 2 Mini IQ4_NL on llama.cpp (day 0, text-only)
 ```
 
 OpenAI-compatible at `http://127.0.0.1:8090/v1`. Logs go to

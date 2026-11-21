@@ -24,7 +24,8 @@
 # 128k session, so the other three re-prefill 40-55k tokens every turn.
 #
 # Env (anything unset is derived):
-#   ENGINE   splash (default) | mlx-serve (the previous engine, kept runnable)
+#   ENGINE   splash (default) | inkling (Inkling 2 Mini on llama.cpp, day-0
+#            GGUF, much slower but text-only and ~39 GiB) | mlx-serve (kept)
 #   MODEL    the weights; per-engine default below
 #   CTX      context per session, tokens (default 131072)
 #   NP       concurrent sessions (default 4 — tumwater's fleet). Splash's lane
@@ -36,6 +37,7 @@
 #
 #   ./serve.sh                       # Splash, 4 sessions, 128k, :8090
 #   ENGINE=mlx-serve ./serve.sh      # the previous engine, cache fixed for NP
+#   ENGINE=inkling ./serve.sh        # Inkling 2 Mini (llama.cpp), 4 slots, :8090
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -86,6 +88,34 @@ splash)
         --served-model-name "$ALIAS" --served-model-name "$OLD_ID"
         --served-model-name "$LEGACY_ID" --announce-served-name)
   echo "serve: splash model=$MODEL ctx=$CTX lanes=4 alias=$ALIAS (+$OLD_ID +$LEGACY_ID)"
+  echo "serve: http://$HOST:$PORT/v1  log: $LOG"
+  exec "$BIN" "${ARGS[@]}" "$@" > >(tee -a "$LOG") 2>&1
+  ;;
+
+inkling)
+  # Inkling 2 Mini (Thinking Machines, 2026-11-20) on llama.cpp, day-0 GGUF.
+  # Replacement for the Flash-Next default ONLY if you accept much lower
+  # throughput and ~27B-class quality: measured on this machine with the same
+  # tumwater replay (RESULTS.md, "Inkling 2 Mini"): 7.26 turns/min, 30.3 agg
+  # out t/s, 12.9 stream t/s p50 (Flash-Next: 16.6-17.7 / 92-101 / 119-127)
+  # at 38.5 GiB peak and better TTFT tails. No speculative decoding exists for
+  # this arch on Metal yet. IQ4_NL has no mmproj, so text-only.
+  BIN="${INKLING_BIN:-$HOME/opt/llama.cpp/build/bin/llama-server}"
+  [ -x "$BIN" ] || BIN="$(command -v llama-server || true)"
+  if [ -z "$BIN" ] || [ ! -x "$BIN" ]; then
+    echo "serve: llama-server not found (build ~/opt/llama.cpp or brew install llama.cpp)" >&2
+    exit 1
+  fi
+  MODEL="${MODEL:-$HOME/opt/inkling/Inkling-2-Mini-IQ4_NL.gguf}"
+  # top of file already defaulted ALIAS to the splash name; only override then
+  [ "$ALIAS" = "Qwen3.8-Flash-Next" ] && ALIAS=Inkling-2-Mini
+  # -c is the TOTAL context across all NP slots; 81920/slot holds the replay's
+  # deepest turns. KV q8_0 halves the 144 KiB/token (per-visit) cache. The top
+  # of this file defaulted CTX to the splash 131072, so only override then.
+  [ "$CTX" = "131072" ] && CTX=81920
+  ARGS=(-m "$MODEL" --host "$HOST" --port "$PORT" -c "$(( CTX * NP ))" -np "$NP"
+        --alias "$ALIAS" -ngl 999 -fa on -ctk q8_0 -ctv q8_0 --no-webui --temp 0.6)
+  echo "serve: inkling model=$MODEL ctx_total=$(( CTX * NP )) slots=$NP alias=$ALIAS"
   echo "serve: http://$HOST:$PORT/v1  log: $LOG"
   exec "$BIN" "${ARGS[@]}" "$@" > >(tee -a "$LOG") 2>&1
   ;;
