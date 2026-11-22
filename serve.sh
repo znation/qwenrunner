@@ -122,7 +122,10 @@ if [ "$INKLING" = 1 ]; then
     # 48 visits), so the deeper pool costs ~0.7 GiB of RAM and measured no
     # throughput penalty. np 4 splits the same total four ways (1.35 t/s
     # per stream) and was unstable under desktop load spikes. CPU pinning
-    # (taskset) measured no effect either way — shipped unpinned.
+    # (taskset) measured no effect either way — shipped unpinned. Threads:
+    # t8 and t12 measure equivalent, t16 is a lottery (+3 % best case,
+    # -65 % under desktop load spikes) — THREADS=8 (one thread per
+    # physical core) stays.
     CTX="${CTX:-65536}"
     NP="${NP:-2}"
 fi

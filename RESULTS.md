@@ -2013,3 +2013,32 @@ Conclusions:
   resume cheap (~5 s vs a full re-prefill, per the 27B measurements).
 * The real lever for more total throughput is not `-np` — it is moving the
   expert matmuls off the CPU (the unmeasured eGPU rung) or a faster host.
+
+### Inkling 2 Mini: threads (t8/t12/t16) **[clean]**
+
+Closes the threads question on the shipped team config (np2, 64k pool,
+unpinned — pinning measured no effect). Interleaved t8/t12/t16, two reps
+each, same driver and workload as the parallelism study
+(`results/inkling_np.jsonl`, labels `np2_t{8,12,16}_c64k`); desktop load
+loadavg 8-18 across arms:
+
+| arm | loadavg range | agg gen t/s | per-stream gen t/s | agg prompt t/s |
+|---|---|---:|---|---:|
+| t8 | 9-15 | 3.17 / 2.58 | 2.82-3.64 | 10.4-12.8 |
+| t12 | 8-16 | 3.04 / 2.62 | 2.90-3.56 | 10.5-12.2 |
+| t16 | 11-18 | 3.27 / **1.12** | 0.90-3.58 | 4.5-13.2 |
+| t16 pinned (16 thr on 8 CPUs) | ~10 | 2.16 | 2.21 | 8.7 |
+
+Conclusions:
+
+* **t8 and t12 are equivalent** (within noise in both reps, both axes) —
+  same as the 27B finding ("4-12 are equivalent").
+* **t16 is a lottery.** Best case +3 % over t8 (3.27 vs 3.17); worst case
+  −65 % (1.12) when the desktop load rises mid-run. More threads claim
+  more of the box and lose more when the desktop spikes — the same
+  fragility np4 showed. The pinned t16 arm (2 threads per CPU) confirms
+  the oversubscription penalty (2.16 vs 3.17 unpinned at comparable
+  load).
+* **Shipped: `THREADS=8` unchanged** — equal average throughput to t12,
+  half the desktop contention of t16, one thread per physical core, and
+  consistent with the 27B history. `THREADS=` remains an env override.

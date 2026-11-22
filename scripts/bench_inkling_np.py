@@ -161,6 +161,17 @@ ARMS = [
     ("np1_nopin", 1, 8, 32768, 1, False),
     ("np2_pin", 2, 8, 32768, 1, True),
     ("np2_nopin", 2, 8, 32768, 1, False),
+    # threads sweep: close the t8/t12/t16 question on the shipped team
+    # config (np2, 64k pool, unpinned — pin measured no effect). The 27B
+    # history said 16 threads is worse; the Inkling t16 arm agreed but ran
+    # pinned to 8 CPUs (2 threads/CPU), so re-sweep unpinned, interleaved,
+    # two reps.
+    ("np2_t8_c64k", 2, 8, 65536, 0, False),
+    ("np2_t12_c64k", 2, 12, 65536, 0, False),
+    ("np2_t16_c64k", 2, 16, 65536, 0, False),
+    ("np2_t8_c64k", 2, 8, 65536, 1, False),
+    ("np2_t12_c64k", 2, 12, 65536, 1, False),
+    ("np2_t16_c64k", 2, 16, 65536, 1, False),
 ]
 
 if __name__ == "__main__":
