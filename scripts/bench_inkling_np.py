@@ -43,6 +43,10 @@ def avail_mib():
 
 
 def start_server(np, threads, ctx, pin=True):
+    # a previous arm's server may linger if something above this line raised;
+    # it holds 17 GiB of mmap'd model and would poison the next arm's RAM
+    subprocess.run(["pkill", "-f", f"--port {PORT}"], capture_output=True)
+    time.sleep(2)
     cmd = (["taskset", "-c", "8-15"] if pin else []) + [
            os.path.join(ROOT, "build/bin/llama-server"),
            "-m", MODEL, "-a", "bench", "-c", str(ctx), "-t", str(threads),
@@ -62,6 +66,8 @@ def start_server(np, threads, ctx, pin=True):
         if proc.poll() is not None:
             raise RuntimeError(f"server exited: see logs/bench_np_{np}t{threads}c{ctx}.log")
         time.sleep(2)
+    proc.terminate()
+    proc.wait()
     raise RuntimeError("server did not become healthy in 180 s")
 
 
@@ -143,9 +149,18 @@ ARMS = [
     ("np1_t16_c32k", 1, 16, 32768, 0),
     ("np2_t16_c64k", 2, 16, 65536, 0),
     # pin A/B: does confining the server to one SMT lane per core buy
-    # throughput under the real desktop load, or cost it?
-    ("np1_t8_c32k_nopin", 1, 8, 32768, 0, False),
-    ("np2_t8_c32k_nopin", 2, 8, 32768, 0, False),
+    # throughput under the real desktop load, or cost it? Interleaved
+    # pin/nopin, two reps, to cancel load drift (the first single-pass
+    # attempt was voided by a load spike: nopin arms ran at loadavg 39-45
+    # vs 11-20 for every pinned arm).
+    ("np1_pin", 1, 8, 32768, 0, True),
+    ("np1_nopin", 1, 8, 32768, 0, False),
+    ("np2_pin", 2, 8, 32768, 0, True),
+    ("np2_nopin", 2, 8, 32768, 0, False),
+    ("np1_pin", 1, 8, 32768, 1, True),
+    ("np1_nopin", 1, 8, 32768, 1, False),
+    ("np2_pin", 2, 8, 32768, 1, True),
+    ("np2_nopin", 2, 8, 32768, 1, False),
 ]
 
 if __name__ == "__main__":

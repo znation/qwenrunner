@@ -1988,9 +1988,26 @@ Conclusions:
   32k slot per agent at np2. Its throughput rep came from the uncontrolled
   pass only (2.52 agg, 3.5 per stream — the best np2 numbers), so treat
   "no penalty" as likely rather than proven.
-* **Pin question left open.** A pin A/B (server on CPUs 8-15 vs unpinned)
-  was confounded: the unpinned arms ran at loadavg 39-45 against 11-20 for
-  every pinned arm, so the comparison is void. serve.sh ships unpinned.
+* **Pin: closed — no effect.** Interleaved A/B (np1/np2 × pin/nopin × 2
+  reps, `results/inkling_np.jsonl` labels `np1_pin`…`np2_nopin`), desktop
+  load settled to loadavg 7-9 for all but the first two arms: aggregate
+  generation pin 2.26/2.73 (np1) and 3.12/3.17 (np2) vs unpinned
+  2.29/2.76 and 3.17/3.07 — even within ~1 %. `taskset -c 8-15` (one SMT
+  lane per physical core) neither protects the server from the desktop
+  nor costs it anything; serve.sh ships unpinned. (The first single-pass
+  pin attempt was voided by a load spike — nopin arms at loadavg 39-45 vs
+  11-20 pinned — and is superseded by this run. A leaked bench server
+  from that attempt, 17 GiB of mmap + 225 % CPU, was itself part of that
+  spike; the driver now kills any stale server on its port and terminates
+  the child on health-timeout.)
+* **Load level moves the absolute numbers a lot.** This A/B ran at
+  loadavg ~8 (vs 11-20 for the np sweep above) and measured solo
+  5.3-5.5 t/s and np2 aggregate 3.07-3.17 t/s — the best numbers yet.
+  At this lighter load np2 beats solo by ~15 % aggregate (3.1 vs 2.7),
+  so "flat in -np" (measured at loadavg 11-20) softens to: np2 is equal
+  to +15 % over solo depending on desktop load; np4 still splits the
+  same total four ways. The shipped np2 default is right under both
+  load regimes.
 * **Shipped team default: `-np 2`, 64k pool (32k per slot).** More than 2
   agents queue for slots; llama.cpp's prompt cache makes a queued agent's
   resume cheap (~5 s vs a full re-prefill, per the 27B measurements).

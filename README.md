@@ -495,20 +495,23 @@ Conclusions:
 * No DSpark speculation: mainline llama.cpp does not support the drafter
   yet ([#32218](https://github.com/ggml-org/llama.cpp/pull/32218) open), so
   `MTP` is off on this path.
-* **Parallelism does not buy total throughput on the CPU rung.** Measured
-  with interleaved reps under real desktop load
+* **Parallelism buys little total throughput on the CPU rung — pinning
+  buys none.** Measured with interleaved reps under real desktop load
   (`scripts/bench_inkling_np.py`, RESULTS.md "Inkling 2 Mini:
-  parallelism"): aggregate generation is 2.08 / 2.14 / 2.41 t/s at np
-  1/2/4 — the CPU decode saturates, slots split the total. The shipped
-  team default is therefore **`-np 2` with a 64k pool (32k per slot)**:
-  two agents progress at ~2.1–2.7 t/s each instead of queueing behind one
-  3.4 t/s stream, and the deeper pool is nearly free (KV is tiny — SWA
-  1024 on 40 of 48 visits). np4 splits the same total four ways (~1.35
-  t/s per stream) and was unstable under desktop load spikes. More than
-  2 agents queue for slots; the prompt cache makes a queued agent's
-  resume cheap (~5 s vs a full re-prefill). The real lever for more total
-  throughput is moving the expert matmuls off the CPU (the unmeasured
-  eGPU rung) or a faster host.
+  parallelism"): aggregate generation is 2.08–2.76 solo vs 2.14–3.17 at
+  np2 (the range is desktop-load dependent; np2 is equal to +15 % over
+  solo) and ~2.4 at np4 — the CPU decode saturates, slots split the
+  total. The shipped team default is therefore **`-np 2` with a 64k pool
+  (32k per slot)**: two agents progress at ~2.1–3.6 t/s each instead of
+  queueing, and the deeper pool is nearly free (KV is tiny — SWA 1024 on
+  40 of 48 visits). np4 splits the same total four ways (~1.35 t/s per
+  stream) and was unstable under desktop load spikes. `taskset` pinning
+  to one SMT lane per core measured no effect either way (interleaved
+  A/B, even within ~1 %) — shipped unpinned. More than 2 agents queue
+  for slots; the prompt cache makes a queued agent's resume cheap (~5 s
+  vs a full re-prefill). The real lever for more total throughput is
+  moving the expert matmuls off the CPU (the unmeasured eGPU rung) or a
+  faster host.
 * The chat template carries `reasoning_effort` (`none`…`max`). The server
   default is **`low`** (`EFFORT=` env, via `--reasoning-effort`): the
   template's own default is `high` (0.9), at which short `max_tokens`
