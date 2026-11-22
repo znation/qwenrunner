@@ -182,6 +182,28 @@ working prefix cache would likely put the MLX fleet aggregate near or above
 Flash-Next's 92-101 agg t/s (4 lanes × ~36 t/s), but that is an estimate, not
 a measurement.
 
+#### oMLX 0.8.2 (bundled DSpark draft) — fastest single-stream, fleet not viable
+
+oMLX (upgraded 0.7.3 → 0.8.2) is the same author as the mlx-lm Inkling PR and
+bundles its own Inkling 2 DSpark drafter (`omlx/patches/inkling2/dspark.py`),
+auto-attached from `<model>/mtp.safetensors` (`mlx-community/Inkling-2-Mini-oQ4e-mtp`,
+16.9 GB). MTP is default-on.
+
+* **Single stream**: server-logged 47.5-50.7 t/s at 4k with MTP, accept ~58.6 %,
+  ~1.9 tok/cycle — the fastest Metal single-stream number for this model
+  (llama.cpp 38, mlx-lm 37.5). MTP buys ~1.3×, not the B300's 4.4×.
+* **The harness under-counts oMLX**: reasoning streams as `reasoning_content`
+  and is excluded from `usage.completion_tokens` (a 384-token completion reads
+  as ~55 content tokens), so harness agg/tps for oMLX is misleading; the
+  server log is authoritative.
+* **Fleet replay (4 sessions, same fixture): not viable.** MTP is dropped at
+  batch > 1 (`MTP inactive for 2-row batch: model has no attached mtp head`),
+  and the 48-visit KV is paged to SSD: per-turn prefix-cache reconstruct
+  measured 4.7-11.6 s rising to **140.6 s** at depth. Guarded runs throttled
+  prefill (`adaptive_prefill_throttle`); an unguarded run OOM'd the Metal
+  working set (`Insufficient Memory`, kIOGPUCommandBufferCallbackErrorOutOfMemory
+  67×). 112 turns had not finished after ~58 min (llama.cpp: 16.5 min).
+
 #### Non-Metal is not the fix
 
 Metal is not the bottleneck: the looped arch's 48 serial visits limit single-stream
