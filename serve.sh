@@ -7,10 +7,13 @@
 # The experts (~14.7 GiB of the file) stay in RAM as mmap pages (-cmoe);
 # everything else — attention, convolutions, loop controller, embeddings —
 # follows the eGPU: with the 1070 attached, -ngl 99 puts it there
-# (uncapped, drives no display; UNMEASURED — the looped graph's GPU-assigned
-# ops reserved a 7-8 GiB compute buffer on the Vega, so verify the load on
-# first attach and drop to NGL=0 if it OOMs). Without the eGPU the path is
-# pure CPU (-dev none, zero model VRAM, gaming-proof): measured 5.6 t/s
+# (uncapped, drives no display; UNMEASURED — verify the load on first attach
+# and drop to NGL=0 if it OOMs). Without the eGPU the dense (non-expert)
+# weights go on the Vega (-dev Vulkan0 -ngl 99 -cmoe --no-op-offload -ub 64)
+# with one 64k slot: 2741 MiB of VRAM for the model, speeds in RESULTS.md
+# "dense weights on the Vega". It falls back to pure CPU (-dev none, zero
+# model VRAM, gaming-proof) with NGL=0, or when the desktop already holds too
+# much VRAM at launch (VEGA_MODEL_MIB/VEGA_RESERVE_MIB): 5.4 t/s solo
 # generation, 24.8 t/s prompt at 32k. No DSpark speculation: mainline
 # llama.cpp does not support the drafter yet (#32218 open), so MTP is off
 # on this path. The MoE expert cache (--moe-cache-mib, llama.cpp's own
@@ -70,6 +73,8 @@
 #   MMPROJ MMPROJ_OFFLOAD (0 = CPU vision encoder, 1 = GPU)
 #   MTP MD DEVD NGLD DCTK DCTV DNMAX DPMIN
 #   LM BATCH UBATCH CTK CTV FA
+#   VEGA_MODEL_MIB VEGA_RESERVE_MIB (Inkling path, no eGPU: launch-time VRAM
+#           check that picks dense-on-Vega or pure CPU)
 #   MOE_CACHE_MIB (Inkling path: hot-expert VRAM cache, MiB; 0 disables)
 #   EFFORT (Inkling path: default reasoning_effort for the chat template;
 #           default low; clients override per request)
@@ -112,22 +117,13 @@ if [ "$INKLING" = 1 ]; then
     ALIAS="${ALIAS:-Inkling-2-Mini}"
     MMPROJ="${MMPROJ:-$ROOT/models/mmproj-Inkling-2-Mini-BF16.gguf}"
     MTP="${MTP:-0}"
-    # Team default (RESULTS.md "Inkling 2 Mini: parallelism"): aggregate
-    # token throughput is flat to +15 % at -np 2 on the pure-CPU path
-    # (2.08-2.76 solo vs 2.14-3.17 at np2, depending on desktop load) —
-    # decode saturates the CPU, so slots buy concurrency more than speed:
-    # two agents progress at ~2.1-3.6 t/s each instead of queueing behind
-    # one stream. The 64k pool keeps a
-    # full 32k slot per agent; KV for this model is tiny (SWA 1024 on 40 of
-    # 48 visits), so the deeper pool costs ~0.7 GiB of RAM and measured no
-    # throughput penalty. np 4 splits the same total four ways (1.35 t/s
-    # per stream) and was unstable under desktop load spikes. CPU pinning
-    # (taskset) measured no effect either way — shipped unpinned. Threads:
-    # t8 and t12 measure equivalent, t16 is a lottery (+3 % best case,
-    # -65 % under desktop load spikes) — THREADS=8 (one thread per
-    # physical core) stays.
+    # One agent with a full 64k slot: 64k per agent is the requirement, and two
+    # such slots (CTX=131072 NP=2) need ~3400 MiB of the Vega at -ub 64 against
+    # 2741 for one. A second agent queues; the prompt cache makes its resume
+    # cheap. NP=2 alone halves the slot to 32k. Parallelism, pinning and thread
+    # measurements (THREADS=8): RESULTS.md "Inkling 2 Mini: parallelism".
     CTX="${CTX:-65536}"
-    NP="${NP:-2}"
+    NP="${NP:-1}"
 fi
 # The name the API advertises (/v1/models). Without it llama-server reports the
 # .gguf path, so a client's model id becomes the path. The alias gives both
@@ -289,13 +285,34 @@ if [ "$EGPU" = 1 ]; then
     fi
 else
     if [ "$INKLING" = 1 ]; then
-        # Measured (see README "Inkling 2 Mini"): the looped graph's GPU-assigned
-        # ops reserve a 7-8 GiB Vulkan0 compute buffer even at -ngl 0 — the
-        # CPU-only graph needs 839 MiB — so every Vulkan-in-schedule config
-        # breaches the 5500 MiB cap (RADV silently spills the rest into GTT)
-        # and guard.py kills it at load. The only guard-safe Vega-only rung
-        # is pure CPU: -dev none, zero model VRAM, gaming-proof.
-        DEV="none"
+        # Dense weights on the Vega, experts on the CPU (RESULTS.md "Inkling 2
+        # Mini: dense weights on the Vega"). --no-op-offload (FIT_ARGS below) is
+        # what makes it fit: without it the looped graph reserves a 7-8 GiB
+        # Vulkan0 compute buffer and guard.py kills it at load.
+        #
+        # Footprint: dense weights 1264, KV/RS 61 per slot + 9 per 1k of pool,
+        # compute buffer 13 per ubatch token at 64k per slot (proportional to
+        # slot size), +40 slack. Fitted to llama-fit-params and checked against
+        # measured runs: np2/64k/ub64 2397, np1/64k/ub64 2741 (np1/64k/ub128
+        # would be ~3600). Text model only: MMPROJ_OFFLOAD=1 is not counted.
+        # The reserve is room
+        # for the desktop to grow after launch; with less than that, or NGL=0,
+        # run pure CPU (zero model VRAM, gaming-proof). This is checked at
+        # launch only: if the desktop grows past CAP later, guard.py kills the
+        # server, and relaunching picks the CPU rung.
+        VEGA_MODEL_MIB="${VEGA_MODEL_MIB:-$(( 1264 + 61*NP + 9*CTX/1024 + 13*${UBATCH:-64}*CTX_SLOT/65536 + 40 ))}"
+        VEGA_RESERVE_MIB="${VEGA_RESERVE_MIB:-600}"
+        VEGA_USED=$(python3 -c "import sys; sys.path.insert(0, '$ROOT/scripts'); import guard; print(int(guard.vram_used_mib()))" 2>/dev/null || true)
+        DEV="Vulkan0"
+        if [ "${NGL:-99}" = 0 ]; then
+            DEV="none"
+        elif [ -z "$VEGA_USED" ]; then
+            echo "serve: WARNING cannot read display VRAM — falling back to pure CPU" >&2
+            DEV="none"
+        elif [ $(( VEGA_USED + VEGA_MODEL_MIB + VEGA_RESERVE_MIB )) -gt "$CAP" ]; then
+            echo "serve: desktop holds ${VEGA_USED} MiB of VRAM (+${VEGA_MODEL_MIB} model +${VEGA_RESERVE_MIB} reserve > cap ${CAP}) — falling back to pure CPU" >&2
+            DEV="none"
+        fi
     else
         DEV="Vulkan0"
     fi
@@ -383,13 +400,17 @@ elif [ "$INKLING" = 1 ]; then
     # on the Vega against the 1070's 8192 MiB, so verify on first attach and
     # drop to NGL=0 if the load OOMs.
     #
-    # No eGPU: -dev none (set in the DEV block), pure CPU. The MoE cache has
-    # no device to live on, so the flag is omitted on this rung.
+    # No eGPU: dense weights on the Vega or, as the fallback, pure CPU (DEV
+    # block above). The micro-batch and the slot size set the Vulkan compute
+    # buffer, so -ub stays 64. The MoE cache loses on the Vega, so it is omitted.
     FIT_ON=0
     if [ "$EGPU" = 1 ]; then
         FIT_ARGS=(-ngl "${NGL:-99}" -cmoe --moe-cache-mib "$MOE_CACHE_MIB" --fit off --jinja --reasoning-effort "$EFFORT")
+    elif [ "$DEV" = "Vulkan0" ]; then
+        FIT_ARGS=(-ngl "${NGL:-99}" -cmoe --no-op-offload --fit off --jinja --reasoning-effort "$EFFORT")
+        UBATCH="${UBATCH:-64}"
     else
-        FIT_ARGS=(-ngl "${NGL:-0}" -cmoe --fit off --jinja --reasoning-effort "$EFFORT")
+        FIT_ARGS=(-ngl 0 -cmoe --fit off --jinja --reasoning-effort "$EFFORT")
     fi
 elif [ "$EGPU" = 1 ]; then
     FIT_ARGS+=( -fitt "$FITT_CUDA,$VEGA_MARGIN")
@@ -452,6 +473,8 @@ if [ "$EGPU" = 1 ]; then
     else
         echo "serve: eGPU present — split across CUDA0 (1070) + Vulkan0 (Vega) + CPU"
     fi
+elif [ "$DEV" = "none" ]; then
+    echo "serve: no eGPU — pure CPU, the Vega stays desktop-only"
 else
     echo "serve: no eGPU — split across Vulkan0 (Vega) + CPU"
 fi
@@ -467,6 +490,8 @@ else
     elif [ "$INKLING" = 1 ]; then
         if [ "$EGPU" = 1 ]; then
             echo "serve: --fit off: -ngl ${NGL:-99} -cmoe --moe-cache-mib ${MOE_CACHE_MIB} (Inkling path, eGPU)"
+        elif [ "$DEV" = "Vulkan0" ]; then
+            echo "serve: --fit off: -ngl ${NGL:-99} -cmoe --no-op-offload -ub ${UBATCH} (Inkling path, dense weights on the Vega)"
         else
             echo "serve: --fit off: -dev none -ngl 0 -cmoe (Inkling path, pure CPU)"
         fi

@@ -1,0 +1,16 @@
+{"label": "cpu_t8", "rep": 0, "base_vram": 1253, "load1": 18.08203125, "prompt_n": 966, "pp": 22.06, "tg": 5.36, "peak_vram": 1259, "peak_gtt": 142, "buf": []}
+{"label": "cpu_t6", "rep": 0, "base_vram": 1194, "load1": 10.1533203125, "prompt_n": 966, "pp": 20.44, "tg": 3.13, "peak_vram": 1830, "peak_gtt": 564, "buf": []}
+{"label": "vk_ub128_t8", "rep": 0, "base_vram": 1255, "load1": 12.5107421875, "prompt_n": 966, "pp": 29.41, "tg": 5.98, "peak_vram": 3736, "peak_gtt": 205, "buf": []}
+{"label": "vk_ub128_t6", "rep": 0, "base_vram": 1194, "load1": 8.92236328125, "prompt_n": 966, "pp": 26.02, "tg": 5.98, "peak_vram": 3674, "peak_gtt": 205, "buf": []}
+{"label": "vk_ub256_t8", "rep": 0, "base_vram": 1194, "load1": 6.0703125, "prompt_n": 966, "pp": 31.74, "tg": 6.0, "peak_vram": 4562, "peak_gtt": 251, "buf": []}
+{"label": "vk_core1_ub128", "rep": 0, "base_vram": 1194, "load1": 6.125, "prompt_n": 966, "pp": 31.46, "tg": 6.21, "peak_vram": 4222, "peak_gtt": 205, "buf": []}
+{"label": "vk_core2_ub64", "rep": 0, "base_vram": 1194, "load1": 6.59765625, "prompt_n": 966, "pp": 30.08, "tg": 6.38, "peak_vram": 4338, "peak_gtt": 183, "buf": []}
+{"label": "vk_core3_ub32", "rep": 0, "base_vram": 1194, "load1": 7.125, "prompt_n": 966, "pp": 28.63, "tg": 6.54, "peak_vram": 4671, "peak_gtt": 172, "buf": []}
+{"label": "cpu_t8", "rep": 1, "base_vram": 1194, "load1": 6.67626953125, "prompt_n": 966, "pp": 22.43, "tg": 5.4, "peak_vram": 1194, "peak_gtt": 113, "buf": []}
+{"label": "cpu_t6", "rep": 1, "base_vram": 1194, "load1": 7.138671875, "prompt_n": 966, "pp": 20.52, "tg": 5.9, "peak_vram": 1194, "peak_gtt": 113, "buf": []}
+{"label": "vk_ub128_t8", "rep": 1, "base_vram": 1194, "load1": 5.70263671875, "prompt_n": 966, "pp": 29.58, "tg": 6.03, "peak_vram": 3674, "peak_gtt": 205, "buf": []}
+{"label": "vk_ub128_t6", "rep": 1, "base_vram": 1194, "load1": 6.30322265625, "prompt_n": 966, "pp": 25.99, "tg": 5.85, "peak_vram": 3674, "peak_gtt": 205, "buf": []}
+{"label": "vk_ub256_t8", "rep": 1, "base_vram": 1194, "load1": 5.56640625, "prompt_n": 966, "pp": 31.57, "tg": 6.02, "peak_vram": 4562, "peak_gtt": 251, "buf": []}
+{"label": "vk_core1_ub128", "rep": 1, "base_vram": 1194, "load1": 5.44677734375, "prompt_n": 966, "pp": 31.28, "tg": 6.22, "peak_vram": 4222, "peak_gtt": 205, "buf": []}
+{"label": "vk_core2_ub64", "rep": 1, "base_vram": 1194, "load1": 6.26904296875, "prompt_n": 966, "pp": 30.12, "tg": 6.39, "peak_vram": 4338, "peak_gtt": 183, "buf": []}
+{"label": "vk_core3_ub32", "rep": 1, "base_vram": 1194, "load1": 6.85107421875, "prompt_n": 966, "pp": 28.56, "tg": 6.54, "peak_vram": 4671, "peak_gtt": 172, "buf": []}

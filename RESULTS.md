@@ -1904,7 +1904,8 @@ the Vega), no `guard.py` in the loop; VRAM/GTT sampled at 0.5 s
 
 Conclusions:
 
-* **The looped graph does not fit the Vega under the cap.** The ops the
+* **The looped graph does not fit the Vega under the cap** (superseded: it
+  does with `--no-op-offload`, see "dense weights on the Vega" below). The ops the
   scheduler assigns to the GPU reserve a **7–8 GiB Vulkan0 compute buffer**:
   11.2 GiB at `-ub 512`, ~6.6 GiB at `-ub 32`, nearly independent of context
   (6.64 GiB at ctx 2048 vs 7.62 at 32768) and unchanged by `-fa off`. The
@@ -1923,7 +1924,8 @@ Conclusions:
   uploads win. Same conclusion as the Swift spill path above. Shipped as
   `MOE_CACHE_MIB` defaulting to 0 (eGPU rung only).
 * **Generation on the CPU rung is RAM-bandwidth-bound**: ~1.7 GB of expert
-  weights touched per token at 5.6 t/s ≈ 9.5 GB/s. Ubatch is irrelevant
+  weights touched per token at 5.6 t/s ≈ 9.5 GB/s (corrected below: this
+  counts experts only; with the dense weights it is ~22–25 GB/s). Ubatch is irrelevant
   (prompt 24.8 at ub 128 vs 23.8 at 512; gen flat).
 * **eGPU rung unmeasured** (`-dev CUDA0 -ngl 99 -cmoe`): the Vulkan
   reservation analysis does not transfer to CUDA, but 7–8 GiB compute
@@ -2042,3 +2044,65 @@ Conclusions:
 * **Shipped: `THREADS=8` unchanged** — equal average throughput to t12,
   half the desktop contention of t16, one thread per physical core, and
   consistent with the 27B history. `THREADS=` remains an env override.
+
+### Inkling 2 Mini: dense weights on the Vega **[clean]**
+
+Measured 2026-11-23/24 on the pinned `46eb174` unless noted: `-dev Vulkan0
+-ngl 99 --no-op-offload`, t8, q4_0 KV, 966-token prompt, 128 generated
+tokens, two interleaved reps, under `guard.py` at the stated cap on total
+system VRAM (desktop ~1.0-1.2 GiB). Driver `scripts/bench_inkling_vega.py`;
+rows `results/inkling_vega_4g.jsonl`, `_np2.jsonl`, `_5g.jsonl` (the last on
+draft PR #32898, whose CPU speed matches the pin). The np2 rows are two
+concurrent requests on a 64k pool.
+
+| arm | cap | prompt t/s | gen t/s | np2 gen per stream | np2 wall | peak VRAM |
+|---|---|---:|---:|---:|---:|---:|
+| np1 pure CPU | 5000 | 22.4 (rep 2; rep 1 cold, 14.4) | 5.46 | | | 1041 |
+| np1 dense, ub 128 | 4000 | 29.5 | 6.22 | | | 3505 |
+| np1 + 1 looped layer's experts, ub 64 | 4000 | 28.4 | 6.20 | | | 3620 |
+| np1 + 2 looped layers, ub 64 | 5000 | 30.3 | 6.49 | | | 4167 |
+| np2 pure CPU | 5000 | 22.4 (rep 2; rep 1 19.2) | 5.38 | 3.65 | 127 s | 1337 |
+| np2 dense, ub 64 | 4000 | 26.8 | 6.07 | 4.02 | 111 s | 3540 |
+| np2 + 1 looped layer, ub 64 | 4000 | killed at load, 2/2 | | | | 4085 |
+| np2 + 1 looped layer, ub 32 | 4000 | killed 1/2; other rep 25.4 | 6.20 | 4.12 | 115 s | 3873 |
+| np2 + 2 looped layers, ub 64 | 5000 | 30.1 | 6.35 | 4.29 | 100 s | 4634 |
+
+* **`--no-op-offload` removes the 7-8 GiB Vulkan buffer.** The likely cause
+  is the scheduler reserving GPU copies of the looped layers' experts (12 ×
+  546 MiB ≈ 6.4 GiB, matching the ubatch-independent floor); the flag's
+  effect is measured, that mechanism is inferred.
+* **Shipped: dense only, one 64k slot (`-np 1`, 64k per agent required).**
+  At np2/64k dense-only is ~10 % slower in np2 wall time than two looped
+  layers but leaves ~1960 MiB under the 5500 cap instead of ~870.
+  `serve.sh` runs pure CPU instead when `VRAM used + footprint + 600 > CAP` at
+  launch (footprint computed from NP, CTX and UBATCH), or with `NGL=0`.
+  Growth after launch is still guard.py's job.
+* **The compute buffer scales with slot size × ubatch**, so `-ub 64` ships at
+  every NP. `llama-fit-params` estimates (MiB; within 6 of the measured
+  np1/32k/ub64, np2/64k/ub64 and np1/64k/ub64 runs): np1/64k ub32 2319, ub64
+  2735, ub128 3602; np2/128k (64k per slot) ub16 2747, ub32 2955, ub64 3371.
+  The np1 rows above used a 32k pool.
+* **64k single slot** (`results/inkling_vega_64k.jsonl`, pin, cap 5500).
+  Background load varied, so every rep is listed, prompt / gen t/s: pure CPU
+  9.06/2.54, 21.2/5.31, 14.28/5.22; dense ub 64 (shipped) 25.7/6.00,
+  13.29/2.61, 15.93/5.92; dense ub 32 15.84/6.02, 23.7/6.05. Best reps:
+  generation 6.0 vs 5.3; prompt 25.7 (ub 64), 23.7 (ub 32), 21.2 (CPU). The
+  model held 2740.7 MiB (ub 64) and 2324.3 (ub 32); system VRAM peaked as
+  high as 5176 MiB as the desktop moved.
+* **A per-op profile of CPU generation** puts ~88 % in matmuls: ~75 ms/token
+  dense `MUL_MAT`, ~62 ms expert `MUL_MAT_ID`. Counting both, traffic is
+  ~22-25 GB/s of a measured 36 GB/s read bandwidth. `-cmoe` versus repacked
+  experts, OpenMP versus ggml's threadpool, and llama.cpp master versus the
+  pin all measured the same on CPU.
+* **Strata 0.1.66 (`strata-inkling`, CPU backend, same GGUF) is slower:**
+  2.1 t/s generation, 10.1 prompt (one run, 64 in / 16 out). It has no Vulkan
+  backend for this; its CUDA 12 engine lists the GTX 10 series as
+  experimental, so it is worth a retest on the eGPU.
+* Not measured: perplexity on the Vega path. Vision works (one image, encoder
+  on the CPU). Two concurrent
+  ~10k-token prompts through `serve.sh` completed with the model's own VRAM
+  flat at 2396.7 MiB (no growth with depth to that point); prompt speed held
+  25.3 t/s at 8k on the first slot alone. Later figures in that run are not
+  usable: unrelated jobs raised loadavg to 34-43. The desktop also grew ~2 GB
+  meanwhile and system VRAM peaked at 5423 MiB, 77 under the cap, so the
+  launch-time check does not protect against later desktop growth.

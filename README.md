@@ -19,15 +19,15 @@ The 14.7 GiB of routed experts stay in RAM as `mmap` pages (`-cmoe`) and the
 rest follows the eGPU: with the 1070 attached, `-ngl 99` puts the non-expert
 weights (1.26 GiB) on it (`-dev CUDA0`, uncapped, drives no display; the
 Vega stays desktop-only) — **unmeasured on the 1070**, verify on first
-attach. Without the eGPU the path is **pure CPU** (`-dev none`, zero model
-VRAM, gaming-proof): measured **5.6 t/s generation, 24.8 t/s prompt** at
-32k on an idle machine, **~3.4 t/s solo / ~2.1–2.7 t/s per stream at
-`-np 2` under the real desktop load** (aggregate throughput is flat in
-`-np` — see "Inkling 2 Mini" below for the team parallelism study). The
-looped graph's GPU-assigned ops reserve a 7–8 GiB compute buffer
-on the Vega (the CPU-only graph needs 839 MiB), so every
-Vulkan-in-schedule config breaches the 5500 cap and `guard.py` kills it at
-load — pure CPU is the only guard-safe Vega-only rung. Vision input works
+attach. Without the eGPU those same dense weights go on the Vega
+(`-dev Vulkan0 -ngl 99 -cmoe --no-op-offload -ub 64`; experts stay on the
+CPU) with **one 64k slot**: best rep **25.7 t/s prompt and 6.0 t/s
+generation**, against 21.2 and 5.3 on pure CPU. The model holds **2741 MiB**
+of VRAM. `--no-op-offload` is what makes it fit: without it the looped graph reserves
+a 7–8 GiB compute buffer on the Vega and `guard.py` kills it at load.
+`serve.sh` falls back to pure CPU (`-dev none`, zero model VRAM,
+gaming-proof) when the desktop already holds too much VRAM at launch, and
+`NGL=0 ./serve.sh` forces it. Vision input works
 out of the box (`mmproj-Inkling-2-Mini-BF16.gguf`, encoder on the CPU by
 default, `MMPROJ_OFFLOAD=1` moves it to the GPU). Reasoning depth is set by
 the client via `reasoning_effort` (`none`…`max`, default `high`); sampling
@@ -247,12 +247,12 @@ present. Both backends end up in one binary and `-dev` selects between them.
 
 ```
 ./serve.sh                       # Inkling 2 Mini IQ4_NL default (:8080)
-                                 #   team default: -np 2, 64k pool (32k/slot)
-                                 #   no eGPU:  pure CPU, -dev none (3.4 t/s solo under real load)
+                                 #   one 64k slot (-np 1); a second agent queues
+                                 #   no eGPU:  dense weights on the Vega, 2741 MiB; CPU if VRAM is short
                                  #   eGPU on:  -ngl 99 -cmoe on the 1070 alone (unmeasured, verify)
-NP=1 ./serve.sh                  # solo rung: one agent at full speed
+CTX=131072 NP=2 ./serve.sh       # two agents, 64k each (~3400 MiB of the Vega; unmeasured)
 MOE_CACHE_MIB=1024 ./serve.sh    # eGPU only: hot-expert VRAM cache (measured 3x SLOWER on the Vega)
-NGL=0 ./serve.sh                 # (Swift spill path) pure CPU, zero model VRAM — gaming-proof rung
+NGL=0 ./serve.sh                 # (Inkling or Swift path) pure CPU, zero model VRAM — gaming-proof rung
 CTX=65536 ./serve.sh             # one 64k slot (KV ~0.9 GiB RAM; prefill ~110 min)
 MODEL=models/iq3s/Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf ./serve.sh  # Swift disk-spill (previous default)
 MODEL=models/Qwen3.8-27B-UD-Q4_K_M.gguf ./serve.sh   # the 27B split
@@ -312,8 +312,8 @@ at ~6 min of prefill per 5k fresh tokens.
 
 The local model's entry in both clients tracks the serving default: pi in
 `~/.pi/agent/models.json` and omp in `~/.omp/agent/models.yml` now name
-`Swift-1.5-Qwen3.8-Flash-Next` with `contextWindow: 14336` (the 16k slot less
-room for tool-call output, text-only input — no mmproj is served). omp needs
+`Inkling-2-Mini` with `contextWindow: 63000` (the one 64k slot less some
+headroom, text and image input). omp needs
 the explicit override because its auto-discovery of `http://127.0.0.1:8080`
 otherwise takes the server's raw per-slot context as both the window *and* the
 output budget. The cloud model
@@ -461,20 +461,19 @@ generated tokens, one rep per arm; raw rows in
 | … cache 1024, `-lm none` (pinned) | 28.2 | 2.13 | ~6.9 GiB |
 | … cache 1024 + `--moe-cache-cpu-share 1.0` | 28.2 | 2.12 | ~6.9 GiB |
 | `-ngl 0 -dev Vulkan0` (all weights CPU) | 25.9 | 5.61 | ~6.0 GiB + GTT spill |
-| **`-dev none` (pure CPU) — shipped default** | 24.8 | 5.62 | **0** |
+| `-dev none` (pure CPU) — the `NGL=0` fallback | 24.8 | 5.62 | **0** |
 
 Conclusions:
 
-* **The looped graph does not fit the Vega.** The ops the scheduler assigns
-  to the GPU reserve a **7–8 GiB Vulkan0 compute buffer** — at `-ub 512`
-  11.2 GiB, at `-ub 32` still ~6.6 GiB, nearly independent of context
-  (6.6 GiB at ctx 2048 vs 7.6 at 32768) and of `-fa` — while the same graph
-  scheduled entirely on the CPU needs **839 MiB**. RADV silently spills the
-  excess into GTT (measured 5–6 GiB of GTT during runs), so the server
-  *works* at `-ngl 99` but peaks at 7.3–8.1 GiB of system VRAM: every
-  Vulkan-in-schedule config breaches the 5500 MiB cap and `guard.py` kills
-  it at load. Pure CPU (`-dev none`) is the only guard-safe Vega-only rung,
-  and it gives up almost nothing: 5.62 vs 6.13–6.46 t/s generation.
+* **The looped graph fits the Vega only with `--no-op-offload`.** The table
+  above predates that flag: without it, the GPU-assigned ops reserve a
+  **7–8 GiB Vulkan0 compute buffer**, RADV spills into GTT, and `guard.py`
+  kills it at load. With it, dense weights on the Vega peaked at 3505–3540
+  MiB of system VRAM with 32k slots and beat pure CPU by ~14 % generation
+  solo and ~13 % wall time at np2. The shipped default is dense-only with one
+  64k slot at `-ub 64` (model share ~2741 MiB). Keeping two looped layers' experts on
+  the Vega too is faster again but peaks at 4634 MiB, leaving less room for
+  the desktop; see RESULTS.md "Inkling 2 Mini: dense weights on the Vega".
 * **The MoE expert cache loses on this host, decisively.** `--moe-cache-mib
   1024` costs 3× generation (2.13 vs 6.13–6.46 t/s) and the result holds
   with the host experts pinned (`-lm none`) and with
@@ -484,9 +483,11 @@ Conclusions:
   saved uploads win. Same conclusion as the Swift spill path. The cache is
   the right lever on a GPU whose expert matmuls outpace the CPU (an RTX-class
   card); here it is wired as `MOE_CACHE_MIB` and defaults to 0.
-* **Generation is RAM-bandwidth-bound on the CPU rung**, as expected for a
-  3B-active MoE: ~1.7 GB of expert weights touched per token at 5.6 t/s ≈
-  9.5 GB/s. Ubatch does not matter (prompt 24.8 at ub 128 vs 23.8 at 512).
+* **Generation is RAM-bandwidth-bound on the CPU rung.** A token touches
+  ~1.7 GB of expert weights plus ~2 GB of dense weights (the looped core's
+  are revisited three times): an estimated 22–25 GB/s of the 36 GB/s this
+  machine measures. The earlier 9.5 GB/s figure counted experts only. That
+  the dense half is small (1.26 GiB) is why moving it to the Vega helps.
 * **eGPU rung unmeasured.** With the 1070 attached the path is
   `-dev CUDA0 -ngl 99 -cmoe` (uncapped, drives no display). The Vulkan
   reservation analysis does not transfer to CUDA, but 7–8 GiB of compute
@@ -501,14 +502,15 @@ Conclusions:
   parallelism"): aggregate generation is 2.08–2.76 solo vs 2.14–3.17 at
   np2 (the range is desktop-load dependent; np2 is equal to +15 % over
   solo) and ~2.4 at np4 — the CPU decode saturates, slots split the
-  total. The shipped team default is therefore **`-np 2` with a 64k pool
-  (32k per slot)**: two agents progress at ~2.1–3.6 t/s each instead of
-  queueing, and the deeper pool is nearly free (KV is tiny — SWA 1024 on
-  40 of 48 visits). np4 splits the same total four ways (~1.35 t/s per
+  total. At a 32k
+  slot, two agents progress at ~2.1–3.6 t/s each instead of queueing. The
+  shipped default is nevertheless **`-np 1` with one 64k slot**, because
+  64k per agent is required and two such slots need ~3400 MiB of the Vega.
+  np4 splits the same total four ways (~1.35 t/s per
   stream) and was unstable under desktop load spikes. `taskset` pinning
   to one SMT lane per core measured no effect either way (interleaved
-  A/B, even within ~1 %) — shipped unpinned. More than 2 agents queue
-  for slots; the prompt cache makes a queued agent's resume cheap (~5 s
+  A/B, even within ~1 %) — shipped unpinned. A second agent queues
+  for the slot; the prompt cache makes a queued agent's resume cheap (~5 s
   vs a full re-prefill). The real lever for more total throughput is
   moving the expert matmuls off the CPU (the unmeasured eGPU rung) or a
   faster host.
